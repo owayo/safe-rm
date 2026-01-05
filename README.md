@@ -195,18 +195,15 @@ Add to your `CLAUDE.md`:
 ```markdown
 ## File Deletion Rules
 
-- Use `safe-rm` instead of `rm` for file deletion
-- Deletion is blocked for:
-  - Files outside the project directory
-  - Modified files (uncommitted changes)
-  - Staged files (added but not committed)
-  - Untracked files (not in Git)
-- In Git repositories, deletion is allowed for:
-  - Clean files (committed and unchanged)
-  - Ignored files (in .gitignore)
-- In non-Git directories: all files inside the project can be deleted
-- Use `git status` to check file states before deletion
-- Commit important changes before attempting to delete files
+- Do NOT use `rm` or `rmdir`. These are restricted for safety.
+- Use `safe-rm <file>` or `safe-rm -r <directory>` to delete files.
+- `safe-rm` will automatically verify that the file is safe to delete (committed or ignored in Git).
+- If `safe-rm` fails, the file likely has uncommitted changes or is outside the project.
+
+### Examples
+- Delete a build artifact: `safe-rm -r target/`
+- Delete an old file: `safe-rm old_module.rs`
+- Preview what would be deleted: `safe-rm -n file.txt`
 ```
 
 ## Git Status Decision Matrix
