@@ -28,8 +28,8 @@ shlex = "1.3.0"
 # Path normalization
 path-clean = "1.0.1"
 
-# Git operations
-git2 = "0.20.3"
+# Git operations (vendored for cross-compilation on CI)
+git2 = { version = "0.20.3", features = ["vendored-libgit2", "vendored-openssl"] }
 
 # Error handling
 anyhow = "1.0.100"
