@@ -6,7 +6,7 @@ rust-version = "1.70"
 authors = ["safe-rm contributors"]
 description = "Secure deletion proxy for Claude Code PreToolUse hooks with spatial containment and VCS safety"
 license = "MIT"
-repository = "https://github.com/owa/safe-rm"
+repository = "https://github.com/owayo/safe-rm"
 keywords = ["rm", "delete", "safety", "ai", "agent", "claude"]
 categories = ["command-line-utilities"]
 

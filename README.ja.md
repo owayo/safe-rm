@@ -5,14 +5,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/owa/safe-rm/actions/workflows/ci.yml">
-    <img alt="CI" src="https://github.com/owa/safe-rm/actions/workflows/ci.yml/badge.svg?branch=main">
+  <a href="https://github.com/owayo/safe-rm/actions/workflows/ci.yml">
+    <img alt="CI" src="https://github.com/owayo/safe-rm/actions/workflows/ci.yml/badge.svg?branch=main">
   </a>
-  <a href="https://github.com/owa/safe-rm/releases/latest">
-    <img alt="Version" src="https://img.shields.io/github/v/release/owa/safe-rm">
+  <a href="https://github.com/owayo/safe-rm/releases/latest">
+    <img alt="Version" src="https://img.shields.io/github/v/release/owayo/safe-rm">
   </a>
   <a href="LICENSE">
-    <img alt="License" src="https://img.shields.io/github/license/owa/safe-rm">
+    <img alt="License" src="https://img.shields.io/github/license/owayo/safe-rm">
   </a>
 </p>
 
@@ -51,7 +51,7 @@ cargo install --path .
 
 ### バイナリダウンロード
 
-[Releases](https://github.com/owa/safe-rm/releases) から最新版をダウンロードしてください。
+[Releases](https://github.com/owayo/safe-rm/releases) から最新版をダウンロードしてください。
 
 ## 使い方
 
@@ -284,7 +284,7 @@ cargo build --release
 
 ## セキュリティ
 
-セキュリティの脆弱性を発見した場合は、[GitHub Issues](https://github.com/owa/safe-rm/issues) から報告してください。
+セキュリティの脆弱性を発見した場合は、[GitHub Issues](https://github.com/owayo/safe-rm/issues) から報告してください。
 
 ## ライセンス
 

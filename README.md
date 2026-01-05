@@ -5,14 +5,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/owa/safe-rm/actions/workflows/ci.yml">
-    <img alt="CI" src="https://github.com/owa/safe-rm/actions/workflows/ci.yml/badge.svg?branch=main">
+  <a href="https://github.com/owayo/safe-rm/actions/workflows/ci.yml">
+    <img alt="CI" src="https://github.com/owayo/safe-rm/actions/workflows/ci.yml/badge.svg?branch=main">
   </a>
-  <a href="https://github.com/owa/safe-rm/releases/latest">
-    <img alt="Version" src="https://img.shields.io/github/v/release/owa/safe-rm">
+  <a href="https://github.com/owayo/safe-rm/releases/latest">
+    <img alt="Version" src="https://img.shields.io/github/v/release/owayo/safe-rm">
   </a>
   <a href="LICENSE">
-    <img alt="License" src="https://img.shields.io/github/license/owa/safe-rm">
+    <img alt="License" src="https://img.shields.io/github/license/owayo/safe-rm">
   </a>
 </p>
 
@@ -51,7 +51,7 @@ cargo install --path .
 
 ### Binary Download
 
-Download the latest release from [Releases](https://github.com/owa/safe-rm/releases).
+Download the latest release from [Releases](https://github.com/owayo/safe-rm/releases).
 
 ## Usage
 
@@ -284,7 +284,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Security
 
-If you discover a security vulnerability, please report it via [GitHub Issues](https://github.com/owa/safe-rm/issues).
+If you discover a security vulnerability, please report it via [GitHub Issues](https://github.com/owayo/safe-rm/issues).
 
 ## License
 
