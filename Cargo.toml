@@ -1,0 +1,44 @@
+[package]
+name = "safe-rm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["safe-rm contributors"]
+description = "Secure deletion proxy for Claude Code PreToolUse hooks with spatial containment and VCS safety"
+license = "MIT"
+repository = "https://github.com/owa/safe-rm"
+keywords = ["rm", "delete", "safety", "ai", "agent", "claude"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "safe_rm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "safe-rm"
+path = "src/main.rs"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Shell command tokenization
+shlex = "1.3"
+
+# Path normalization
+path-clean = "1.0"
+
+# Git operations
+git2 = "0.18"
+
+# Error handling
+anyhow = "1.0"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.0"
+tempfile = "3.10"
+
+[profile.release]
+lto = true
+strip = true
