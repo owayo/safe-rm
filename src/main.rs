@@ -3,12 +3,13 @@
 //! This tool provides Git-aware access control for file deletion,
 //! allowing AI agents to safely delete only clean or ignored files.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
 use safe_rm::cli::CliArgs;
-use safe_rm::error::SafeRmError;
+use safe_rm::error::{FileStatus, SafeRmError};
 use safe_rm::git_checker::GitChecker;
 use safe_rm::path_checker::PathChecker;
 
@@ -32,13 +33,20 @@ fn run() -> Result<(), SafeRmError> {
     // Open Git repository if available
     let git_checker = GitChecker::open(&project_root);
 
+    // Pre-fetch all Git statuses at once (batch optimization)
+    // This reduces N API calls to 1 for N files
+    let status_cache: HashMap<String, FileStatus> = git_checker
+        .as_ref()
+        .map(|checker| checker.get_all_statuses())
+        .unwrap_or_default();
+
     let mut success_count = 0;
     let mut error_count = 0;
     let mut max_exit_code: u8 = 0;
     let mut last_error: Option<SafeRmError> = None;
 
     for path in &args.paths {
-        match process_path(path, &project_root, &git_checker, &args) {
+        match process_path(path, &project_root, &git_checker, &status_cache, &args) {
             Ok(deleted) => {
                 if deleted {
                     success_count += 1;
@@ -79,6 +87,7 @@ fn process_path(
     path: &Path,
     project_root: &Path,
     git_checker: &Option<GitChecker>,
+    status_cache: &HashMap<String, FileStatus>,
     args: &CliArgs,
 ) -> Result<bool, SafeRmError> {
     // Verify path is within project FIRST (security check takes precedence)
@@ -107,14 +116,9 @@ fn process_path(
         return Err(SafeRmError::IsDirectory(abs_path));
     }
 
-    // Check Git status
+    // Check Git status using pre-fetched cache (batch optimization)
     if let Some(ref checker) = git_checker {
-        if abs_path.is_dir() {
-            // For directories, check all files recursively
-            check_directory_recursive(&abs_path, checker)?;
-        } else {
-            checker.check_path(&canonical_path)?;
-        }
+        checker.check_path_with_cache(&canonical_path, status_cache)?;
     }
 
     // Perform deletion (or dry-run)
@@ -126,28 +130,6 @@ fn process_path(
         println!("removed: {}", path.display());
         Ok(true)
     }
-}
-
-/// Recursively check all files in a directory
-fn check_directory_recursive(dir: &Path, checker: &GitChecker) -> Result<(), SafeRmError> {
-    let entries = fs::read_dir(dir).map_err(|_| SafeRmError::DirectoryReadError {
-        path: dir.to_path_buf(),
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|_| SafeRmError::DirectoryReadError {
-            path: dir.to_path_buf(),
-        })?;
-        let entry_path = entry.path();
-
-        if entry_path.is_dir() {
-            check_directory_recursive(&entry_path, checker)?;
-        } else {
-            checker.check_path(&entry_path)?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Delete a file or directory

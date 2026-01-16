@@ -4,6 +4,7 @@
 
 use crate::error::{FileStatus, SafeRmError};
 use git2::{Repository, Status, StatusOptions};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Git ステータスチェッカー
@@ -21,6 +22,73 @@ impl GitChecker {
         Repository::open(project_root)
             .ok()
             .map(|repo| Self { repo })
+    }
+
+    /// 全ファイルのステータスを一括取得（バッチ処理用）
+    ///
+    /// 一度の Git API 呼び出しで全ステータスを取得し、HashMap として返す。
+    /// これにより、多数のファイルを処理する際の API 呼び出し回数を削減。
+    ///
+    /// # Returns
+    /// * `HashMap<String, FileStatus>` - 相対パス → ステータスのマップ
+    pub fn get_all_statuses(&self) -> HashMap<String, FileStatus> {
+        let mut status_map = HashMap::new();
+
+        let mut opts = StatusOptions::new();
+        opts.include_untracked(true);
+        opts.include_ignored(true);
+        opts.recurse_untracked_dirs(true);
+
+        if let Ok(statuses) = self.repo.statuses(Some(&mut opts)) {
+            for entry in statuses.iter() {
+                if let Some(path) = entry.path() {
+                    let status = Self::convert_status(entry.status());
+                    status_map.insert(path.to_string(), status);
+                }
+            }
+        }
+
+        status_map
+    }
+
+    /// キャッシュからファイルステータスを取得
+    ///
+    /// `get_all_statuses()` で事前取得したキャッシュを使用。
+    /// キャッシュにない場合は Clean として扱う（Git 追跡済みで変更なし）。
+    pub fn get_file_status_from_cache(
+        &self,
+        path: &Path,
+        cache: &HashMap<String, FileStatus>,
+    ) -> FileStatus {
+        let workdir = match self.repo.workdir() {
+            Some(dir) => dir,
+            None => return FileStatus::NotInRepo,
+        };
+
+        let relative_path = match path.strip_prefix(workdir) {
+            Ok(p) => p,
+            Err(_) => return FileStatus::NotInRepo,
+        };
+
+        let path_str = relative_path.to_string_lossy().to_string();
+
+        // キャッシュから取得
+        if let Some(&status) = cache.get(&path_str) {
+            return status;
+        }
+
+        // キャッシュにない場合: .gitignore チェック
+        if self.is_ignored_path(path) {
+            return FileStatus::Ignored;
+        }
+
+        // Git 追跡済みで変更がない（Clean）か、リポジトリ外
+        // status_file で確認
+        match self.repo.status_file(relative_path) {
+            Ok(status) if status.is_empty() => FileStatus::Clean,
+            Ok(status) => Self::convert_status(status),
+            Err(_) => FileStatus::NotInRepo,
+        }
     }
 
     /// ファイルの Git ステータスを取得
@@ -230,6 +298,87 @@ impl GitChecker {
         }
 
         Ok(())
+    }
+
+    /// ディレクトリ内のファイルをキャッシュを使用して再帰的にチェック（高速版）
+    ///
+    /// `get_all_statuses()` で事前取得したキャッシュを使用することで、
+    /// 多数のファイルを持つディレクトリの検証を高速化。
+    pub fn check_directory_with_cache(
+        &self,
+        dir: &Path,
+        cache: &HashMap<String, FileStatus>,
+    ) -> Result<(), SafeRmError> {
+        // まずディレクトリ自体が Ignored かチェック（早期許可）
+        let dir_status = self.get_directory_status(dir);
+        if dir_status == FileStatus::Ignored {
+            return Ok(());
+        }
+
+        self.check_directory_recursive_with_cache(dir, cache)
+    }
+
+    /// キャッシュを使用した再帰的ディレクトリチェック
+    fn check_directory_recursive_with_cache(
+        &self,
+        dir: &Path,
+        cache: &HashMap<String, FileStatus>,
+    ) -> Result<(), SafeRmError> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => {
+                return Err(SafeRmError::DirectoryReadError {
+                    path: dir.to_path_buf(),
+                });
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.is_dir() {
+                // サブディレクトリも再帰的にチェック
+                self.check_directory_with_cache(&path, cache)?;
+            } else {
+                // キャッシュからステータスを取得
+                let status = self.get_file_status_from_cache(&path, cache);
+                if !Self::is_deletable(status) {
+                    return Err(SafeRmError::DirtyFiles { path, status });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 単一ファイルをキャッシュを使用してチェック
+    pub fn check_file_with_cache(
+        &self,
+        path: &Path,
+        cache: &HashMap<String, FileStatus>,
+    ) -> Result<(), SafeRmError> {
+        let status = self.get_file_status_from_cache(path, cache);
+        if Self::is_deletable(status) {
+            Ok(())
+        } else {
+            Err(SafeRmError::DirtyFiles {
+                path: path.to_path_buf(),
+                status,
+            })
+        }
+    }
+
+    /// ファイルまたはディレクトリをキャッシュを使用してチェック
+    pub fn check_path_with_cache(
+        &self,
+        path: &Path,
+        cache: &HashMap<String, FileStatus>,
+    ) -> Result<(), SafeRmError> {
+        if path.is_dir() {
+            self.check_directory_with_cache(path, cache)
+        } else {
+            self.check_file_with_cache(path, cache)
+        }
     }
 }
 
