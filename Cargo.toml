@@ -35,7 +35,7 @@ git2 = { version = "0.20.3", features = ["vendored-libgit2", "vendored-openssl"]
 anyhow = "1.0.100"
 
 [dev-dependencies]
-assert_cmd = "2.1.1"
+assert_cmd = "2.1.2"
 predicates = "3.1.3"
 tempfile = "3.24.0"
 

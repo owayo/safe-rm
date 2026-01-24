@@ -13,7 +13,7 @@ impl PathChecker {
     /// パスがプロジェクトルート内にあることを検証
     ///
     /// # Arguments
-    /// * `project_root` - プロジェクトルートの絶対パス
+    /// * `project_root` - プロジェクト境界の絶対パス（Gitリポジトリルート等）
     /// * `target_path` - 検証対象のパス（相対または絶対）
     ///
     /// # Returns
@@ -23,8 +23,26 @@ impl PathChecker {
         project_root: &Path,
         target_path: &Path,
     ) -> Result<PathBuf, SafeRmError> {
-        // 1. パスを絶対パスに変換
-        let absolute_path = Self::to_absolute(project_root, target_path);
+        Self::verify_containment_with_base(project_root, project_root, target_path)
+    }
+
+    /// パスがプロジェクトルート内にあることを検証（解決ベース指定）
+    ///
+    /// # Arguments
+    /// * `project_root` - プロジェクト境界の絶対パス（Gitリポジトリルート等）
+    /// * `resolve_base` - 相対パスの解決基底（通常はカレントディレクトリ）
+    /// * `target_path` - 検証対象のパス（相対または絶対）
+    ///
+    /// # Returns
+    /// * `Ok(PathBuf)` - 正規化された絶対パス
+    /// * `Err(SafeRmError::OutsideProject)` - プロジェクト外へのアクセス
+    pub fn verify_containment_with_base(
+        project_root: &Path,
+        resolve_base: &Path,
+        target_path: &Path,
+    ) -> Result<PathBuf, SafeRmError> {
+        // 1. パスを絶対パスに変換（相対パスは resolve_base から解決）
+        let absolute_path = Self::to_absolute(resolve_base, target_path);
 
         // 2. 字句的に正規化（.. を解決）
         let cleaned_path = absolute_path.clean();

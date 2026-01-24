@@ -27,11 +27,19 @@ fn main() -> ExitCode {
 fn run() -> Result<(), SafeRmError> {
     let args = CliArgs::parse_args();
 
-    // Get project root (current working directory)
-    let project_root = std::env::current_dir().map_err(SafeRmError::IoError)?;
+    // Get current working directory
+    let cwd = std::env::current_dir().map_err(SafeRmError::IoError)?;
 
     // Open Git repository if available
-    let git_checker = GitChecker::open(&project_root);
+    let git_checker = GitChecker::open(&cwd);
+
+    // Use Git repository root as project boundary (not just cwd)
+    // This allows absolute paths within the same repo to work correctly
+    // e.g., running from frontend/ but deleting backend/file.txt
+    let project_root = git_checker
+        .as_ref()
+        .and_then(|checker| checker.workdir())
+        .unwrap_or_else(|| cwd.clone());
 
     // Pre-fetch all Git statuses at once (batch optimization)
     // This reduces N API calls to 1 for N files
@@ -46,7 +54,14 @@ fn run() -> Result<(), SafeRmError> {
     let mut last_error: Option<SafeRmError> = None;
 
     for path in &args.paths {
-        match process_path(path, &project_root, &git_checker, &status_cache, &args) {
+        match process_path(
+            path,
+            &project_root,
+            &cwd,
+            &git_checker,
+            &status_cache,
+            &args,
+        ) {
             Ok(deleted) => {
                 if deleted {
                     success_count += 1;
@@ -86,19 +101,22 @@ fn run() -> Result<(), SafeRmError> {
 fn process_path(
     path: &Path,
     project_root: &Path,
+    cwd: &Path,
     git_checker: &Option<GitChecker>,
     status_cache: &HashMap<String, FileStatus>,
     args: &CliArgs,
 ) -> Result<bool, SafeRmError> {
     // Verify path is within project FIRST (security check takes precedence)
     // This prevents information disclosure about file existence outside project
-    let canonical_path = PathChecker::verify_containment(project_root, path)?;
+    // project_root is the git repo root (or cwd if no git repo)
+    // cwd is used as the base for resolving relative paths
+    let canonical_path = PathChecker::verify_containment_with_base(project_root, cwd, path)?;
 
-    // Resolve path to absolute
+    // Resolve path to absolute (relative paths are resolved from cwd, not git root)
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        project_root.join(path)
+        cwd.join(path)
     };
 
     // Check if path exists

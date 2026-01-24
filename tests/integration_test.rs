@@ -236,6 +236,60 @@ mod allow_flow_tests {
     }
 
     #[test]
+    fn test_absolute_path_sibling_directory() {
+        // 再現シナリオ: frontend/ から backend/file.txt をフルパスで削除
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // frontend/ と backend/ サブディレクトリを作成
+        let frontend = repo_path.join("frontend");
+        let backend = repo_path.join("backend");
+        fs::create_dir(&frontend).unwrap();
+        fs::create_dir(&backend).unwrap();
+
+        // backend/file.txt を作成してコミット
+        commit_file(&repo_path, "backend/file.txt", "backend content");
+
+        // frontend/ から backend/file.txt のフルパスで削除
+        let abs_path = backend.join("file.txt");
+        let (exit_code, stdout, stderr) = run_safe_rm(&[abs_path.to_str().unwrap()], &frontend);
+
+        assert_eq!(
+            exit_code, 0,
+            "Absolute path to sibling directory file should succeed. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(!abs_path.exists(), "File should be deleted");
+    }
+
+    #[test]
+    fn test_absolute_path_within_same_repo() {
+        // リポジトリルートのファイルをサブディレクトリからフルパスで削除
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // サブディレクトリを作成
+        let subdir = repo_path.join("subdir");
+        fs::create_dir(&subdir).unwrap();
+
+        // ルートにファイルを作成してコミット
+        commit_file(&repo_path, "root_file.txt", "root content");
+
+        // subdir/ からルートのファイルをフルパスで削除
+        let abs_path = repo_path.join("root_file.txt");
+        let (exit_code, stdout, stderr) = run_safe_rm(&[abs_path.to_str().unwrap()], &subdir);
+
+        assert_eq!(
+            exit_code, 0,
+            "Absolute path to repo root file should succeed. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(!abs_path.exists(), "File should be deleted");
+    }
+
+    #[test]
     fn test_multiple_files() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();

@@ -5,7 +5,7 @@
 use crate::error::{FileStatus, SafeRmError};
 use git2::{Repository, Status, StatusOptions};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Git ステータスチェッカー
 pub struct GitChecker {
@@ -13,15 +13,27 @@ pub struct GitChecker {
 }
 
 impl GitChecker {
-    /// プロジェクトルートで Git リポジトリを開く
+    /// 指定パスから Git リポジトリを検出して開く
+    ///
+    /// `Repository::discover` を使用して上位ディレクトリを走査し、
+    /// Gitリポジトリを検出する。サブディレクトリからでもリポジトリルートを正しく検出可能。
     ///
     /// # Returns
     /// * `Some(GitChecker)` - Git リポジトリが存在
     /// * `None` - Git リポジトリなし（Git チェックスキップ）
-    pub fn open(project_root: &Path) -> Option<Self> {
-        Repository::open(project_root)
-            .ok()
-            .map(|repo| Self { repo })
+    pub fn open(path: &Path) -> Option<Self> {
+        Repository::discover(path).ok().map(|repo| Self { repo })
+    }
+
+    /// Git リポジトリのワークディレクトリ（ルート）を取得
+    ///
+    /// フルパス指定時のプロジェクト境界判定に使用。
+    /// bare リポジトリの場合は None を返す。
+    /// macOS の /var → /private/var シンボリックリンク対策で canonicalize する。
+    pub fn workdir(&self) -> Option<PathBuf> {
+        self.repo
+            .workdir()
+            .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
     }
 
     /// 全ファイルのステータスを一括取得（バッチ処理用）
