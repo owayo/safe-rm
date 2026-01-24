@@ -8,13 +8,28 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use safe_rm::cli::CliArgs;
+use safe_rm::cli::{CliArgs, Commands};
+use safe_rm::config::Config;
 use safe_rm::error::{FileStatus, SafeRmError};
 use safe_rm::git_checker::GitChecker;
+use safe_rm::init;
 use safe_rm::path_checker::PathChecker;
 
 fn main() -> ExitCode {
-    match run() {
+    let args = CliArgs::parse_args();
+
+    // Handle subcommands
+    if let Some(Commands::Init) = args.command {
+        match init::run_init() {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("safe-rm: {}", e);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("safe-rm: {}", e);
@@ -24,8 +39,9 @@ fn main() -> ExitCode {
 }
 
 /// Main execution logic
-fn run() -> Result<(), SafeRmError> {
-    let args = CliArgs::parse_args();
+fn run(args: CliArgs) -> Result<(), SafeRmError> {
+    // Load user configuration
+    let config = Config::load();
 
     // Get current working directory
     let cwd = std::env::current_dir().map_err(SafeRmError::IoError)?;
@@ -61,6 +77,7 @@ fn run() -> Result<(), SafeRmError> {
             &git_checker,
             &status_cache,
             &args,
+            &config,
         ) {
             Ok(deleted) => {
                 if deleted {
@@ -105,13 +122,8 @@ fn process_path(
     git_checker: &Option<GitChecker>,
     status_cache: &HashMap<String, FileStatus>,
     args: &CliArgs,
+    config: &Config,
 ) -> Result<bool, SafeRmError> {
-    // Verify path is within project FIRST (security check takes precedence)
-    // This prevents information disclosure about file existence outside project
-    // project_root is the git repo root (or cwd if no git repo)
-    // cwd is used as the base for resolving relative paths
-    let canonical_path = PathChecker::verify_containment_with_base(project_root, cwd, path)?;
-
     // Resolve path to absolute (relative paths are resolved from cwd, not git root)
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
@@ -119,34 +131,69 @@ fn process_path(
         cwd.join(path)
     };
 
-    // Check if path exists
-    if !abs_path.exists() {
-        if args.force {
-            // --force: ignore nonexistent files
-            return Ok(false);
-        } else {
-            return Err(SafeRmError::NotFound(abs_path));
+    // Check if path is in allowed_paths (bypass containment and Git checks)
+    if config.is_path_allowed(&abs_path) {
+        // Check if path exists
+        if !abs_path.exists() {
+            if args.force {
+                return Ok(false);
+            } else {
+                return Err(SafeRmError::NotFound(abs_path));
+            }
         }
-    }
 
-    // Check if it's a directory without -r flag
-    if abs_path.is_dir() && !args.recursive {
-        return Err(SafeRmError::IsDirectory(abs_path));
-    }
+        // Check if it's a directory without -r flag
+        if abs_path.is_dir() && !args.recursive {
+            return Err(SafeRmError::IsDirectory(abs_path));
+        }
 
-    // Check Git status using pre-fetched cache (batch optimization)
-    if let Some(ref checker) = git_checker {
-        checker.check_path_with_cache(&canonical_path, status_cache)?;
-    }
-
-    // Perform deletion (or dry-run)
-    if args.dry_run {
-        println!("would remove: {}", path.display());
-        Ok(true)
+        // Perform deletion (or dry-run) — skip containment and Git checks
+        if args.dry_run {
+            println!("would remove: {} (allowed by config)", path.display());
+            Ok(true)
+        } else {
+            delete_path(&abs_path, args.recursive)?;
+            println!("removed: {} (allowed by config)", path.display());
+            Ok(true)
+        }
     } else {
-        delete_path(&abs_path, args.recursive)?;
-        println!("removed: {}", path.display());
-        Ok(true)
+        // Standard safety checks
+
+        // Verify path is within project FIRST (security check takes precedence)
+        // This prevents information disclosure about file existence outside project
+        // project_root is the git repo root (or cwd if no git repo)
+        // cwd is used as the base for resolving relative paths
+        let canonical_path = PathChecker::verify_containment_with_base(project_root, cwd, path)?;
+
+        // Check if path exists
+        if !abs_path.exists() {
+            if args.force {
+                // --force: ignore nonexistent files
+                return Ok(false);
+            } else {
+                return Err(SafeRmError::NotFound(abs_path));
+            }
+        }
+
+        // Check if it's a directory without -r flag
+        if abs_path.is_dir() && !args.recursive {
+            return Err(SafeRmError::IsDirectory(abs_path));
+        }
+
+        // Check Git status using pre-fetched cache (batch optimization)
+        if let Some(ref checker) = git_checker {
+            checker.check_path_with_cache(&canonical_path, status_cache)?;
+        }
+
+        // Perform deletion (or dry-run)
+        if args.dry_run {
+            println!("would remove: {}", path.display());
+            Ok(true)
+        } else {
+            delete_path(&abs_path, args.recursive)?;
+            println!("removed: {}", path.display());
+            Ok(true)
+        }
     }
 }
 

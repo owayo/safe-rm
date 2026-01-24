@@ -2,7 +2,7 @@
 //!
 //! Provides type-safe argument parsing using clap derive.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 /// CLI arguments for safe-rm
@@ -13,9 +13,14 @@ use std::path::PathBuf;
     about = "Safe file deletion tool for AI agents",
     long_about = "A CLI tool that provides Git-aware access control for file deletion.\n\
                   It allows deleting only clean or ignored files within the project directory,\n\
-                  preventing accidental deletion of uncommitted work or files outside the project."
+                  preventing accidental deletion of uncommitted work or files outside the project.",
+    subcommand_negates_reqs = true
 )]
 pub struct CliArgs {
+    /// Subcommand (e.g., init)
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+
     /// Files or directories to delete
     #[arg(required = true, value_name = "PATH")]
     pub paths: Vec<PathBuf>,
@@ -33,6 +38,13 @@ pub struct CliArgs {
     pub dry_run: bool,
 }
 
+/// Subcommands
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Initialize configuration file (~/.config/safe-rm/config.toml)
+    Init,
+}
+
 impl CliArgs {
     /// Parse CLI arguments from command line
     pub fn parse_args() -> Self {
@@ -46,6 +58,7 @@ mod tests {
 
     fn make_args(paths: Vec<&str>, recursive: bool, force: bool, dry_run: bool) -> CliArgs {
         CliArgs {
+            command: None,
             paths: paths.into_iter().map(PathBuf::from).collect(),
             recursive,
             force,
@@ -106,5 +119,17 @@ mod tests {
         assert!(args.recursive);
         assert!(args.force);
         assert!(args.dry_run);
+    }
+
+    #[test]
+    fn test_cli_args_init_subcommand() {
+        let args = CliArgs {
+            command: Some(Commands::Init),
+            paths: vec![],
+            recursive: false,
+            force: false,
+            dry_run: false,
+        };
+        assert!(matches!(args.command, Some(Commands::Init)));
     }
 }

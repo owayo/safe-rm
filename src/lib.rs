@@ -4,6 +4,8 @@
 //! allowing AI agents to safely delete only clean or ignored files.
 
 pub mod cli;
+pub mod config;
 pub mod error;
 pub mod git_checker;
+pub mod init;
 pub mod path_checker;

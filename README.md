@@ -33,6 +33,7 @@
 - **Git Status Protection**: Prevent deletion of modified, staged, or untracked files
 - **Directory Traversal Prevention**: Block `../` escape attempts
 - **Ignored File Passthrough**: Allow deletion of `.gitignore`d files (build artifacts, etc.)
+- **Configurable Allowed Paths**: Bypass safety checks for specified directories (per-directory recursive control)
 - **Non-Git Support**: Works safely in non-Git directories
 - **Dry Run Mode**: Preview what would be deleted without actually deleting
 
@@ -85,14 +86,78 @@ safe-rm -rf build/
 | `-h, --help` | Show help message |
 | `-V, --version` | Show version |
 
+### Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `init` | Generate config file at `~/.config/safe-rm/config.toml` |
+
+## Configuration
+
+`safe-rm` supports an optional configuration file at `~/.config/safe-rm/config.toml` to define directories where deletion is always permitted, bypassing project containment and Git status checks. Tilde (`~`) expansion is supported for home directory paths.
+
+### Setup
+
+```bash
+# Generate a default config file with examples
+safe-rm init
+# → Creates ~/.config/safe-rm/config.toml
+```
+
+### Config File Format
+
+```toml
+# Recursively allow all files/subdirectories under this path
+# Tilde (~) is expanded to home directory
+[[allowed_paths]]
+path = "~/.claude/skills"
+recursive = true
+
+# Only allow direct children of this directory
+[[allowed_paths]]
+path = "/tmp/logs"
+recursive = false
+```
+
+### Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `path` | string | (required) | Directory path where deletion is permitted |
+| `recursive` | bool | `false` | If `true`, all nested files/subdirectories are allowed. If `false`, only direct children. |
+
+### Behavior
+
+- Paths matching `allowed_paths` bypass both project containment and Git status checks
+- The `recursive` flag controls whether subdirectories are included:
+  - `recursive = true`: `/path/to/dir/sub/deep/file.txt` is allowed
+  - `recursive = false`: Only `/path/to/dir/file.txt` is allowed (direct children)
+- If the config file is missing or invalid, `safe-rm` falls back to default behavior (no allowed paths)
+- Output includes `(allowed by config)` annotation for config-permitted deletions
+
+### Example
+
+```bash
+# With config: allowed_paths = [{ path = "~/.claude/skills", recursive = true }]
+
+# This works even outside the current project:
+safe-rm ~/.claude/skills/my-skill/rules.md
+# removed: /Users/owa/.claude/skills/my-skill/rules.md (allowed by config)
+
+safe-rm -r ~/.claude/skills/old-skill/
+# removed: /Users/owa/.claude/skills/old-skill/ (allowed by config)
+```
+
 ## Architecture
 
 ```mermaid
 flowchart TB
-    CLI[CLI Arguments] --> PathCheck[Path Checker]
+    CLI[CLI Arguments] --> ConfigCheck{In allowed_paths?}
+    ConfigCheck -->|Yes| Delete[Delete File]
+    ConfigCheck -->|No| PathCheck[Path Checker]
     PathCheck --> GitCheck[Git Checker]
     GitCheck --> Result{Allow?}
-    Result -->|Yes| Delete[Delete File]
+    Result -->|Yes| Delete
     Result -->|No| Exit2[Exit 2 + stderr]
     Delete --> Exit0[Exit 0]
 ```
@@ -114,6 +179,10 @@ flowchart TB
         other["../other-project/"]
     end
 
+    subgraph allowed["Config Allowed Paths ✅"]
+        skills["~/.claude/skills/**<br/>(allowed by config)"]
+    end
+
     subgraph project["Project Directory (cwd)"]
         subgraph dirty["Uncommitted Changes 🛡️"]
             modified["main.rs<br/>(modified)"]
@@ -129,6 +198,7 @@ flowchart TB
     end
 
     style outside fill:#ffcccc,stroke:#cc0000,color:#000000
+    style allowed fill:#ccffcc,stroke:#00cc00,color:#000000
     style dirty fill:#ffcccc,stroke:#cc0000,color:#000000
     style deletable fill:#ccffcc,stroke:#00cc00,color:#000000
 ```
@@ -138,6 +208,7 @@ flowchart TB
 | `old_module.rs` (clean) | ✅ Yes | Committed, recoverable via `git checkout` |
 | `target/` (ignored) | ✅ Yes | In `.gitignore`, build artifacts |
 | `node_modules/` (ignored) | ✅ Yes | In `.gitignore`, dependencies |
+| `~/.claude/skills/foo` | ✅ Yes | Allowed by config (recursive) |
 | `main.rs` (modified) | ❌ No | Uncommitted changes would be lost |
 | `new_feature.rs` (staged) | ❌ No | Pending commit would be lost |
 | `temp.txt` (untracked) | ❌ No | Not in Git history, unrecoverable |
@@ -146,6 +217,7 @@ flowchart TB
 
 **Key Points**:
 - Files outside the project are **always blocked**, regardless of Git status
+- **Config allowed paths** bypass both containment and Git checks (supports `~` expansion)
 - In a Git repository: only clean (committed) or ignored files can be deleted
 - In a non-Git directory: all files inside the project can be deleted (no Git protection)
 
@@ -272,8 +344,8 @@ cargo build --release
 
 ### Test Coverage
 
-- **Unit Tests**: 60+ tests covering all modules
-- **Integration Tests**: 18 tests with real Git repositories
+- **Unit Tests**: 80+ tests covering all modules
+- **Integration Tests**: 21 tests with real Git repositories
 
 ## Contributing
 

@@ -33,6 +33,7 @@
 - **Gitステータス保護**: 変更済み、ステージング済み、未追跡ファイルの削除を防止
 - **ディレクトリトラバーサル防止**: `../` によるエスケープ試行をブロック
 - **無視ファイルの許可**: `.gitignore` で指定されたファイル（ビルド成果物など）の削除を許可
+- **許可パス設定**: 指定ディレクトリの安全チェックをバイパス（ディレクトリごとの再帰設定）
 - **非Gitサポート**: 非Gitディレクトリでも安全に動作
 - **ドライランモード**: 実際に削除せずに削除対象をプレビュー
 
@@ -85,14 +86,78 @@ safe-rm -rf build/
 | `-h, --help` | ヘルプを表示 |
 | `-V, --version` | バージョンを表示 |
 
+### サブコマンド
+
+| サブコマンド | 説明 |
+|------------|------|
+| `init` | 設定ファイルを `~/.config/safe-rm/config.toml` に生成 |
+
+## 設定
+
+`safe-rm` は `~/.config/safe-rm/config.toml` にオプションの設定ファイルをサポートしています。削除を常に許可するディレクトリを定義でき、プロジェクト境界チェックとGitステータスチェックの両方をバイパスします。チルダ（`~`）によるホームディレクトリ展開に対応しています。
+
+### セットアップ
+
+```bash
+# デフォルト設定ファイルを生成
+safe-rm init
+# → ~/.config/safe-rm/config.toml を作成
+```
+
+### 設定ファイル形式
+
+```toml
+# このパス配下のすべてのファイル/サブディレクトリを再帰的に許可
+# チルダ（~）はホームディレクトリに展開されます
+[[allowed_paths]]
+path = "~/.claude/skills"
+recursive = true
+
+# このディレクトリの直下のファイルのみ許可
+[[allowed_paths]]
+path = "/tmp/logs"
+recursive = false
+```
+
+### フィールド
+
+| フィールド | 型 | デフォルト | 説明 |
+|-----------|------|---------|------|
+| `path` | string | (必須) | 削除を許可するディレクトリパス |
+| `recursive` | bool | `false` | `true`: ネストされたすべてのファイル/サブディレクトリを許可。`false`: 直下のファイルのみ。 |
+
+### 動作
+
+- `allowed_paths` にマッチするパスは、プロジェクト境界チェックとGitステータスチェックの両方をバイパス
+- `recursive` フラグでサブディレクトリの扱いを制御:
+  - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可
+  - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可
+- 設定ファイルが存在しないか無効な場合、デフォルト動作（許可パスなし）にフォールバック
+- 設定で許可された削除には `(allowed by config)` の注釈が出力に表示
+
+### 例
+
+```bash
+# 設定: allowed_paths = [{ path = "~/.claude/skills", recursive = true }]
+
+# 現在のプロジェクト外でも動作:
+safe-rm ~/.claude/skills/my-skill/rules.md
+# removed: /Users/owa/.claude/skills/my-skill/rules.md (allowed by config)
+
+safe-rm -r ~/.claude/skills/old-skill/
+# removed: /Users/owa/.claude/skills/old-skill/ (allowed by config)
+```
+
 ## アーキテクチャ
 
 ```mermaid
 flowchart TB
-    CLI[CLI引数] --> PathCheck[パスチェッカー]
+    CLI[CLI引数] --> ConfigCheck{allowed_paths内?}
+    ConfigCheck -->|Yes| Delete[ファイル削除]
+    ConfigCheck -->|No| PathCheck[パスチェッカー]
     PathCheck --> GitCheck[Gitチェッカー]
     GitCheck --> Result{許可?}
-    Result -->|Yes| Delete[ファイル削除]
+    Result -->|Yes| Delete
     Result -->|No| Exit2[Exit 2 + stderr]
     Delete --> Exit0[Exit 0]
 ```
@@ -114,6 +179,10 @@ flowchart TB
         other["../other-project/"]
     end
 
+    subgraph allowed["設定で許可されたパス ✅"]
+        skills["~/.claude/skills/**<br/>(設定により許可)"]
+    end
+
     subgraph project["プロジェクトディレクトリ (cwd)"]
         subgraph dirty["未コミットの変更 🛡️"]
             modified["main.rs<br/>(変更済み)"]
@@ -129,6 +198,7 @@ flowchart TB
     end
 
     style outside fill:#ffcccc,stroke:#cc0000,color:#000000
+    style allowed fill:#ccffcc,stroke:#00cc00,color:#000000
     style dirty fill:#ffcccc,stroke:#cc0000,color:#000000
     style deletable fill:#ccffcc,stroke:#00cc00,color:#000000
 ```
@@ -138,6 +208,7 @@ flowchart TB
 | `old_module.rs` (クリーン) | ✅ はい | コミット済み、`git checkout` で復元可能 |
 | `target/` (無視) | ✅ はい | `.gitignore` に記載、ビルド成果物 |
 | `node_modules/` (無視) | ✅ はい | `.gitignore` に記載、依存関係 |
+| `~/.claude/skills/foo` | ✅ はい | 設定により許可（recursive） |
 | `main.rs` (変更済み) | ❌ いいえ | 未コミットの変更が失われる |
 | `new_feature.rs` (ステージング済み) | ❌ いいえ | コミット待ちの内容が失われる |
 | `temp.txt` (未追跡) | ❌ いいえ | Git履歴になく、復元不可能 |
@@ -146,6 +217,7 @@ flowchart TB
 
 **重要ポイント**:
 - プロジェクト外のファイルは**常にブロック**（Git状態に関係なく）
+- **設定で許可されたパス**は境界チェックとGitチェックの両方をバイパス（`~` 展開対応）
 - Gitリポジトリ内: クリーン（コミット済み）または無視されたファイルのみ削除可能
 - 非Gitディレクトリ内: プロジェクト内のすべてのファイルが削除可能（Git保護なし）
 
@@ -272,8 +344,8 @@ cargo build --release
 
 ### テストカバレッジ
 
-- **ユニットテスト**: 全モジュールをカバーする60件以上のテスト
-- **統合テスト**: 実際のGitリポジトリを使用した18件のテスト
+- **ユニットテスト**: 全モジュールをカバーする80件以上のテスト
+- **統合テスト**: 実際のGitリポジトリを使用した21件のテスト
 
 ## コントリビューション
 
