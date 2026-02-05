@@ -554,6 +554,148 @@ mod block_flow_tests {
 // エッジケースのテスト
 // =============================================================================
 
+// =============================================================================
+// allow_project_deletion = true (デフォルトモード) のテスト
+// =============================================================================
+
+mod default_mode_tests {
+    use super::*;
+
+    #[test]
+    fn test_default_mode_allows_modified_file() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // ファイルをコミット後に変更
+        commit_file(&repo_path, "modified.txt", "original");
+        fs::write(repo_path.join("modified.txt"), "modified content").unwrap();
+
+        // デフォルトモード（allow_project_deletion = true）では削除可能
+        let (exit_code, stdout, stderr) = run_safe_rm(&["modified.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "Modified file should be deletable in default mode. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join("modified.txt").exists(),
+            "File should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_default_mode_allows_staged_file() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // 初期コミット
+        commit_file(&repo_path, "init.txt", "init");
+
+        // ファイルを作成してステージング
+        fs::write(repo_path.join("staged.txt"), "staged content").unwrap();
+        Command::new("git")
+            .args(["add", "staged.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // デフォルトモードでは削除可能
+        let (exit_code, stdout, stderr) = run_safe_rm(&["staged.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "Staged file should be deletable in default mode. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join("staged.txt").exists(),
+            "File should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_default_mode_allows_untracked_file() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // 初期コミット
+        commit_file(&repo_path, "init.txt", "init");
+
+        // 未追跡ファイルを作成
+        fs::write(repo_path.join("untracked.txt"), "untracked content").unwrap();
+
+        // デフォルトモードでは削除可能
+        let (exit_code, stdout, stderr) = run_safe_rm(&["untracked.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "Untracked file should be deletable in default mode. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join("untracked.txt").exists(),
+            "File should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_default_mode_allows_dirty_directory_recursive() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // ディレクトリを作成
+        let subdir = repo_path.join("subdir");
+        fs::create_dir(&subdir).unwrap();
+
+        // Clean ファイルをコミット
+        commit_file(&repo_path, "subdir/clean.txt", "clean");
+
+        // 未追跡ファイルを追加
+        fs::write(subdir.join("untracked.txt"), "untracked").unwrap();
+
+        // デフォルトモードではダーティファイルを含むディレクトリも削除可能
+        let (exit_code, stdout, stderr) = run_safe_rm(&["-r", "subdir"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "Directory with dirty files should be deletable in default mode. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join("subdir").exists(),
+            "Directory should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_default_mode_still_blocks_outside_project() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // プロジェクト外へのアクセスはデフォルトモードでもブロックされる
+        let (exit_code, _, stderr) = run_safe_rm(&["/etc/passwd"], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "Outside project path should be blocked even in default mode"
+        );
+        assert!(
+            stderr.contains("プロジェクト外") || stderr.contains("Outside"),
+            "Error message should indicate outside project: {}",
+            stderr
+        );
+    }
+}
+
+// =============================================================================
+// エッジケースのテスト
+// =============================================================================
+
 mod edge_case_tests {
     use super::*;
 
@@ -635,5 +777,412 @@ mod edge_case_tests {
             stdout.contains("safe-rm"),
             "Version should show program name"
         );
+    }
+}
+
+// =============================================================================
+// strict モードでの許可フローテスト
+// =============================================================================
+
+mod strict_mode_allow_tests {
+    use super::*;
+
+    /// allow_project_deletion = false の設定ファイルを作成
+    fn create_strict_config() -> tempfile::NamedTempFile {
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+        config
+    }
+
+    #[test]
+    fn test_strict_mode_allows_clean_file() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // Clean ファイルを作成
+        commit_file(&repo_path, "clean.txt", "clean content");
+
+        // strictモードでもcleanファイルは削除可能
+        let (exit_code, stdout, stderr) =
+            run_safe_rm_with_config(&["clean.txt"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "Clean file should be deletable in strict mode. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join("clean.txt").exists(),
+            "File should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_allows_ignored_file() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // .gitignore を作成してコミット
+        fs::write(repo_path.join(".gitignore"), "ignored.txt\n").unwrap();
+        Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // Ignored ファイルを作成
+        fs::write(repo_path.join("ignored.txt"), "ignored content").unwrap();
+
+        // strictモードでもignoredファイルは削除可能
+        let (exit_code, stdout, stderr) =
+            run_safe_rm_with_config(&["ignored.txt"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "Ignored file should be deletable in strict mode. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join("ignored.txt").exists(),
+            "File should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_allows_ignored_directory_recursive() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // .gitignore を作成してコミット
+        fs::write(repo_path.join(".gitignore"), "build/\n").unwrap();
+        Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // Ignored ディレクトリを作成
+        let build_dir = repo_path.join("build");
+        fs::create_dir(&build_dir).unwrap();
+        fs::write(build_dir.join("output.o"), "binary").unwrap();
+
+        // strictモードでもignoredディレクトリは-rで削除可能
+        let (exit_code, stdout, stderr) =
+            run_safe_rm_with_config(&["-r", "build"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "Ignored directory should be deletable in strict mode. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join("build").exists(),
+            "Directory should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_allows_clean_directory_recursive() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // ディレクトリとcleanファイルを作成
+        let subdir = repo_path.join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        commit_file(&repo_path, "subdir/clean1.txt", "clean1");
+        commit_file(&repo_path, "subdir/clean2.txt", "clean2");
+
+        // strictモードでもすべてcleanなディレクトリは削除可能
+        let (exit_code, stdout, stderr) =
+            run_safe_rm_with_config(&["-r", "subdir"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "Directory with only clean files should be deletable in strict mode. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join("subdir").exists(),
+            "Directory should be deleted"
+        );
+    }
+}
+
+// =============================================================================
+// SAFE_RM_CONFIG 環境変数のテスト
+// =============================================================================
+
+mod env_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_env_config_nonexistent_path_fallback() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // Clean ファイルを作成
+        commit_file(&repo_path, "clean.txt", "clean content");
+
+        // 存在しない設定ファイルを指定 → デフォルト設定にフォールバック
+        let (exit_code, stdout, _) = run_safe_rm_with_config(
+            &["clean.txt"],
+            &repo_path,
+            Some(std::path::Path::new("/nonexistent/config.toml")),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "Should fallback to default config and succeed"
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+    }
+
+    #[test]
+    fn test_env_config_invalid_toml_fallback() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // Clean ファイルを作成
+        commit_file(&repo_path, "clean.txt", "clean content");
+
+        // 無効なTOMLを含む設定ファイルを作成
+        let invalid_config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(invalid_config.path(), "invalid[[[toml content").unwrap();
+
+        // 無効な設定 → デフォルトにフォールバック
+        let (exit_code, stdout, stderr) =
+            run_safe_rm_with_config(&["clean.txt"], &repo_path, Some(invalid_config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "Should fallback to default config and succeed"
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            stderr.contains("warning") || stderr.contains("Warning"),
+            "Should show warning about invalid config: {}",
+            stderr
+        );
+    }
+
+    #[test]
+    fn test_env_config_applies_allowed_paths() {
+        // プロジェクト外のディレクトリを作成
+        let outside_dir = TempDir::new().unwrap();
+        let outside_path = outside_dir.path().canonicalize().unwrap();
+        let outside_file = outside_path.join("allowed_file.txt");
+        fs::write(&outside_file, "content").unwrap();
+
+        // allowed_pathsを含む設定ファイル
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+[[allowed_paths]]
+path = "{}"
+recursive = true
+"#,
+            outside_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // プロジェクトを作成
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        // allowed_pathsで許可されているので削除可能
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &[outside_file.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "File in allowed_paths should be deletable. stderr: {}",
+            stderr
+        );
+        assert!(
+            stdout.contains("removed:") && stdout.contains("allowed by config"),
+            "Should show removed message with config annotation: {}",
+            stdout
+        );
+        assert!(!outside_file.exists(), "File should be deleted");
+    }
+}
+
+// =============================================================================
+// allowed_paths のエラーハンドリングテスト
+// =============================================================================
+
+mod allowed_paths_error_tests {
+    use super::*;
+
+    #[test]
+    fn test_allowed_paths_nonexistent_with_force() {
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        // 存在しないパスを許可する設定
+        let allowed_dir = TempDir::new().unwrap();
+        let allowed_path = allowed_dir.path().canonicalize().unwrap();
+        let nonexistent_file = allowed_path.join("nonexistent.txt");
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+[[allowed_paths]]
+path = "{}"
+recursive = true
+"#,
+            allowed_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // -f フラグ付きで存在しないファイルを削除 → 成功（無視）
+        let (exit_code, _, _) = run_safe_rm_with_config(
+            &["-f", nonexistent_file.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "-f flag should ignore nonexistent file in allowed_paths"
+        );
+    }
+
+    #[test]
+    fn test_allowed_paths_nonexistent_without_force() {
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        // 存在しないパスを許可する設定
+        let allowed_dir = TempDir::new().unwrap();
+        let allowed_path = allowed_dir.path().canonicalize().unwrap();
+        let nonexistent_file = allowed_path.join("nonexistent.txt");
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+[[allowed_paths]]
+path = "{}"
+recursive = true
+"#,
+            allowed_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // -f なしで存在しないファイルを削除 → 失敗
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &[nonexistent_file.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(exit_code, 1, "Should fail for nonexistent file without -f");
+        assert!(
+            stderr.contains("No such file"),
+            "Error should mention file not found: {}",
+            stderr
+        );
+    }
+
+    #[test]
+    fn test_allowed_paths_directory_without_recursive() {
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        // 許可されたパス内にディレクトリを作成
+        let allowed_dir = TempDir::new().unwrap();
+        let allowed_path = allowed_dir.path().canonicalize().unwrap();
+        let subdir = allowed_path.join("subdir");
+        fs::create_dir(&subdir).unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+[[allowed_paths]]
+path = "{}"
+recursive = true
+"#,
+            allowed_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // -r なしでディレクトリを削除 → 失敗
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &[subdir.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(exit_code, 1, "Should fail for directory without -r");
+        assert!(
+            stderr.contains("Is a directory") || stderr.contains("-r"),
+            "Error should mention directory requires -r: {}",
+            stderr
+        );
+    }
+
+    #[test]
+    fn test_allowed_paths_strict_mode_bypasses_git_check() {
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        // プロジェクト外にGitで追跡されていないファイルを作成
+        let outside_dir = TempDir::new().unwrap();
+        let outside_path = outside_dir.path().canonicalize().unwrap();
+        let outside_file = outside_path.join("file.txt");
+        fs::write(&outside_file, "content").unwrap();
+
+        // strictモードでもallowed_pathsは許可される
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+allow_project_deletion = false
+
+[[allowed_paths]]
+path = "{}"
+recursive = true
+"#,
+            outside_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &[outside_file.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "allowed_paths should bypass both containment and Git checks in strict mode. stderr: {}",
+            stderr
+        );
+        assert!(
+            stdout.contains("allowed by config"),
+            "Should show allowed by config: {}",
+            stdout
+        );
+        assert!(!outside_file.exists(), "File should be deleted");
     }
 }

@@ -217,6 +217,46 @@ mod tests {
     }
 
     #[test]
+    fn test_default_config_has_allow_project_deletion_true() {
+        let config = Config::default();
+        assert!(
+            config.allow_project_deletion,
+            "Default allow_project_deletion should be true"
+        );
+    }
+
+    #[test]
+    fn test_parsed_config_defaults_allow_project_deletion_true() {
+        // Empty config should default to allow_project_deletion = true
+        let toml_content = "";
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(
+            config.allow_project_deletion,
+            "Parsed empty config should have allow_project_deletion = true"
+        );
+    }
+
+    #[test]
+    fn test_explicit_allow_project_deletion_false() {
+        let toml_content = "allow_project_deletion = false\n";
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(
+            !config.allow_project_deletion,
+            "Explicit false should be respected"
+        );
+    }
+
+    #[test]
+    fn test_explicit_allow_project_deletion_true() {
+        let toml_content = "allow_project_deletion = true\n";
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(
+            config.allow_project_deletion,
+            "Explicit true should be respected"
+        );
+    }
+
+    #[test]
     fn test_load_missing_file() {
         let config = Config::load_from_path(Some(PathBuf::from("/nonexistent/config.toml")));
         assert!(config.allowed_paths.is_empty());
@@ -565,5 +605,137 @@ recursive = true
 
         assert!(config.is_path_allowed(&child_file)); // direct child OK
         assert!(!config.is_path_allowed(&nested_file)); // nested blocked
+    }
+
+    // --- SAFE_RM_CONFIG environment variable tests ---
+
+    #[test]
+    fn test_config_path_uses_env_var() {
+        // Save original value and set test value
+        let original = std::env::var("SAFE_RM_CONFIG").ok();
+        // SAFETY: Tests run single-threaded with --test-threads=1 or serially
+        unsafe {
+            std::env::set_var("SAFE_RM_CONFIG", "/custom/path/config.toml");
+        }
+
+        let path = Config::config_path();
+        assert_eq!(path, Some(PathBuf::from("/custom/path/config.toml")));
+
+        // Restore original value
+        // SAFETY: Tests run single-threaded
+        unsafe {
+            if let Some(val) = original {
+                std::env::set_var("SAFE_RM_CONFIG", val);
+            } else {
+                std::env::remove_var("SAFE_RM_CONFIG");
+            }
+        }
+    }
+
+    #[test]
+    fn test_config_path_env_var_precedence() {
+        // Env var should take precedence over default path
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let content = r#"
+allow_project_deletion = false
+
+[[allowed_paths]]
+path = "/custom/via/env"
+recursive = true
+"#;
+        fs::write(tmp.path(), content).unwrap();
+
+        let original = std::env::var("SAFE_RM_CONFIG").ok();
+        // SAFETY: Tests run single-threaded
+        unsafe {
+            std::env::set_var("SAFE_RM_CONFIG", tmp.path());
+        }
+
+        let config = Config::load();
+        assert!(!config.allow_project_deletion);
+        assert_eq!(config.allowed_paths.len(), 1);
+        assert_eq!(config.allowed_paths[0].path, "/custom/via/env");
+
+        // Restore
+        // SAFETY: Tests run single-threaded
+        unsafe {
+            if let Some(val) = original {
+                std::env::set_var("SAFE_RM_CONFIG", val);
+            } else {
+                std::env::remove_var("SAFE_RM_CONFIG");
+            }
+        }
+    }
+
+    // --- Pre-resolved paths tests ---
+
+    #[test]
+    fn test_resolve_allowed_paths_canonicalizes() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let allowed_dir = tmp_dir.path().join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: true,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        // Verify that resolve populates allowed_paths_resolved
+        assert_eq!(config.allowed_paths_resolved.len(), 1);
+        // Canonical path should be resolvable
+        assert!(config.allowed_paths_resolved[0]
+            .canonical_path
+            .is_absolute());
+    }
+
+    #[test]
+    fn test_resolve_allowed_paths_fallback_nonexistent() {
+        // Non-existent paths should use expanded path as fallback
+        let nonexistent = "/nonexistent/path/that/does/not/exist";
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: nonexistent.to_string(),
+                recursive: true,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        // Should fallback to expanded path (no panic)
+        assert_eq!(config.allowed_paths_resolved.len(), 1);
+        assert_eq!(
+            config.allowed_paths_resolved[0].canonical_path,
+            PathBuf::from(nonexistent)
+        );
+    }
+
+    #[test]
+    fn test_load_from_path_pre_resolves_allowed_paths() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let allowed_dir = tmp_dir.path().join("allowed_dir");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        let config_file = tmp_dir.path().join("config.toml");
+        let content = format!(
+            r#"
+[[allowed_paths]]
+path = "{}"
+recursive = true
+"#,
+            allowed_dir.to_string_lossy()
+        );
+        fs::write(&config_file, content).unwrap();
+
+        let config = Config::load_from_path(Some(config_file));
+
+        // allowed_path内のファイルが許可されることを検証
+        let test_file = allowed_dir.join("file.txt");
+        fs::write(&test_file, b"content").unwrap();
+
+        assert!(config.is_path_allowed(&test_file));
     }
 }
