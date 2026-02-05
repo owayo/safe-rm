@@ -39,6 +39,19 @@ pub struct Config {
     /// List of allowed path entries
     #[serde(default)]
     pub allowed_paths: Vec<AllowedPathEntry>,
+
+    /// Pre-resolved allowed paths (canonicalized at load time for performance)
+    #[serde(skip)]
+    allowed_paths_resolved: Vec<AllowedPathResolved>,
+}
+
+/// Pre-resolved allowed path entry (canonicalized for fast lookup)
+#[derive(Debug, Clone)]
+struct AllowedPathResolved {
+    /// Canonicalized path (or expanded path if canonicalize fails)
+    canonical_path: PathBuf,
+    /// If true, all files/subdirectories recursively are allowed.
+    recursive: bool,
 }
 
 impl Default for Config {
@@ -46,6 +59,7 @@ impl Default for Config {
         Self {
             allow_project_deletion: true,
             allowed_paths: Vec::new(),
+            allowed_paths_resolved: Vec::new(),
         }
     }
 }
@@ -92,7 +106,10 @@ impl Config {
 
         match std::fs::read_to_string(&path) {
             Ok(content) => match toml::from_str::<Config>(&content) {
-                Ok(config) => config,
+                Ok(mut config) => {
+                    config.resolve_allowed_paths();
+                    config
+                }
                 Err(e) => {
                     eprintln!(
                         "safe-rm: warning: config parse error ({}): {}",
@@ -113,6 +130,23 @@ impl Config {
         }
     }
 
+    /// Pre-resolve allowed paths at load time (performance optimization)
+    /// Also used in tests to resolve paths after manual Config construction.
+    pub fn resolve_allowed_paths(&mut self) {
+        self.allowed_paths_resolved = self
+            .allowed_paths
+            .iter()
+            .map(|entry| {
+                let expanded = Self::expand_tilde(&entry.path);
+                let canonical = std::fs::canonicalize(&expanded).unwrap_or(expanded);
+                AllowedPathResolved {
+                    canonical_path: canonical,
+                    recursive: entry.recursive,
+                }
+            })
+            .collect();
+    }
+
     /// Expand tilde (~) prefix to the user's home directory
     fn expand_tilde(path: &str) -> PathBuf {
         if path == "~" {
@@ -130,9 +164,9 @@ impl Config {
     ///
     /// Returns true if the given path matches any allowed_paths entry,
     /// respecting the `recursive` flag for each entry.
-    /// Supports tilde (~) expansion in allowed path entries.
+    /// Uses pre-resolved paths for performance (canonicalized at load time).
     pub fn is_path_allowed(&self, target: &Path) -> bool {
-        if self.allowed_paths.is_empty() {
+        if self.allowed_paths_resolved.is_empty() {
             return false;
         }
 
@@ -149,21 +183,17 @@ impl Config {
         let target_resolved =
             std::fs::canonicalize(&target_normalized).unwrap_or(target_normalized);
 
-        for entry in &self.allowed_paths {
-            let allowed = Self::expand_tilde(&entry.path);
-
-            // Try to canonicalize the allowed path too
-            let allowed_resolved = std::fs::canonicalize(&allowed).unwrap_or(allowed);
-
+        // Use pre-resolved paths (no canonicalize calls here - already done at load time)
+        for entry in &self.allowed_paths_resolved {
             if entry.recursive {
                 // Recursive: target can be anywhere under the allowed path
-                if target_resolved.starts_with(&allowed_resolved) {
+                if target_resolved.starts_with(&entry.canonical_path) {
                     return true;
                 }
             } else {
                 // Non-recursive: target must be a direct child of the allowed path
                 if let Some(parent) = target_resolved.parent() {
-                    if parent == allowed_resolved {
+                    if parent == entry.canonical_path {
                         return true;
                     }
                 }
@@ -252,13 +282,14 @@ path = "/tmp/dir"
         let child_file = allowed_dir.join("file.txt");
         fs::write(&child_file, "test").unwrap();
 
-        let config = Config {
+        let mut config = Config {
             allowed_paths: vec![AllowedPathEntry {
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: true,
             }],
             ..Default::default()
         };
+        config.resolve_allowed_paths();
 
         assert!(config.is_path_allowed(&child_file));
     }
@@ -272,13 +303,14 @@ path = "/tmp/dir"
         let child_file = nested.join("file.txt");
         fs::write(&child_file, "test").unwrap();
 
-        let config = Config {
+        let mut config = Config {
             allowed_paths: vec![AllowedPathEntry {
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: true,
             }],
             ..Default::default()
         };
+        config.resolve_allowed_paths();
 
         assert!(config.is_path_allowed(&child_file));
     }
@@ -290,13 +322,14 @@ path = "/tmp/dir"
         let sub_dir = allowed_dir.join("subdir");
         fs::create_dir_all(&sub_dir).unwrap();
 
-        let config = Config {
+        let mut config = Config {
             allowed_paths: vec![AllowedPathEntry {
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: true,
             }],
             ..Default::default()
         };
+        config.resolve_allowed_paths();
 
         assert!(config.is_path_allowed(&sub_dir));
     }
@@ -311,13 +344,14 @@ path = "/tmp/dir"
         let child_file = allowed_dir.join("file.txt");
         fs::write(&child_file, "test").unwrap();
 
-        let config = Config {
+        let mut config = Config {
             allowed_paths: vec![AllowedPathEntry {
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: false,
             }],
             ..Default::default()
         };
+        config.resolve_allowed_paths();
 
         assert!(config.is_path_allowed(&child_file));
     }
@@ -331,13 +365,14 @@ path = "/tmp/dir"
         let nested_file = nested.join("file.txt");
         fs::write(&nested_file, "test").unwrap();
 
-        let config = Config {
+        let mut config = Config {
             allowed_paths: vec![AllowedPathEntry {
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: false,
             }],
             ..Default::default()
         };
+        config.resolve_allowed_paths();
 
         // Nested file should NOT be allowed with recursive = false
         assert!(!config.is_path_allowed(&nested_file));
@@ -350,13 +385,14 @@ path = "/tmp/dir"
         let sub_dir = allowed_dir.join("subdir");
         fs::create_dir_all(&sub_dir).unwrap();
 
-        let config = Config {
+        let mut config = Config {
             allowed_paths: vec![AllowedPathEntry {
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: false,
             }],
             ..Default::default()
         };
+        config.resolve_allowed_paths();
 
         // Direct child directory is allowed
         assert!(config.is_path_allowed(&sub_dir));
@@ -369,13 +405,14 @@ path = "/tmp/dir"
         let deep = allowed_dir.join("a").join("b");
         fs::create_dir_all(&deep).unwrap();
 
-        let config = Config {
+        let mut config = Config {
             allowed_paths: vec![AllowedPathEntry {
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: false,
             }],
             ..Default::default()
         };
+        config.resolve_allowed_paths();
 
         // Deep subdirectory should NOT be allowed
         assert!(!config.is_path_allowed(&deep));
@@ -385,13 +422,14 @@ path = "/tmp/dir"
 
     #[test]
     fn test_path_not_allowed() {
-        let config = Config {
+        let mut config = Config {
             allowed_paths: vec![AllowedPathEntry {
                 path: "/tmp/allowed-dir".to_string(),
                 recursive: true,
             }],
             ..Default::default()
         };
+        config.resolve_allowed_paths();
         assert!(!config.is_path_allowed(Path::new("/tmp/other-dir/file.txt")));
     }
 
@@ -408,7 +446,7 @@ path = "/tmp/dir"
         fs::create_dir_all(dir_b.join("sub")).unwrap();
         fs::write(&nested_b, "b").unwrap();
 
-        let config = Config {
+        let mut config = Config {
             allowed_paths: vec![
                 AllowedPathEntry {
                     path: dir_a.to_string_lossy().to_string(),
@@ -421,6 +459,7 @@ path = "/tmp/dir"
             ],
             ..Default::default()
         };
+        config.resolve_allowed_paths();
 
         assert!(config.is_path_allowed(&file_a)); // direct child of dir_a
         assert!(config.is_path_allowed(&nested_b)); // nested in dir_b (recursive)
@@ -490,13 +529,14 @@ recursive = true
         fs::write(&child_file, "test").unwrap();
 
         let tilde_path = format!("~/{}", dir_name);
-        let config = Config {
+        let mut config = Config {
             allowed_paths: vec![AllowedPathEntry {
                 path: tilde_path,
                 recursive: true,
             }],
             ..Default::default()
         };
+        config.resolve_allowed_paths();
 
         assert!(config.is_path_allowed(&child_file));
     }
@@ -514,13 +554,14 @@ recursive = true
         fs::write(&nested_file, "test").unwrap();
 
         let tilde_path = format!("~/{}", dir_name);
-        let config = Config {
+        let mut config = Config {
             allowed_paths: vec![AllowedPathEntry {
                 path: tilde_path,
                 recursive: false,
             }],
             ..Default::default()
         };
+        config.resolve_allowed_paths();
 
         assert!(config.is_path_allowed(&child_file)); // direct child OK
         assert!(!config.is_path_allowed(&nested_file)); // nested blocked

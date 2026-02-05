@@ -57,12 +57,16 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
         .and_then(|checker| checker.workdir())
         .unwrap_or_else(|| cwd.clone());
 
-    // Pre-fetch all Git statuses at once (batch optimization)
-    // This reduces N API calls to 1 for N files
-    let status_cache: HashMap<String, FileStatus> = git_checker
-        .as_ref()
-        .map(|checker| checker.get_all_statuses())
-        .unwrap_or_default();
+    // Pre-fetch Git statuses only when needed (performance optimization)
+    // Skip entirely if allow_project_deletion is enabled
+    let status_cache: HashMap<String, FileStatus> = if !config.allow_project_deletion {
+        git_checker
+            .as_ref()
+            .map(|checker| checker.get_all_statuses())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
 
     let mut success_count = 0;
     let mut error_count = 0;
@@ -133,17 +137,21 @@ fn process_path(
 
     // Check if path is in allowed_paths (bypass containment and Git checks)
     if config.is_path_allowed(&abs_path) {
-        // Check if path exists
-        if !abs_path.exists() {
-            if args.force {
-                return Ok(false);
-            } else {
-                return Err(SafeRmError::NotFound(abs_path));
+        // Get metadata with single syscall (optimization: replaces exists() + is_dir())
+        let metadata = match std::fs::symlink_metadata(&abs_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if args.force {
+                    return Ok(false);
+                } else {
+                    return Err(SafeRmError::NotFound(abs_path));
+                }
             }
-        }
+            Err(e) => return Err(SafeRmError::IoError(e)),
+        };
 
         // Check if it's a directory without -r flag
-        if abs_path.is_dir() && !args.recursive {
+        if metadata.is_dir() && !args.recursive {
             return Err(SafeRmError::IsDirectory(abs_path));
         }
 
@@ -152,7 +160,7 @@ fn process_path(
             println!("would remove: {} (allowed by config)", path.display());
             Ok(true)
         } else {
-            delete_path(&abs_path, args.recursive)?;
+            delete_path_with_metadata(&abs_path, args.recursive, &metadata)?;
             println!("removed: {} (allowed by config)", path.display());
             Ok(true)
         }
@@ -165,18 +173,21 @@ fn process_path(
         // cwd is used as the base for resolving relative paths
         let canonical_path = PathChecker::verify_containment_with_base(project_root, cwd, path)?;
 
-        // Check if path exists
-        if !abs_path.exists() {
-            if args.force {
-                // --force: ignore nonexistent files
-                return Ok(false);
-            } else {
-                return Err(SafeRmError::NotFound(abs_path));
+        // Get metadata with single syscall (optimization: replaces exists() + is_dir())
+        let metadata = match std::fs::symlink_metadata(&abs_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if args.force {
+                    return Ok(false);
+                } else {
+                    return Err(SafeRmError::NotFound(abs_path));
+                }
             }
-        }
+            Err(e) => return Err(SafeRmError::IoError(e)),
+        };
 
         // Check if it's a directory without -r flag
-        if abs_path.is_dir() && !args.recursive {
+        if metadata.is_dir() && !args.recursive {
             return Err(SafeRmError::IsDirectory(abs_path));
         }
 
@@ -193,16 +204,20 @@ fn process_path(
             println!("would remove: {}", path.display());
             Ok(true)
         } else {
-            delete_path(&abs_path, args.recursive)?;
+            delete_path_with_metadata(&abs_path, args.recursive, &metadata)?;
             println!("removed: {}", path.display());
             Ok(true)
         }
     }
 }
 
-/// Delete a file or directory
-fn delete_path(path: &Path, recursive: bool) -> Result<(), SafeRmError> {
-    if path.is_dir() {
+/// Delete a file or directory using pre-fetched metadata (avoids extra syscall)
+fn delete_path_with_metadata(
+    path: &Path,
+    recursive: bool,
+    metadata: &std::fs::Metadata,
+) -> Result<(), SafeRmError> {
+    if metadata.is_dir() {
         if recursive {
             fs::remove_dir_all(path).map_err(SafeRmError::IoError)?;
         } else {
