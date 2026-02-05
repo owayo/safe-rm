@@ -94,7 +94,7 @@ safe-rm -rf build/
 
 ## Configuration
 
-`safe-rm` supports an optional configuration file at `~/.config/safe-rm/config.toml` to define directories where deletion is always permitted, bypassing project containment and Git status checks. Tilde (`~`) expansion is supported for home directory paths.
+`safe-rm` supports an optional configuration file at `~/.config/safe-rm/config.toml`. You can also specify a custom config path via the `SAFE_RM_CONFIG` environment variable.
 
 ### Setup
 
@@ -107,6 +107,11 @@ safe-rm init
 ### Config File Format
 
 ```toml
+# Allow deletion of any file within the current project without Git status checks.
+# Containment check (cannot delete outside project) is still enforced.
+# Default: true
+allow_project_deletion = true
+
 # Recursively allow all files/subdirectories under this path
 # Tilde (~) is expanded to home directory
 [[allowed_paths]]
@@ -123,16 +128,19 @@ recursive = false
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `allow_project_deletion` | bool | `true` | If `true`, allow deletion of any file within the current project without Git status checks. Containment check is still enforced. |
 | `path` | string | (required) | Directory path where deletion is permitted |
 | `recursive` | bool | `false` | If `true`, all nested files/subdirectories are allowed. If `false`, only direct children. |
 
 ### Behavior
 
+- **`allow_project_deletion = true` (default)**: All files inside the project can be deleted without Git status checks. This is suitable for AI agents that need to freely delete files within their working project.
+- **`allow_project_deletion = false`**: Only clean (committed) or ignored files can be deleted. Uncommitted changes are protected.
 - Paths matching `allowed_paths` bypass both project containment and Git status checks
 - The `recursive` flag controls whether subdirectories are included:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` is allowed
   - `recursive = false`: Only `/path/to/dir/file.txt` is allowed (direct children)
-- If the config file is missing or invalid, `safe-rm` falls back to default behavior (no allowed paths)
+- If the config file is missing or invalid, `safe-rm` falls back to default behavior (`allow_project_deletion = true`, no allowed paths)
 - Output includes `(allowed by config)` annotation for config-permitted deletions
 
 ### Example
@@ -155,8 +163,10 @@ flowchart TB
     CLI[CLI Arguments] --> ConfigCheck{In allowed_paths?}
     ConfigCheck -->|Yes| Delete[Delete File]
     ConfigCheck -->|No| PathCheck[Path Checker]
-    PathCheck --> GitCheck[Git Checker]
-    GitCheck --> Result{Allow?}
+    PathCheck --> ProjectCheck{allow_project_deletion?}
+    ProjectCheck -->|true| Delete
+    ProjectCheck -->|false| GitCheck[Git Checker]
+    GitCheck --> Result{Clean or Ignored?}
     Result -->|Yes| Delete
     Result -->|No| Exit2[Exit 2 + stderr]
     Delete --> Exit0[Exit 0]
@@ -164,11 +174,51 @@ flowchart TB
 
 ### Safety Layers
 
-1. **Path Containment**: Ensures all paths resolve within current working directory
-2. **Git Protection**: Blocks deletion of dirty files (modified/staged/untracked)
+1. **Path Containment**: Ensures all paths resolve within current working directory (always enforced)
+2. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked)
 3. **Recursive Check**: For directories, validates all contained files
 
 ### File System and Deletable Scope
+
+#### Default Mode (`allow_project_deletion = true`)
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#666666', 'primaryTextColor': '#000000', 'primaryBorderColor': '#666666' }}}%%
+flowchart TB
+    subgraph outside["Outside Project 🛡️ ALWAYS BLOCKED"]
+        etc["/etc/passwd"]
+        home["~/.bashrc"]
+        other["../other-project/"]
+    end
+
+    subgraph allowed["Config Allowed Paths ✅"]
+        skills["~/.claude/skills/**<br/>(allowed by config)"]
+    end
+
+    subgraph project["Project Directory (cwd) ✅ ALL DELETABLE"]
+        modified["main.rs (modified)"]
+        staged["new_feature.rs (staged)"]
+        untracked["temp.txt (untracked)"]
+        clean["old_module.rs (clean)"]
+        ignored["target/ (.gitignore)"]
+    end
+
+    style outside fill:#ffcccc,stroke:#cc0000,color:#000000
+    style allowed fill:#ccffcc,stroke:#00cc00,color:#000000
+    style project fill:#ccffcc,stroke:#00cc00,color:#000000
+```
+
+| File | Deletable | Reason |
+|------|-----------|--------|
+| `old_module.rs` (clean) | ✅ Yes | Inside project |
+| `target/` (ignored) | ✅ Yes | Inside project |
+| `main.rs` (modified) | ✅ Yes | Inside project (allow_project_deletion=true) |
+| `temp.txt` (untracked) | ✅ Yes | Inside project (allow_project_deletion=true) |
+| `~/.claude/skills/foo` | ✅ Yes | Allowed by config (recursive) |
+| `/etc/passwd` | ❌ No | Outside project directory |
+| `../other-project/` | ❌ No | Path traversal blocked |
+
+#### Strict Mode (`allow_project_deletion = false`)
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#666666', 'primaryTextColor': '#000000', 'primaryBorderColor': '#666666' }}}%%
@@ -216,10 +266,10 @@ flowchart TB
 | `../other-project/` | ❌ No | Path traversal blocked |
 
 **Key Points**:
-- Files outside the project are **always blocked**, regardless of Git status
+- Files outside the project are **always blocked**, regardless of settings
+- **Default mode (`allow_project_deletion = true`)**: All files inside the project can be deleted (ideal for AI agents)
+- **Strict mode (`allow_project_deletion = false`)**: Only clean (committed) or ignored files can be deleted
 - **Config allowed paths** bypass both containment and Git checks (supports `~` expansion)
-- In a Git repository: only clean (committed) or ignored files can be deleted
-- In a non-Git directory: all files inside the project can be deleted (no Git protection)
 
 ## Exit Codes
 
@@ -279,6 +329,15 @@ Add to your `CLAUDE.md`:
 ```
 
 ## Git Status Decision Matrix
+
+### Default Mode (`allow_project_deletion = true`)
+
+| File Status | Deletable? | Reason |
+|-------------|------------|--------|
+| Any (inside project) | Yes | `allow_project_deletion = true` skips Git checks |
+| Outside project | No | Always blocked regardless of settings |
+
+### Strict Mode (`allow_project_deletion = false`)
 
 | File Status | Deletable? | Reason |
 |-------------|------------|--------|

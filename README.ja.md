@@ -94,7 +94,7 @@ safe-rm -rf build/
 
 ## 設定
 
-`safe-rm` は `~/.config/safe-rm/config.toml` にオプションの設定ファイルをサポートしています。削除を常に許可するディレクトリを定義でき、プロジェクト境界チェックとGitステータスチェックの両方をバイパスします。チルダ（`~`）によるホームディレクトリ展開に対応しています。
+`safe-rm` は `~/.config/safe-rm/config.toml` にオプションの設定ファイルをサポートしています。`SAFE_RM_CONFIG` 環境変数でカスタムパスを指定することもできます。
 
 ### セットアップ
 
@@ -107,6 +107,11 @@ safe-rm init
 ### 設定ファイル形式
 
 ```toml
+# プロジェクト内のすべてのファイルをGitステータスチェックなしで削除許可
+# 境界チェック（プロジェクト外への削除不可）は引き続き有効
+# デフォルト: true
+allow_project_deletion = true
+
 # このパス配下のすべてのファイル/サブディレクトリを再帰的に許可
 # チルダ（~）はホームディレクトリに展開されます
 [[allowed_paths]]
@@ -123,16 +128,19 @@ recursive = false
 
 | フィールド | 型 | デフォルト | 説明 |
 |-----------|------|---------|------|
+| `allow_project_deletion` | bool | `true` | `true`: プロジェクト内のすべてのファイルをGitステータスチェックなしで削除許可。境界チェックは引き続き有効。 |
 | `path` | string | (必須) | 削除を許可するディレクトリパス |
 | `recursive` | bool | `false` | `true`: ネストされたすべてのファイル/サブディレクトリを許可。`false`: 直下のファイルのみ。 |
 
 ### 動作
 
+- **`allow_project_deletion = true`（デフォルト）**: プロジェクト内のすべてのファイルをGitステータスチェックなしで削除可能。作業プロジェクト内でファイルを自由に削除する必要があるAIエージェントに最適。
+- **`allow_project_deletion = false`**: クリーン（コミット済み）または無視されたファイルのみ削除可能。未コミットの変更は保護。
 - `allowed_paths` にマッチするパスは、プロジェクト境界チェックとGitステータスチェックの両方をバイパス
 - `recursive` フラグでサブディレクトリの扱いを制御:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可
   - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可
-- 設定ファイルが存在しないか無効な場合、デフォルト動作（許可パスなし）にフォールバック
+- 設定ファイルが存在しないか無効な場合、デフォルト動作（`allow_project_deletion = true`、許可パスなし）にフォールバック
 - 設定で許可された削除には `(allowed by config)` の注釈が出力に表示
 
 ### 例
@@ -155,8 +163,10 @@ flowchart TB
     CLI[CLI引数] --> ConfigCheck{allowed_paths内?}
     ConfigCheck -->|Yes| Delete[ファイル削除]
     ConfigCheck -->|No| PathCheck[パスチェッカー]
-    PathCheck --> GitCheck[Gitチェッカー]
-    GitCheck --> Result{許可?}
+    PathCheck --> ProjectCheck{allow_project_deletion?}
+    ProjectCheck -->|true| Delete
+    ProjectCheck -->|false| GitCheck[Gitチェッカー]
+    GitCheck --> Result{クリーンまたは無視?}
     Result -->|Yes| Delete
     Result -->|No| Exit2[Exit 2 + stderr]
     Delete --> Exit0[Exit 0]
@@ -164,11 +174,51 @@ flowchart TB
 
 ### 安全レイヤー
 
-1. **パス境界チェック**: すべてのパスがカレントディレクトリ内に解決されることを確認
-2. **Git保護**: ダーティファイル（変更済み/ステージング済み/未追跡）の削除をブロック
+1. **パス境界チェック**: すべてのパスがカレントディレクトリ内に解決されることを確認（常に有効）
+2. **Git保護**: `allow_project_deletion = false` の場合、ダーティファイル（変更済み/ステージング済み/未追跡）の削除をブロック
 3. **再帰チェック**: ディレクトリの場合、含まれるすべてのファイルを検証
 
 ### ファイルシステムと削除可能スコープ
+
+#### デフォルトモード (`allow_project_deletion = true`)
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#666666', 'primaryTextColor': '#000000', 'primaryBorderColor': '#666666' }}}%%
+flowchart TB
+    subgraph outside["プロジェクト外 🛡️ 常にブロック"]
+        etc["/etc/passwd"]
+        home["~/.bashrc"]
+        other["../other-project/"]
+    end
+
+    subgraph allowed["設定で許可されたパス ✅"]
+        skills["~/.claude/skills/**<br/>(設定により許可)"]
+    end
+
+    subgraph project["プロジェクトディレクトリ (cwd) ✅ すべて削除可能"]
+        modified["main.rs (変更済み)"]
+        staged["new_feature.rs (ステージング済み)"]
+        untracked["temp.txt (未追跡)"]
+        clean["old_module.rs (クリーン)"]
+        ignored["target/ (.gitignore)"]
+    end
+
+    style outside fill:#ffcccc,stroke:#cc0000,color:#000000
+    style allowed fill:#ccffcc,stroke:#00cc00,color:#000000
+    style project fill:#ccffcc,stroke:#00cc00,color:#000000
+```
+
+| ファイル | 削除可能 | 理由 |
+|----------|----------|------|
+| `old_module.rs` (クリーン) | ✅ はい | プロジェクト内 |
+| `target/` (無視) | ✅ はい | プロジェクト内 |
+| `main.rs` (変更済み) | ✅ はい | プロジェクト内 (allow_project_deletion=true) |
+| `temp.txt` (未追跡) | ✅ はい | プロジェクト内 (allow_project_deletion=true) |
+| `~/.claude/skills/foo` | ✅ はい | 設定により許可（recursive） |
+| `/etc/passwd` | ❌ いいえ | プロジェクトディレクトリ外 |
+| `../other-project/` | ❌ いいえ | パストラバーサルをブロック |
+
+#### 厳格モード (`allow_project_deletion = false`)
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#666666', 'primaryTextColor': '#000000', 'primaryBorderColor': '#666666' }}}%%
@@ -216,10 +266,10 @@ flowchart TB
 | `../other-project/` | ❌ いいえ | パストラバーサルをブロック |
 
 **重要ポイント**:
-- プロジェクト外のファイルは**常にブロック**（Git状態に関係なく）
+- プロジェクト外のファイルは**常にブロック**（設定に関係なく）
+- **デフォルトモード (`allow_project_deletion = true`)**: プロジェクト内のすべてのファイルが削除可能（AIエージェントに最適）
+- **厳格モード (`allow_project_deletion = false`)**: クリーン（コミット済み）または無視されたファイルのみ削除可能
 - **設定で許可されたパス**は境界チェックとGitチェックの両方をバイパス（`~` 展開対応）
-- Gitリポジトリ内: クリーン（コミット済み）または無視されたファイルのみ削除可能
-- 非Gitディレクトリ内: プロジェクト内のすべてのファイルが削除可能（Git保護なし）
 
 ## 終了コード
 
@@ -279,6 +329,15 @@ Claude Code の設定ファイル（例: `~/.claude/settings.json` または `.c
 ```
 
 ## Git ステータス判定マトリクス
+
+### デフォルトモード (`allow_project_deletion = true`)
+
+| ファイルステータス | 削除可能? | 理由 |
+|-------------------|-----------|------|
+| すべて（プロジェクト内） | はい | `allow_project_deletion = true` はGitチェックをスキップ |
+| プロジェクト外 | いいえ | 設定に関わらず常にブロック |
+
+### 厳格モード (`allow_project_deletion = false`)
 
 | ファイルステータス | 削除可能? | 理由 |
 |-------------------|-----------|------|

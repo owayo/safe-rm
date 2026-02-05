@@ -14,13 +14,25 @@ fn get_binary_path() -> String {
 
 /// safe-rm を実行してステータスを取得
 fn run_safe_rm(args: &[&str], cwd: &std::path::Path) -> (i32, String, String) {
+    run_safe_rm_with_config(args, cwd, None)
+}
+
+/// safe-rm を実行してステータスを取得（カスタム設定ファイル指定可能）
+fn run_safe_rm_with_config(
+    args: &[&str],
+    cwd: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+) -> (i32, String, String) {
     let binary = get_binary_path();
 
-    let output = Command::new(&binary)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("Failed to execute safe-rm");
+    let mut cmd = Command::new(&binary);
+    cmd.args(args).current_dir(cwd);
+
+    if let Some(path) = config_path {
+        cmd.env("SAFE_RM_CONFIG", path);
+    }
+
+    let output = cmd.output().expect("Failed to execute safe-rm");
 
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -320,22 +332,31 @@ mod allow_flow_tests {
 }
 
 // =============================================================================
-// ブロックフローのテスト
+// ブロックフローのテスト（allow_project_deletion = false モード）
 // =============================================================================
 
 mod block_flow_tests {
     use super::*;
 
+    /// allow_project_deletion = false の設定ファイルを作成
+    fn create_strict_config() -> tempfile::NamedTempFile {
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+        config
+    }
+
     #[test]
     fn test_modified_file_blocked() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
 
         // ファイルをコミット後に変更
         commit_file(&repo_path, "modified.txt", "original");
         fs::write(repo_path.join("modified.txt"), "modified content").unwrap();
 
-        let (exit_code, _, stderr) = run_safe_rm(&["modified.txt"], &repo_path);
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["modified.txt"], &repo_path, Some(config.path()));
 
         assert_eq!(exit_code, 2, "Modified file deletion should be blocked");
         assert!(
@@ -353,6 +374,7 @@ mod block_flow_tests {
     fn test_staged_file_blocked() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
 
         // 初期コミット
         commit_file(&repo_path, "init.txt", "init");
@@ -365,7 +387,8 @@ mod block_flow_tests {
             .output()
             .unwrap();
 
-        let (exit_code, _, stderr) = run_safe_rm(&["staged.txt"], &repo_path);
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["staged.txt"], &repo_path, Some(config.path()));
 
         assert_eq!(exit_code, 2, "Staged file deletion should be blocked");
         assert!(
@@ -383,6 +406,7 @@ mod block_flow_tests {
     fn test_untracked_file_blocked() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
 
         // 初期コミット
         commit_file(&repo_path, "init.txt", "init");
@@ -390,7 +414,8 @@ mod block_flow_tests {
         // 未追跡ファイルを作成
         fs::write(repo_path.join("untracked.txt"), "untracked content").unwrap();
 
-        let (exit_code, _, stderr) = run_safe_rm(&["untracked.txt"], &repo_path);
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["untracked.txt"], &repo_path, Some(config.path()));
 
         assert_eq!(exit_code, 2, "Untracked file deletion should be blocked");
         assert!(
@@ -408,6 +433,7 @@ mod block_flow_tests {
     fn test_directory_with_dirty_file_blocked() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
 
         // ディレクトリを作成
         let subdir = repo_path.join("subdir");
@@ -419,7 +445,8 @@ mod block_flow_tests {
         // 未追跡ファイルを追加
         fs::write(subdir.join("untracked.txt"), "untracked").unwrap();
 
-        let (exit_code, _, stderr) = run_safe_rm(&["-r", "subdir"], &repo_path);
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "subdir"], &repo_path, Some(config.path()));
 
         assert_eq!(exit_code, 2, "Directory with dirty file should be blocked");
         assert!(!stderr.is_empty(), "Should have error message");
@@ -530,10 +557,18 @@ mod block_flow_tests {
 mod edge_case_tests {
     use super::*;
 
+    /// allow_project_deletion = false の設定ファイルを作成
+    fn create_strict_config() -> tempfile::NamedTempFile {
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+        config
+    }
+
     #[test]
     fn test_partial_failure() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
 
         // Clean ファイルを作成
         commit_file(&repo_path, "clean.txt", "clean");
@@ -545,7 +580,11 @@ mod edge_case_tests {
         fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
 
         // clean.txt と untracked.txt を一緒に削除しようとする
-        let (exit_code, stdout, stderr) = run_safe_rm(&["clean.txt", "untracked.txt"], &repo_path);
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &["clean.txt", "untracked.txt"],
+            &repo_path,
+            Some(config.path()),
+        );
 
         // clean.txt は削除成功、untracked.txt は失敗
         assert_ne!(exit_code, 0, "Should have partial failure");

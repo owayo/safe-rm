@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 ///
 /// Example config.toml:
 /// ```toml
+/// # Allow deletion of any file within the current project (Git repository)
+/// # without requiring the file to be committed or ignored.
+/// # Containment check is still enforced (cannot delete outside project).
+/// allow_project_deletion = true
+///
 /// [[allowed_paths]]
 /// path = "/Users/owa/.claude/skills"
 /// recursive = true
@@ -18,11 +23,31 @@ use std::path::{Path, PathBuf};
 /// path = "/tmp/logs"
 /// recursive = false  # only direct children
 /// ```
-#[derive(Debug, Clone, Deserialize, Default)]
+/// Helper function to provide default value of true
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    /// If true, allow deletion of any file within the current project
+    /// without Git status checks. Containment is still enforced.
+    /// Default: true
+    #[serde(default = "default_true")]
+    pub allow_project_deletion: bool,
+
     /// List of allowed path entries
     #[serde(default)]
     pub allowed_paths: Vec<AllowedPathEntry>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            allow_project_deletion: true,
+            allowed_paths: Vec::new(),
+        }
+    }
 }
 
 /// An allowed path entry with per-directory settings
@@ -41,7 +66,12 @@ impl Config {
     ///
     /// Uses XDG-style path (~/.config/) on all platforms for consistency
     /// with safe-kill and other CLI tools.
+    ///
+    /// If SAFE_RM_CONFIG environment variable is set, uses that path instead.
     pub fn config_path() -> Option<PathBuf> {
+        if let Ok(path) = std::env::var("SAFE_RM_CONFIG") {
+            return Some(PathBuf::from(path));
+        }
         dirs::home_dir().map(|d| d.join(".config").join("safe-rm").join("config.toml"))
     }
 
@@ -227,6 +257,7 @@ path = "/tmp/dir"
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: true,
             }],
+            ..Default::default()
         };
 
         assert!(config.is_path_allowed(&child_file));
@@ -246,6 +277,7 @@ path = "/tmp/dir"
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: true,
             }],
+            ..Default::default()
         };
 
         assert!(config.is_path_allowed(&child_file));
@@ -263,6 +295,7 @@ path = "/tmp/dir"
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: true,
             }],
+            ..Default::default()
         };
 
         assert!(config.is_path_allowed(&sub_dir));
@@ -283,6 +316,7 @@ path = "/tmp/dir"
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: false,
             }],
+            ..Default::default()
         };
 
         assert!(config.is_path_allowed(&child_file));
@@ -302,6 +336,7 @@ path = "/tmp/dir"
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: false,
             }],
+            ..Default::default()
         };
 
         // Nested file should NOT be allowed with recursive = false
@@ -320,6 +355,7 @@ path = "/tmp/dir"
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: false,
             }],
+            ..Default::default()
         };
 
         // Direct child directory is allowed
@@ -338,6 +374,7 @@ path = "/tmp/dir"
                 path: allowed_dir.to_string_lossy().to_string(),
                 recursive: false,
             }],
+            ..Default::default()
         };
 
         // Deep subdirectory should NOT be allowed
@@ -353,6 +390,7 @@ path = "/tmp/dir"
                 path: "/tmp/allowed-dir".to_string(),
                 recursive: true,
             }],
+            ..Default::default()
         };
         assert!(!config.is_path_allowed(Path::new("/tmp/other-dir/file.txt")));
     }
@@ -381,6 +419,7 @@ path = "/tmp/dir"
                     recursive: true, // all nested
                 },
             ],
+            ..Default::default()
         };
 
         assert!(config.is_path_allowed(&file_a)); // direct child of dir_a
@@ -456,6 +495,7 @@ recursive = true
                 path: tilde_path,
                 recursive: true,
             }],
+            ..Default::default()
         };
 
         assert!(config.is_path_allowed(&child_file));
@@ -479,6 +519,7 @@ recursive = true
                 path: tilde_path,
                 recursive: false,
             }],
+            ..Default::default()
         };
 
         assert!(config.is_path_allowed(&child_file)); // direct child OK

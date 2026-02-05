@@ -181,8 +181,11 @@ fn process_path(
         }
 
         // Check Git status using pre-fetched cache (batch optimization)
-        if let Some(ref checker) = git_checker {
-            checker.check_path_with_cache(&canonical_path, status_cache)?;
+        // Skip if allow_project_deletion is enabled (containment already verified above)
+        if !config.allow_project_deletion {
+            if let Some(ref checker) = git_checker {
+                checker.check_path_with_cache(&canonical_path, status_cache)?;
+            }
         }
 
         // Perform deletion (or dry-run)
