@@ -172,6 +172,7 @@ impl From<git2::Error> for SafeRmError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
 
     #[test]
     fn test_exit_code_block_errors_return_2() {
@@ -360,5 +361,89 @@ mod tests {
         let msg = err.user_message();
         assert!(msg.contains("/tmp/unreadable"));
         assert!(msg.contains("ディレクトリの読み取り"));
+    }
+
+    // --- IoError / GitError のテスト ---
+
+    #[test]
+    fn test_user_message_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let err = SafeRmError::IoError(io_err);
+        let msg = err.user_message();
+        assert!(msg.contains("I/O error"));
+        assert!(msg.contains("permission denied"));
+    }
+
+    #[test]
+    fn test_user_message_git_error() {
+        let git_err = git2::Error::from_str("repository not found");
+        let err = SafeRmError::GitError(git_err);
+        let msg = err.user_message();
+        assert!(msg.contains("Git error"));
+        assert!(msg.contains("repository not found"));
+    }
+
+    #[test]
+    fn test_exit_code_io_error_returns_1() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        assert_eq!(SafeRmError::IoError(io_err).exit_code(), 1);
+    }
+
+    #[test]
+    fn test_exit_code_git_error_returns_1() {
+        let git_err = git2::Error::from_str("test error");
+        assert_eq!(SafeRmError::GitError(git_err).exit_code(), 1);
+    }
+
+    // --- std::error::Error の source() テスト ---
+
+    #[test]
+    fn test_source_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "io test");
+        let err = SafeRmError::IoError(io_err);
+        assert!(err.source().is_some(), "IoError should have a source");
+    }
+
+    #[test]
+    fn test_source_git_error() {
+        let git_err = git2::Error::from_str("git test");
+        let err = SafeRmError::GitError(git_err);
+        assert!(err.source().is_some(), "GitError should have a source");
+    }
+
+    #[test]
+    fn test_source_not_found_is_none() {
+        let err = SafeRmError::NotFound(PathBuf::from("test.txt"));
+        assert!(err.source().is_none(), "NotFound should not have a source");
+    }
+
+    #[test]
+    fn test_source_outside_project_is_none() {
+        let err = SafeRmError::OutsideProject {
+            path: PathBuf::from("/etc/passwd"),
+            project_root: PathBuf::from("/project"),
+        };
+        assert!(
+            err.source().is_none(),
+            "OutsideProject should not have a source"
+        );
+    }
+
+    // --- From トレイトのテスト ---
+
+    #[test]
+    fn test_from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let err: SafeRmError = io_err.into();
+        assert!(matches!(err, SafeRmError::IoError(_)));
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn test_from_git2_error() {
+        let git_err = git2::Error::from_str("bad ref");
+        let err: SafeRmError = git_err.into();
+        assert!(matches!(err, SafeRmError::GitError(_)));
+        assert_eq!(err.exit_code(), 1);
     }
 }

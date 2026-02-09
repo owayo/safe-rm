@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI argument parsing
-clap = { version = "4.5.54", features = ["derive"] }
+clap = { version = "4.5.59", features = ["derive"] }
 
 # Shell command tokenization
 shlex = "1.3.0"
@@ -29,22 +29,22 @@ shlex = "1.3.0"
 path-clean = "1.0.1"
 
 # Git operations (vendored for cross-compilation on CI)
-git2 = { version = "0.20.3", features = ["vendored-libgit2", "vendored-openssl"] }
+git2 = { version = "0.20.4", features = ["vendored-libgit2", "vendored-openssl"] }
 
 # Error handling
-anyhow = "1.0.100"
+anyhow = "1.0.101"
 
 # Configuration file parsing
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.0.3"
 
 # Home directory detection
 dirs = "6.0"
 
 [dev-dependencies]
 assert_cmd = "2.1.2"
-predicates = "3.1.3"
-tempfile = "3.24.0"
+predicates = "3.1.4"
+tempfile = "3.25.0"
 
 [profile.release]
 lto = true

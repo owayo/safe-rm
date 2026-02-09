@@ -25,7 +25,7 @@
 
 ## Overview
 
-`safe-rm` is a CLI tool that prevents AI agents from accidentally deleting uncommitted work or files outside the project. It enforces **Git-aware access control** — only clean or ignored files within the current working directory can be deleted.
+`safe-rm` is a CLI tool that prevents AI agents from accidentally deleting uncommitted work or files outside the project. It enforces **Git-aware access control** — only clean or ignored files within the project directory (Git repository root) can be deleted.
 
 ## Features
 
@@ -174,7 +174,7 @@ flowchart TB
 
 ### Safety Layers
 
-1. **Path Containment**: Ensures all paths resolve within current working directory (always enforced)
+1. **Path Containment**: Ensures all paths resolve within the project directory (Git repository root, or cwd if not a Git repo) (always enforced)
 2. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked)
 3. **Recursive Check**: For directories, validates all contained files
 
@@ -195,7 +195,7 @@ flowchart TB
         skills["~/.claude/skills/**<br/>(allowed by config)"]
     end
 
-    subgraph project["Project Directory (cwd) ✅ ALL DELETABLE"]
+    subgraph project["Project Directory (git root) ✅ ALL DELETABLE"]
         modified["main.rs (modified)"]
         staged["new_feature.rs (staged)"]
         untracked["temp.txt (untracked)"]
@@ -233,7 +233,7 @@ flowchart TB
         skills["~/.claude/skills/**<br/>(allowed by config)"]
     end
 
-    subgraph project["Project Directory (cwd)"]
+    subgraph project["Project Directory (git root)"]
         subgraph dirty["Uncommitted Changes 🛡️"]
             modified["main.rs<br/>(modified)"]
             staged["new_feature.rs<br/>(staged)"]
@@ -403,8 +403,8 @@ cargo build --release
 
 ### Test Coverage
 
-- **Unit Tests**: 80+ tests covering all modules
-- **Integration Tests**: 21 tests with real Git repositories
+- **Unit Tests**: 130+ tests covering all modules (CLI, config, error, path_checker, git_checker, init)
+- **Integration Tests**: 50+ tests with real Git repositories (allow/block flows, strict mode, symlinks, batch operations, special filenames)
 
 ## Contributing
 

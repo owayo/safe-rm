@@ -1186,3 +1186,518 @@ recursive = true
         assert!(!outside_file.exists(), "File should be deleted");
     }
 }
+
+// =============================================================================
+// init サブコマンドのテスト
+// =============================================================================
+
+mod init_tests {
+    use super::*;
+
+    #[test]
+    fn test_init_creates_config_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join("safe-rm");
+        let config_path = config_dir.join("config.toml");
+
+        // SAFE_RM_CONFIG で一時パスを指定して init を実行
+        let binary = get_binary_path();
+        let output = Command::new(&binary)
+            .args(["init"])
+            .env("SAFE_RM_CONFIG", &config_path)
+            .output()
+            .expect("Failed to execute safe-rm init");
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert_eq!(exit_code, 0, "init should succeed");
+        assert!(config_path.exists(), "Config file should be created");
+        assert!(
+            stdout.contains("Created config file"),
+            "Should show creation message: {}",
+            stdout
+        );
+
+        // 作成されたファイルが有効なTOMLであることを確認
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            content.contains("allowed_paths"),
+            "Config should contain allowed_paths"
+        );
+    }
+
+    #[test]
+    fn test_init_does_not_overwrite_existing() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join("safe-rm");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        // 既存のファイルを作成
+        fs::write(&config_path, "# existing config\n").unwrap();
+
+        let binary = get_binary_path();
+        let output = Command::new(&binary)
+            .args(["init"])
+            .env("SAFE_RM_CONFIG", &config_path)
+            .output()
+            .expect("Failed to execute safe-rm init");
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(exit_code, 0, "init should succeed even with existing file");
+        assert!(
+            stderr.contains("already exists"),
+            "Should warn about existing file: {}",
+            stderr
+        );
+
+        // 内容が変わっていないことを確認
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            content, "# existing config\n",
+            "Existing config should not be overwritten"
+        );
+    }
+}
+
+// =============================================================================
+// allowed_paths の非再帰設定テスト
+// =============================================================================
+
+mod allowed_paths_non_recursive_tests {
+    use super::*;
+
+    #[test]
+    fn test_non_recursive_allows_direct_child() {
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        // 許可ディレクトリを作成
+        let allowed_dir = TempDir::new().unwrap();
+        let allowed_path = allowed_dir.path().canonicalize().unwrap();
+        let direct_file = allowed_path.join("direct.txt");
+        fs::write(&direct_file, "direct child").unwrap();
+
+        // non-recursive 設定
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+[[allowed_paths]]
+path = "{}"
+recursive = false
+"#,
+            allowed_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // 直接の子ファイルは削除可能
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &[direct_file.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "Direct child should be deletable with non-recursive. stderr: {}",
+            stderr
+        );
+        assert!(
+            stdout.contains("allowed by config"),
+            "Should show allowed by config: {}",
+            stdout
+        );
+        assert!(!direct_file.exists(), "File should be deleted");
+    }
+
+    #[test]
+    fn test_non_recursive_blocks_nested_child() {
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        // 許可ディレクトリとネストされたファイルを作成
+        let allowed_dir = TempDir::new().unwrap();
+        let allowed_path = allowed_dir.path().canonicalize().unwrap();
+        let nested_dir = allowed_path.join("sub");
+        fs::create_dir(&nested_dir).unwrap();
+        let nested_file = nested_dir.join("nested.txt");
+        fs::write(&nested_file, "nested child").unwrap();
+
+        // non-recursive 設定
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+[[allowed_paths]]
+path = "{}"
+recursive = false
+"#,
+            allowed_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // ネストされたファイルはブロックされる（プロジェクト外のため）
+        let (exit_code, _, _) = run_safe_rm_with_config(
+            &[nested_file.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 2,
+            "Nested child should be blocked with non-recursive"
+        );
+        assert!(nested_file.exists(), "Nested file should NOT be deleted");
+    }
+}
+
+// =============================================================================
+// dry-run モードの追加テスト
+// =============================================================================
+
+mod dry_run_tests {
+    use super::*;
+
+    #[test]
+    fn test_dry_run_with_directory() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // ディレクトリを作成
+        let subdir = repo_path.join("drydir");
+        fs::create_dir(&subdir).unwrap();
+        commit_file(&repo_path, "drydir/file.txt", "content");
+
+        let (exit_code, stdout, _) = run_safe_rm(&["-rn", "drydir"], &repo_path);
+
+        assert_eq!(exit_code, 0, "Dry run with directory should succeed");
+        assert!(
+            stdout.contains("would remove:"),
+            "Should show would remove: {}",
+            stdout
+        );
+        assert!(
+            repo_path.join("drydir").exists(),
+            "Directory should NOT be deleted in dry run"
+        );
+    }
+
+    #[test]
+    fn test_dry_run_with_allowed_paths() {
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        // 許可ディレクトリを作成
+        let allowed_dir = TempDir::new().unwrap();
+        let allowed_path = allowed_dir.path().canonicalize().unwrap();
+        let file = allowed_path.join("test.txt");
+        fs::write(&file, "content").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+[[allowed_paths]]
+path = "{}"
+recursive = true
+"#,
+            allowed_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        let (exit_code, stdout, _) = run_safe_rm_with_config(
+            &["-n", file.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(exit_code, 0, "Dry run with allowed paths should succeed");
+        assert!(
+            stdout.contains("would remove:") && stdout.contains("allowed by config"),
+            "Should show would remove with config annotation: {}",
+            stdout
+        );
+        assert!(file.exists(), "File should NOT be deleted in dry run");
+    }
+
+    #[test]
+    fn test_dry_run_with_multiple_files() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "dry1.txt", "content1");
+        commit_file(&repo_path, "dry2.txt", "content2");
+
+        let (exit_code, stdout, _) = run_safe_rm(&["-n", "dry1.txt", "dry2.txt"], &repo_path);
+
+        assert_eq!(exit_code, 0, "Dry run with multiple files should succeed");
+        assert!(stdout.contains("dry1.txt"), "Should mention dry1.txt");
+        assert!(stdout.contains("dry2.txt"), "Should mention dry2.txt");
+        assert!(
+            repo_path.join("dry1.txt").exists(),
+            "dry1.txt should NOT be deleted"
+        );
+        assert!(
+            repo_path.join("dry2.txt").exists(),
+            "dry2.txt should NOT be deleted"
+        );
+    }
+}
+
+// =============================================================================
+// シンボリックリンクのテスト
+// =============================================================================
+
+#[cfg(unix)]
+mod symlink_tests {
+    use super::*;
+
+    #[test]
+    fn test_symlink_inside_project_deletable() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // ターゲットファイルを作成してコミット
+        commit_file(&repo_path, "target.txt", "target content");
+
+        // シンボリックリンクを作成
+        let link_path = repo_path.join("link.txt");
+        std::os::unix::fs::symlink(repo_path.join("target.txt"), &link_path).unwrap();
+
+        // git add + commit
+        Command::new("git")
+            .args(["add", "link.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add symlink"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&["link.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "Symlink inside project should be deletable. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(!link_path.exists(), "Symlink should be deleted");
+        // ターゲットはまだ存在する
+        assert!(
+            repo_path.join("target.txt").exists(),
+            "Target should still exist"
+        );
+    }
+
+    #[test]
+    fn test_symlink_pointing_outside_project_blocked() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // 初期コミット
+        commit_file(&repo_path, "init.txt", "init");
+
+        // プロジェクト外にファイルを作成
+        let outside_dir = TempDir::new().unwrap();
+        let outside_file = outside_dir.path().join("outside.txt");
+        fs::write(&outside_file, "outside content").unwrap();
+
+        // プロジェクト外を指すシンボリックリンクを作成
+        let link_path = repo_path.join("evil_link.txt");
+        std::os::unix::fs::symlink(&outside_file, &link_path).unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm(&["evil_link.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "Symlink pointing outside should be blocked. stderr: {}",
+            stderr
+        );
+        assert!(
+            link_path.symlink_metadata().is_ok(),
+            "Symlink should NOT be deleted"
+        );
+    }
+}
+
+// =============================================================================
+// バッチ処理の追加テスト
+// =============================================================================
+
+mod batch_tests {
+    use super::*;
+
+    /// allow_project_deletion = false の設定ファイルを作成
+    fn create_strict_config() -> tempfile::NamedTempFile {
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+        config
+    }
+
+    #[test]
+    fn test_security_error_takes_precedence_over_operation_error() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // 初期コミット
+        commit_file(&repo_path, "init.txt", "init");
+
+        // 存在しないファイル（exit 1）と プロジェクト外ファイル（exit 2）
+        let (exit_code, _, _) = run_safe_rm(&["nonexistent.txt", "/etc/passwd"], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "Security error (exit 2) should take precedence over operation error (exit 1)"
+        );
+    }
+
+    #[test]
+    fn test_multiple_clean_files_in_strict_mode() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        commit_file(&repo_path, "a.txt", "a");
+        commit_file(&repo_path, "b.txt", "b");
+        commit_file(&repo_path, "c.txt", "c");
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &["a.txt", "b.txt", "c.txt"],
+            &repo_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "All clean files should be deletable in strict mode. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("a.txt"), "Should mention a.txt");
+        assert!(stdout.contains("b.txt"), "Should mention b.txt");
+        assert!(stdout.contains("c.txt"), "Should mention c.txt");
+        assert!(!repo_path.join("a.txt").exists(), "a.txt should be deleted");
+        assert!(!repo_path.join("b.txt").exists(), "b.txt should be deleted");
+        assert!(!repo_path.join("c.txt").exists(), "c.txt should be deleted");
+    }
+
+    #[test]
+    fn test_mix_of_clean_and_dirty_in_strict_mode() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // clean ファイルを作成
+        commit_file(&repo_path, "clean1.txt", "clean1");
+        commit_file(&repo_path, "clean2.txt", "clean2");
+
+        // dirty ファイルを作成（modified）
+        commit_file(&repo_path, "dirty.txt", "original");
+        fs::write(repo_path.join("dirty.txt"), "modified").unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &["clean1.txt", "dirty.txt", "clean2.txt"],
+            &repo_path,
+            Some(config.path()),
+        );
+
+        // exit code 2 (security block takes precedence)
+        assert_eq!(exit_code, 2, "Should exit with 2 due to dirty file");
+        // clean files should still be deleted
+        assert!(
+            !repo_path.join("clean1.txt").exists(),
+            "clean1.txt should be deleted"
+        );
+        assert!(
+            !repo_path.join("clean2.txt").exists(),
+            "clean2.txt should be deleted"
+        );
+        // dirty file should NOT be deleted
+        assert!(
+            repo_path.join("dirty.txt").exists(),
+            "dirty.txt should NOT be deleted"
+        );
+        assert!(
+            stderr.contains("dirty.txt"),
+            "Error should mention dirty.txt"
+        );
+        assert!(
+            stdout.contains("clean1.txt"),
+            "Should mention clean1.txt removed"
+        );
+    }
+}
+
+// =============================================================================
+// 特殊ファイル名のテスト
+// =============================================================================
+
+mod special_filename_tests {
+    use super::*;
+
+    #[test]
+    fn test_file_with_spaces_in_name() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "file with spaces.txt", "content");
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&["file with spaces.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "File with spaces should be deletable. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join("file with spaces.txt").exists(),
+            "File should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_file_with_unicode_name() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "日本語ファイル.txt", "内容");
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&["日本語ファイル.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "File with unicode name should be deletable. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join("日本語ファイル.txt").exists(),
+            "File should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_hidden_file() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, ".hidden_file", "hidden content");
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&[".hidden_file"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "Hidden file should be deletable. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join(".hidden_file").exists(),
+            "Hidden file should be deleted"
+        );
+    }
+}

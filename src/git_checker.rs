@@ -779,4 +779,232 @@ mod tests {
             _ => panic!("Expected DirtyFiles error"),
         }
     }
+
+    // Task: get_all_statuses と cache 関連のテスト
+
+    #[test]
+    fn test_get_all_statuses_returns_all_files() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // .gitignore を作成してコミット
+        let gitignore_path = repo_path.join(".gitignore");
+        fs::write(&gitignore_path, "*.log\n").unwrap();
+        Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add .gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // Clean ファイル
+        commit_file(&repo_path, "clean.txt", "clean");
+
+        // Modified ファイル
+        commit_file(&repo_path, "modified.txt", "original");
+        fs::write(repo_path.join("modified.txt"), "changed").unwrap();
+
+        // Untracked ファイル
+        fs::write(repo_path.join("new.txt"), "new").unwrap();
+
+        // Ignored ファイル
+        fs::write(repo_path.join("debug.log"), "log").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let statuses = checker.get_all_statuses();
+
+        // Modified, Untracked, Ignored は status に含まれる
+        assert!(statuses.contains_key("modified.txt"));
+        assert!(statuses.contains_key("new.txt"));
+        assert!(statuses.contains_key("debug.log"));
+
+        // Clean ファイルはステータスリストに含まれない（変更なし）
+        assert!(!statuses.contains_key("clean.txt"));
+    }
+
+    #[test]
+    fn test_check_file_with_cache_clean() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "cached_clean.txt", "content");
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses();
+        let file_path = repo_path.join("cached_clean.txt");
+        let result = checker.check_file_with_cache(&file_path, &cache);
+
+        assert!(result.is_ok(), "Clean file should pass cache check");
+    }
+
+    #[test]
+    fn test_check_file_with_cache_modified() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "cached_mod.txt", "original");
+        fs::write(repo_path.join("cached_mod.txt"), "changed").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses();
+        let file_path = repo_path.join("cached_mod.txt");
+        let result = checker.check_file_with_cache(&file_path, &cache);
+
+        assert!(result.is_err(), "Modified file should fail cache check");
+    }
+
+    #[test]
+    fn test_check_path_with_cache_directory() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let subdir = repo_path.join("cachedir");
+        fs::create_dir(&subdir).unwrap();
+        commit_file(&repo_path, "cachedir/file1.txt", "content1");
+        commit_file(&repo_path, "cachedir/file2.txt", "content2");
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses();
+        let result = checker.check_path_with_cache(&subdir, &cache);
+
+        assert!(
+            result.is_ok(),
+            "Directory with clean files should pass cache check"
+        );
+    }
+
+    #[test]
+    fn test_check_directory_with_cache_dirty() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let subdir = repo_path.join("dirtycache");
+        fs::create_dir(&subdir).unwrap();
+        commit_file(&repo_path, "dirtycache/clean.txt", "clean");
+
+        // 未追跡ファイルを追加
+        fs::write(subdir.join("untracked.txt"), "untracked").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses();
+        let result = checker.check_directory_with_cache(&subdir, &cache);
+
+        assert!(
+            result.is_err(),
+            "Directory with dirty files should fail cache check"
+        );
+    }
+
+    #[test]
+    fn test_workdir_returns_path() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let workdir = checker.workdir();
+
+        assert!(workdir.is_some(), "Git repo should have a workdir");
+        let wd = workdir.unwrap();
+        assert!(wd.is_absolute(), "Workdir should be absolute");
+    }
+
+    #[test]
+    fn test_get_file_status_from_cache_not_in_repo() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "dummy.txt", "dummy");
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses();
+
+        // リポジトリ外のパスに対して NotInRepo が返ることを確認
+        let outside_path = std::path::Path::new("/tmp/nonexistent_path.txt");
+        let status = checker.get_file_status_from_cache(outside_path, &cache);
+        assert_eq!(status, FileStatus::NotInRepo);
+    }
+
+    #[test]
+    fn test_convert_status_clean() {
+        // 空のステータス（変更なし）はCleanになるべき
+        let status = GitChecker::convert_status(Status::empty());
+        assert_eq!(status, FileStatus::Clean);
+    }
+
+    #[test]
+    fn test_convert_status_ignored() {
+        let status = GitChecker::convert_status(Status::IGNORED);
+        assert_eq!(status, FileStatus::Ignored);
+    }
+
+    #[test]
+    fn test_convert_status_staged_new() {
+        let status = GitChecker::convert_status(Status::INDEX_NEW);
+        assert_eq!(status, FileStatus::Staged);
+    }
+
+    #[test]
+    fn test_convert_status_staged_modified() {
+        let status = GitChecker::convert_status(Status::INDEX_MODIFIED);
+        assert_eq!(status, FileStatus::Staged);
+    }
+
+    #[test]
+    fn test_convert_status_wt_modified() {
+        let status = GitChecker::convert_status(Status::WT_MODIFIED);
+        assert_eq!(status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn test_convert_status_wt_new() {
+        let status = GitChecker::convert_status(Status::WT_NEW);
+        assert_eq!(status, FileStatus::Untracked);
+    }
+
+    #[test]
+    fn test_convert_status_ignored_takes_precedence() {
+        // IGNORED + WT_NEW の場合、IGNORED が優先される
+        let status = GitChecker::convert_status(Status::IGNORED | Status::WT_NEW);
+        assert_eq!(status, FileStatus::Ignored);
+    }
+
+    #[test]
+    fn test_convert_status_index_deleted() {
+        let status = GitChecker::convert_status(Status::INDEX_DELETED);
+        assert_eq!(status, FileStatus::Staged);
+    }
+
+    #[test]
+    fn test_convert_status_index_renamed() {
+        let status = GitChecker::convert_status(Status::INDEX_RENAMED);
+        assert_eq!(status, FileStatus::Staged);
+    }
+
+    #[test]
+    fn test_convert_status_index_typechange() {
+        let status = GitChecker::convert_status(Status::INDEX_TYPECHANGE);
+        assert_eq!(status, FileStatus::Staged);
+    }
+
+    #[test]
+    fn test_convert_status_wt_deleted() {
+        let status = GitChecker::convert_status(Status::WT_DELETED);
+        assert_eq!(status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn test_convert_status_wt_renamed() {
+        let status = GitChecker::convert_status(Status::WT_RENAMED);
+        assert_eq!(status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn test_convert_status_wt_typechange() {
+        let status = GitChecker::convert_status(Status::WT_TYPECHANGE);
+        assert_eq!(status, FileStatus::Modified);
+    }
 }

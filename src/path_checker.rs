@@ -316,4 +316,80 @@ mod tests {
         assert!(!PathChecker::is_home_reference(Path::new("/home/user")));
         assert!(!PathChecker::is_home_reference(Path::new("./file.txt")));
     }
+
+    // --- verify_containment_with_base テスト ---
+
+    #[test]
+    fn test_verify_containment_with_base_different_from_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+
+        // サブディレクトリを作成してベースとする
+        let subdir = project_root.join("frontend");
+        fs::create_dir(&subdir).unwrap();
+
+        // 別のサブディレクトリのファイルを作成
+        let backend = project_root.join("backend");
+        fs::create_dir(&backend).unwrap();
+        let file = backend.join("app.rs");
+        fs::write(&file, "fn main() {}").unwrap();
+
+        // frontend/ をベースとして backend/app.rs (絶対パス) を検証
+        let result = PathChecker::verify_containment_with_base(&project_root, &subdir, &file);
+        assert!(
+            result.is_ok(),
+            "Absolute path within project should pass even with different base"
+        );
+    }
+
+    #[test]
+    fn test_verify_containment_with_base_relative_resolved_from_base() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+
+        // subdir/file.txt を作成
+        let subdir = project_root.join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        let file = subdir.join("file.txt");
+        fs::write(&file, "content").unwrap();
+
+        // subdir をベースとして相対パス "file.txt" を検証
+        let result = PathChecker::verify_containment_with_base(
+            &project_root,
+            &subdir,
+            Path::new("file.txt"),
+        );
+        assert!(
+            result.is_ok(),
+            "Relative path resolved from subdir base should be within project"
+        );
+    }
+
+    #[test]
+    fn test_verify_containment_with_base_outside_via_relative() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+
+        let subdir = project_root.join("deep").join("nested");
+        fs::create_dir_all(&subdir).unwrap();
+
+        // deep/nested/ から ../../../../etc/passwd を参照 → プロジェクト外
+        let result = PathChecker::verify_containment_with_base(
+            &project_root,
+            &subdir,
+            Path::new("../../../../etc/passwd"),
+        );
+        assert!(
+            result.is_err(),
+            "Traversal beyond project root should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_try_canonicalize_nonexistent_path() {
+        // 存在しないパスでも fallback でパスが返る
+        let path = Path::new("/nonexistent/path/to/file.txt");
+        let result = PathChecker::try_canonicalize(path);
+        assert_eq!(result, path.to_path_buf());
+    }
 }
