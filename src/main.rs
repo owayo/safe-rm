@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use path_clean::PathClean;
 use safe_rm::cli::{CliArgs, Commands};
 use safe_rm::config::Config;
 use safe_rm::error::{FileStatus, SafeRmError};
@@ -172,6 +173,7 @@ fn process_path(
         // project_root is the git repo root (or cwd if no git repo)
         // cwd is used as the base for resolving relative paths
         let canonical_path = PathChecker::verify_containment_with_base(project_root, cwd, path)?;
+        let normalized_path = abs_path.clean();
 
         // Get metadata with single syscall (optimization: replaces exists() + is_dir())
         let metadata = match std::fs::symlink_metadata(&abs_path) {
@@ -195,7 +197,14 @@ fn process_path(
         // Skip if allow_project_deletion is enabled (containment already verified above)
         if !config.allow_project_deletion {
             if let Some(ref checker) = git_checker {
-                checker.check_path_with_cache(&canonical_path, status_cache)?;
+                // Keep symlink path as-is (check link itself), canonicalize others
+                // to avoid alias-path bypasses (e.g. /var vs /private/var).
+                let git_check_path = if metadata.file_type().is_symlink() {
+                    &normalized_path
+                } else {
+                    &canonical_path
+                };
+                checker.check_path_with_cache(git_check_path, status_cache)?;
             }
         }
 

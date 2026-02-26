@@ -714,6 +714,32 @@ recursive = true
     }
 
     #[test]
+    fn test_is_path_allowed_nonexistent_file_in_allowed_dir() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        // Use canonical path to avoid macOS /var → /private/var mismatch
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: true,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        // Non-existent file in allowed dir should still match
+        // (canonicalize falls back to un-canonicalized path, but parent is canonical)
+        let nonexistent = allowed_dir.join("does_not_exist.txt");
+        assert!(
+            config.is_path_allowed(&nonexistent),
+            "Non-existent file in allowed dir should be allowed"
+        );
+    }
+
+    #[test]
     fn test_load_from_path_pre_resolves_allowed_paths() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let allowed_dir = tmp_dir.path().join("allowed_dir");

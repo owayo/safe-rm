@@ -386,6 +386,20 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_containment_project_root_itself() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+
+        // Attempting to delete the project root itself should succeed
+        // (containment check passes since root starts_with root)
+        let result = PathChecker::verify_containment(&project_root, &project_root);
+        assert!(
+            result.is_ok(),
+            "Project root itself should pass containment check"
+        );
+    }
+
+    #[test]
     fn test_try_canonicalize_nonexistent_path() {
         // 存在しないパスでも fallback でパスが返る
         let path = Path::new("/nonexistent/path/to/file.txt");

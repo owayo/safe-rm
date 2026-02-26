@@ -33,6 +33,8 @@
 - **Git Status Protection**: Prevent deletion of modified, staged, or untracked files
 - **Directory Traversal Prevention**: Block `../` escape attempts
 - **Ignored File Passthrough**: Allow deletion of `.gitignore`d files (build artifacts, etc.)
+- **Symlink-Safe Git Checks**: Directory symlinks are checked as links themselves (not traversed)
+- **Alias-Path Safe Strict Mode**: Non-symlink paths are canonicalized for Git checks, blocking bypasses via alternate absolute aliases
 - **Configurable Allowed Paths**: Bypass safety checks for specified directories (per-directory recursive control)
 - **Non-Git Support**: Works safely in non-Git directories
 - **Dry Run Mode**: Preview what would be deleted without actually deleting
@@ -176,7 +178,9 @@ flowchart TB
 
 1. **Path Containment**: Ensures all paths resolve within the project directory (Git repository root, or cwd if not a Git repo) (always enforced)
 2. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked)
-3. **Recursive Check**: For directories, validates all contained files
+3. **Recursive Check**: For real directories, validates all contained files
+4. **Fail-Closed Directory Reads**: Any directory read failure (including entry iteration errors) is blocked
+5. **Alias-Path Hardening**: Git checks canonicalize non-symlink paths to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
 
 ### File System and Deletable Scope
 
@@ -403,8 +407,8 @@ cargo build --release
 
 ### Test Coverage
 
-- **Unit Tests**: 130+ tests covering all modules (CLI, config, error, path_checker, git_checker, init)
-- **Integration Tests**: 50+ tests with real Git repositories (allow/block flows, strict mode, symlinks, batch operations, special filenames)
+- **Unit Tests**: 140+ tests covering all modules (CLI, config, error, path_checker, git_checker, init)
+- **Integration Tests**: 58+ tests with real Git repositories (allow/block flows, strict mode, symlinks, alias-path hardening, batch operations, special filenames)
 
 ## Contributing
 

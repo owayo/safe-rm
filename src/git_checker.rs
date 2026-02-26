@@ -82,10 +82,10 @@ impl GitChecker {
             Err(_) => return FileStatus::NotInRepo,
         };
 
-        let path_str = relative_path.to_string_lossy().to_string();
+        let path_key = Self::to_git_relative_key(relative_path);
 
         // キャッシュから取得
-        if let Some(&status) = cache.get(&path_str) {
+        if let Some(&status) = cache.get(&path_key) {
             return status;
         }
 
@@ -128,10 +128,11 @@ impl GitChecker {
                     opts.include_untracked(true);
                     opts.include_ignored(true);
 
+                    let relative_path_key = Self::to_git_relative_key(relative_path);
                     if let Ok(statuses) = self.repo.statuses(Some(&mut opts)) {
                         for entry in statuses.iter() {
                             if let Some(entry_path) = entry.path() {
-                                if entry_path == relative_path.to_string_lossy() {
+                                if entry_path == relative_path_key {
                                     return Self::convert_status(entry.status());
                                 }
                             }
@@ -194,7 +195,7 @@ impl GitChecker {
     /// * `Ok(())` - 削除可能
     /// * `Err(SafeRmError::DirtyFiles)` - Dirty ファイルが存在
     pub fn check_path(&self, path: &Path) -> Result<(), SafeRmError> {
-        if path.is_dir() {
+        if Self::is_real_directory(path) {
             self.check_directory(path)
         } else {
             self.check_file(path)
@@ -243,7 +244,7 @@ impl GitChecker {
         };
 
         // ディレクトリパスの末尾にスラッシュを追加して gitignore マッチング
-        let dir_pattern = format!("{}/", relative_path.display());
+        let dir_pattern = format!("{}/", Self::to_git_relative_key(relative_path));
 
         let mut opts = StatusOptions::new();
         opts.pathspec(&dir_pattern);
@@ -294,10 +295,13 @@ impl GitChecker {
             }
         };
 
-        for entry in entries.flatten() {
+        for entry_result in entries {
+            let entry = entry_result.map_err(|_| SafeRmError::DirectoryReadError {
+                path: dir.to_path_buf(),
+            })?;
             let path = entry.path();
 
-            if path.is_dir() {
+            if Self::is_real_directory(&path) {
                 // サブディレクトリは再帰的にチェック
                 self.check_directory(&path)?;
             } else {
@@ -345,10 +349,13 @@ impl GitChecker {
             }
         };
 
-        for entry in entries.flatten() {
+        for entry_result in entries {
+            let entry = entry_result.map_err(|_| SafeRmError::DirectoryReadError {
+                path: dir.to_path_buf(),
+            })?;
             let path = entry.path();
 
-            if path.is_dir() {
+            if Self::is_real_directory(&path) {
                 // サブディレクトリも再帰的にチェック
                 self.check_directory_with_cache(&path, cache)?;
             } else {
@@ -386,11 +393,26 @@ impl GitChecker {
         path: &Path,
         cache: &HashMap<String, FileStatus>,
     ) -> Result<(), SafeRmError> {
-        if path.is_dir() {
+        if Self::is_real_directory(path) {
             self.check_directory_with_cache(path, cache)
         } else {
             self.check_file_with_cache(path, cache)
         }
+    }
+
+    /// Git status のキー形式 (forward slash) に揃える
+    fn to_git_relative_key(path: &Path) -> String {
+        path.components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// シンボリックリンクを辿らずに「実体がディレクトリか」を判定
+    fn is_real_directory(path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_dir())
+            .unwrap_or(false)
     }
 }
 
@@ -1006,5 +1028,104 @@ mod tests {
     fn test_convert_status_wt_typechange() {
         let status = GitChecker::convert_status(Status::WT_TYPECHANGE);
         assert_eq!(status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn test_to_git_relative_key_uses_forward_slash() {
+        let nested = Path::new("subdir").join("file.txt");
+        let key = GitChecker::to_git_relative_key(&nested);
+        assert_eq!(key, "subdir/file.txt");
+    }
+
+    #[test]
+    fn test_get_file_status_from_cache_matches_nested_key() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let nested_dir = repo_path.join("nested");
+        fs::create_dir(&nested_dir).unwrap();
+        let nested_file = nested_dir.join("file.txt");
+        fs::write(&nested_file, "content").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add nested file"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let mut cache = HashMap::new();
+        cache.insert("nested/file.txt".to_string(), FileStatus::Untracked);
+
+        let status = checker.get_file_status_from_cache(&nested_file, &cache);
+        assert_eq!(status, FileStatus::Untracked);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_is_real_directory_does_not_follow_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let real_dir = root.join("real_dir");
+        fs::create_dir(&real_dir).unwrap();
+
+        let link = root.join("dir_link");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+
+        assert!(GitChecker::is_real_directory(&real_dir));
+        assert!(
+            !GitChecker::is_real_directory(&link),
+            "symlink to directory must be treated as non-directory"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_check_path_with_cache_symlink_to_directory_checks_link_itself() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // 実体ディレクトリを作成してコミット
+        let target_dir = repo_path.join("target_dir");
+        fs::create_dir(&target_dir).unwrap();
+        fs::write(target_dir.join("clean.txt"), "clean").unwrap();
+        Command::new("git")
+            .args(["add", "target_dir/clean.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add target dir"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // ディレクトリへのシンボリックリンクを作成してコミット
+        let link_path = repo_path.join("dir_link");
+        std::os::unix::fs::symlink("target_dir", &link_path).unwrap();
+        Command::new("git")
+            .args(["add", "dir_link"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add dir symlink"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // 実体ディレクトリ側を dirty にしても、link 自体が clean なら削除判定は許可されるべき
+        fs::write(repo_path.join("target_dir").join("untracked.txt"), "dirty").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses();
+        let result = checker.check_path_with_cache(&link_path, &cache);
+        assert!(
+            result.is_ok(),
+            "directory symlink should be checked as the link itself, not traversed"
+        );
     }
 }
