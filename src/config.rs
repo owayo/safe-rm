@@ -508,6 +508,10 @@ path = "/tmp/dir"
 
     #[test]
     fn test_config_path_location() {
+        // SAFE_RM_CONFIG が設定されている場合はその値が返るためスキップ
+        if std::env::var("SAFE_RM_CONFIG").is_ok() {
+            return;
+        }
         let path = Config::config_path();
         if let Some(p) = path {
             assert!(p.to_string_lossy().contains("safe-rm"));
