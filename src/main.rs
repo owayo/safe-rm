@@ -197,13 +197,26 @@ fn process_path(
         // Skip if allow_project_deletion is enabled (containment already verified above)
         if !config.allow_project_deletion {
             if let Some(ref checker) = git_checker {
-                // Keep symlink path as-is (check link itself), canonicalize others
-                // to avoid alias-path bypasses (e.g. /var vs /private/var).
-                let git_check_path = if metadata.file_type().is_symlink() {
-                    &normalized_path
-                } else {
-                    &canonical_path
-                };
+                // For symlinks, canonicalize only the parent directory and keep
+                // the link name itself. This preserves "check the link itself"
+                // semantics while resolving repo alias paths.
+                let symlink_git_check_path: Option<std::path::PathBuf> =
+                    if metadata.file_type().is_symlink() {
+                        Some(
+                            normalized_path
+                                .file_name()
+                                .and_then(|name| {
+                                    normalized_path
+                                        .parent()
+                                        .and_then(|parent| parent.canonicalize().ok())
+                                        .map(|canonical_parent| canonical_parent.join(name))
+                                })
+                                .unwrap_or_else(|| normalized_path.clone()),
+                        )
+                    } else {
+                        None
+                    };
+                let git_check_path = symlink_git_check_path.as_deref().unwrap_or(&canonical_path);
                 checker.check_path_with_cache(git_check_path, status_cache)?;
             }
         }

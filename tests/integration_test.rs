@@ -1618,6 +1618,51 @@ mod symlink_tests {
             "Dirty target file should remain"
         );
     }
+
+    #[test]
+    fn test_strict_mode_untracked_symlink_via_repo_alias_is_blocked() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // strict mode 設定
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        // 初期コミットと symlink ターゲットを用意
+        commit_file(&repo_path, "init.txt", "init");
+        commit_file(&repo_path, "target.txt", "target");
+
+        // 未追跡 symlink（strict mode ではブロック対象）
+        let link_path = repo_path.join("untracked_link");
+        std::os::unix::fs::symlink("target.txt", &link_path).unwrap();
+
+        // リポジトリ別名 symlink 経由で絶対パス指定
+        let alias_dir = TempDir::new().unwrap();
+        let alias_repo = alias_dir.path().join("repo-link");
+        std::os::unix::fs::symlink(&repo_path, &alias_repo).unwrap();
+        let alias_link_path = alias_repo.join("untracked_link");
+
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &[alias_link_path.to_str().unwrap()],
+            &repo_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 2,
+            "Untracked symlink via repo alias must be blocked in strict mode. stderr: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("Untracked") || stderr.contains("未追跡"),
+            "Error should report untracked status. stderr: {}",
+            stderr
+        );
+        assert!(
+            link_path.symlink_metadata().is_ok(),
+            "Untracked symlink should NOT be deleted"
+        );
+    }
 }
 
 // =============================================================================

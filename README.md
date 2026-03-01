@@ -34,7 +34,7 @@
 - **Directory Traversal Prevention**: Block `../` escape attempts
 - **Ignored File Passthrough**: Allow deletion of `.gitignore`d files (build artifacts, etc.)
 - **Symlink-Safe Git Checks**: Directory symlinks are checked as links themselves (not traversed)
-- **Alias-Path Safe Strict Mode**: Non-symlink paths are canonicalized for Git checks, blocking bypasses via alternate absolute aliases
+- **Alias-Path Safe Strict Mode**: Non-symlink paths are canonicalized, and symlink paths canonicalize only parent directories (while checking the link itself), blocking bypasses via alternate absolute aliases
 - **Configurable Allowed Paths**: Bypass safety checks for specified directories (per-directory recursive control)
 - **Non-Git Support**: Works safely in non-Git directories
 - **Dry Run Mode**: Preview what would be deleted without actually deleting
@@ -180,7 +180,7 @@ flowchart TB
 2. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked)
 3. **Recursive Check**: For real directories, validates all contained files
 4. **Fail-Closed Directory Reads**: Any directory read failure (including entry iteration errors) is blocked
-5. **Alias-Path Hardening**: Git checks canonicalize non-symlink paths to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
+5. **Alias-Path Hardening**: Git checks canonicalize non-symlink paths, and for symlink paths canonicalize only parent directories while checking the link itself, to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
 
 ### File System and Deletable Scope
 
