@@ -248,6 +248,28 @@ mod allow_flow_tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_force_nonexistent_absolute_path_via_repo_symlink_alias() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let alias_root = TempDir::new().unwrap();
+        let repo_alias = alias_root.path().join("repo-link");
+        std::os::unix::fs::symlink(&repo_path, &repo_alias).unwrap();
+
+        // 同一リポジトリの symlink alias 経由でも、-f なら未作成パスは成功すべき
+        let nonexistent = repo_alias.join("missing.txt");
+        let nonexistent_arg = nonexistent.to_string_lossy().to_string();
+        let (exit_code, _, stderr) = run_safe_rm(&["-f", nonexistent_arg.as_str()], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "Force deletion for missing path via repo alias should succeed. stderr: {}",
+            stderr
+        );
+    }
+
+    #[test]
     fn test_absolute_path_sibling_directory() {
         // 再現シナリオ: frontend/ から backend/file.txt をフルパスで削除
         let temp_dir = create_test_repo();

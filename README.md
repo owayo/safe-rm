@@ -34,7 +34,7 @@
 - **Directory Traversal Prevention**: Block `../` escape attempts
 - **Ignored File Passthrough**: Allow deletion of `.gitignore`d files (build artifacts, etc.)
 - **Symlink-Safe Git Checks**: Directory symlinks are checked as links themselves (not traversed)
-- **Alias-Path Safe Strict Mode**: Non-symlink paths are canonicalized, and symlink paths canonicalize only parent directories (while checking the link itself), blocking bypasses via alternate absolute aliases
+- **Alias-Path Safety (Containment + Strict Mode)**: Containment checks canonicalize up to the nearest existing parent and re-append missing segments, while strict-mode Git checks canonicalize non-symlink paths and canonicalize only symlink parents (checking the link itself), blocking bypasses via alternate absolute aliases
 - **Configurable Allowed Paths**: Bypass safety checks for specified directories (per-directory recursive control)
 - **Non-Git Support**: Works safely in non-Git directories
 - **Dry Run Mode**: Preview what would be deleted without actually deleting
@@ -42,7 +42,7 @@
 ## Requirements
 
 - **OS**: macOS, Linux
-- **Rust**: 1.70+ (for building from source)
+- **Rust**: 1.85+ (for building from source)
 
 ## Installation
 
@@ -176,7 +176,7 @@ flowchart TB
 
 ### Safety Layers
 
-1. **Path Containment**: Ensures all paths resolve within the project directory (Git repository root, or cwd if not a Git repo) (always enforced)
+1. **Path Containment**: Ensures all paths resolve within the project directory (Git repository root, or cwd if not a Git repo) (always enforced). For nonexistent targets, it canonicalizes the nearest existing parent to absorb alias differences (e.g. repo symlink alias, `/var` vs `/private/var`).
 2. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked)
 3. **Recursive Check**: For real directories, validates all contained files
 4. **Fail-Closed Directory Reads**: Any directory read failure (including entry iteration errors) is blocked

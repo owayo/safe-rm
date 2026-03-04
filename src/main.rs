@@ -196,7 +196,7 @@ fn process_path(
         // Check Git status using pre-fetched cache (batch optimization)
         // Skip if allow_project_deletion is enabled (containment already verified above)
         if !config.allow_project_deletion {
-            if let Some(ref checker) = git_checker {
+            if let Some(checker) = git_checker {
                 // For symlinks, canonicalize only the parent directory and keep
                 // the link name itself. This preserves "check the link itself"
                 // semantics while resolving repo alias paths.

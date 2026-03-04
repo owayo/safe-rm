@@ -691,9 +691,11 @@ recursive = true
         // Verify that resolve populates allowed_paths_resolved
         assert_eq!(config.allowed_paths_resolved.len(), 1);
         // Canonical path should be resolvable
-        assert!(config.allowed_paths_resolved[0]
-            .canonical_path
-            .is_absolute());
+        assert!(
+            config.allowed_paths_resolved[0]
+                .canonical_path
+                .is_absolute()
+        );
     }
 
     #[test]

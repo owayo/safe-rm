@@ -48,6 +48,7 @@ impl PathChecker {
         let cleaned_path = absolute_path.clean();
 
         // 3. 可能であればシンボリックリンクを解決
+        //    末尾が未作成でも、既存の親ディレクトリまで解決してエイリアス差異を吸収する
         let canonical_path = Self::try_canonicalize(&cleaned_path);
 
         // 4. プロジェクトルートも正規化
@@ -73,9 +74,34 @@ impl PathChecker {
         }
     }
 
-    /// 可能であれば canonicalize、失敗時は元のパスを返す
+    /// 可能であれば canonicalize する。
+    /// 末尾が未作成で失敗した場合は、既存の親ディレクトリまで canonicalize してから
+    /// 未作成部分を再結合する。
     fn try_canonicalize(path: &Path) -> PathBuf {
-        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        if let Ok(canonical) = path.canonicalize() {
+            return canonical;
+        }
+
+        let mut current = path;
+        let mut missing_segments: Vec<std::ffi::OsString> = Vec::new();
+
+        while let Some(parent) = current.parent() {
+            if let Some(name) = current.file_name() {
+                missing_segments.push(name.to_os_string());
+            }
+
+            if let Ok(canonical_parent) = parent.canonicalize() {
+                let mut rebuilt = canonical_parent;
+                for segment in missing_segments.iter().rev() {
+                    rebuilt.push(segment);
+                }
+                return rebuilt;
+            }
+
+            current = parent;
+        }
+
+        path.to_path_buf()
     }
 
     /// パスがルート内に含まれているかチェック
@@ -103,7 +129,7 @@ mod tests {
     #[test]
     fn test_verify_containment_relative_path() {
         let temp_dir = TempDir::new().unwrap();
-        // canonicalize to get the real path (handles /private on macOS)
+        // 実パスに揃える（macOS の /var → /private 差異を吸収）
         let project_root = temp_dir.path().canonicalize().unwrap();
 
         // テスト用ファイルを作成
@@ -405,5 +431,27 @@ mod tests {
         let path = Path::new("/nonexistent/path/to/file.txt");
         let result = PathChecker::try_canonicalize(path);
         assert_eq!(result, path.to_path_buf());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_verify_containment_with_base_nonexistent_absolute_path_via_symlink_alias() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+
+        let alias_holder = TempDir::new().unwrap();
+        let repo_alias = alias_holder.path().join("repo_alias");
+        std::os::unix::fs::symlink(&project_root, &repo_alias).unwrap();
+
+        // repo_alias/missing.txt は存在しないが、既存親(repo_alias)は実体に解決可能
+        let nonexistent = repo_alias.join("missing.txt");
+        let result =
+            PathChecker::verify_containment_with_base(&project_root, &project_root, &nonexistent);
+
+        assert!(
+            result.is_ok(),
+            "Symlink alias 経由の未作成パスでもプロジェクト内として扱うべき"
+        );
+        assert_eq!(result.unwrap(), project_root.join("missing.txt"));
     }
 }

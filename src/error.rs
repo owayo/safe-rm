@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn test_source_io_error() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "io test");
+        let io_err = std::io::Error::other("io test");
         let err = SafeRmError::IoError(io_err);
         assert!(err.source().is_some(), "IoError should have a source");
     }
