@@ -30,7 +30,7 @@ git2 = { version = "0.20.4", features = ["vendored-libgit2", "vendored-openssl"]
 
 # Configuration file parsing
 serde = { version = "1.0.228", features = ["derive"] }
-toml = "1.0.3"
+toml = "1.0.4"
 
 # Home directory detection
 dirs = "6.0"

@@ -1,6 +1,6 @@
-//! Path validation for safe-rm
+//! safe-rm のパス検証
 //!
-//! Normalizes paths and verifies project boundary containment.
+//! パスの正規化とプロジェクト境界の包含検証を行う。
 
 use crate::error::SafeRmError;
 use path_clean::PathClean;
@@ -431,6 +431,34 @@ mod tests {
         let path = Path::new("/nonexistent/path/to/file.txt");
         let result = PathChecker::try_canonicalize(path);
         assert_eq!(result, path.to_path_buf());
+    }
+
+    #[test]
+    fn test_try_canonicalize_multiple_missing_segments() {
+        // 既存の親ディレクトリから複数の未作成セグメントがある場合
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+
+        let deep_nonexistent = project_root.join("a").join("b").join("c").join("file.txt");
+        let result = PathChecker::try_canonicalize(&deep_nonexistent);
+
+        // project_root は canonicalize 可能なので、そこから再結合される
+        assert!(result.starts_with(&project_root));
+        assert!(result.ends_with("a/b/c/file.txt") || result.ends_with("a\\b\\c\\file.txt"));
+    }
+
+    #[test]
+    fn test_verify_containment_empty_path_component() {
+        // 空のパスコンポーネントを含むケース
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+
+        let file = project_root.join("test.txt");
+        fs::write(&file, "content").unwrap();
+
+        // "." はプロジェクトルート自体を指す
+        let result = PathChecker::verify_containment(&project_root, Path::new("."));
+        assert!(result.is_ok());
     }
 
     #[test]

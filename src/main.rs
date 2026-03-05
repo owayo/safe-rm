@@ -1,7 +1,7 @@
-//! safe-rm: Safe file deletion tool for AI agents
+//! safe-rm: AIエージェント向け安全なファイル削除ツール
 //!
-//! This tool provides Git-aware access control for file deletion,
-//! allowing AI agents to safely delete only clean or ignored files.
+//! Git状態に基づくアクセス制御を備えたファイル削除プロキシ。
+//! Clean または Ignored 状態のファイルのみ削除を許可する。
 
 use std::collections::HashMap;
 use std::fs;
@@ -19,7 +19,7 @@ use safe_rm::path_checker::PathChecker;
 fn main() -> ExitCode {
     let args = CliArgs::parse_args();
 
-    // Handle subcommands
+    // サブコマンドの処理
     if let Some(Commands::Init) = args.command {
         match init::run_init() {
             Ok(()) => return ExitCode::SUCCESS,
@@ -39,27 +39,26 @@ fn main() -> ExitCode {
     }
 }
 
-/// Main execution logic
+/// メイン実行ロジック
 fn run(args: CliArgs) -> Result<(), SafeRmError> {
-    // Load user configuration
+    // ユーザー設定の読み込み
     let config = Config::load();
 
-    // Get current working directory
+    // カレントディレクトリの取得
     let cwd = std::env::current_dir().map_err(SafeRmError::IoError)?;
 
-    // Open Git repository if available
+    // Git リポジトリを開く（存在する場合）
     let git_checker = GitChecker::open(&cwd);
 
-    // Use Git repository root as project boundary (not just cwd)
-    // This allows absolute paths within the same repo to work correctly
-    // e.g., running from frontend/ but deleting backend/file.txt
+    // Git リポジトリルートをプロジェクト境界として使用（cwd ではなく）
+    // 例: frontend/ から実行して backend/file.txt を削除する場合にも正しく動作
     let project_root = git_checker
         .as_ref()
         .and_then(|checker| checker.workdir())
         .unwrap_or_else(|| cwd.clone());
 
-    // Pre-fetch Git statuses only when needed (performance optimization)
-    // Skip entirely if allow_project_deletion is enabled
+    // Git ステータスを必要時のみ一括事前取得（パフォーマンス最適化）
+    // allow_project_deletion 有効時はスキップ
     let status_cache: HashMap<String, FileStatus> = if !config.allow_project_deletion {
         git_checker
             .as_ref()
@@ -104,9 +103,9 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
     }
 
     if error_count > 0 {
-        // Return the error with highest exit code (security blocks take precedence)
+        // 最も高い終了コードのエラーを返す（セキュリティブロックが優先）
         if max_exit_code == 2 {
-            // Return the security error directly
+            // セキュリティエラーを直接返す
             Err(last_error.unwrap())
         } else {
             Err(SafeRmError::PartialFailure {
@@ -119,7 +118,7 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
     }
 }
 
-/// Process a single path for deletion
+/// 単一パスの削除処理
 fn process_path(
     path: &Path,
     project_root: &Path,
@@ -129,16 +128,16 @@ fn process_path(
     args: &CliArgs,
     config: &Config,
 ) -> Result<bool, SafeRmError> {
-    // Resolve path to absolute (relative paths are resolved from cwd, not git root)
+    // 絶対パスに変換（相対パスは cwd から解決、git root からではない）
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
     };
 
-    // Check if path is in allowed_paths (bypass containment and Git checks)
+    // allowed_paths 内のパスか確認（包含検証と Git チェックをバイパス）
     if config.is_path_allowed(&abs_path) {
-        // Get metadata with single syscall (optimization: replaces exists() + is_dir())
+        // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
         let metadata = match std::fs::symlink_metadata(&abs_path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -151,12 +150,12 @@ fn process_path(
             Err(e) => return Err(SafeRmError::IoError(e)),
         };
 
-        // Check if it's a directory without -r flag
+        // ディレクトリに -r フラグがない場合はエラー
         if metadata.is_dir() && !args.recursive {
             return Err(SafeRmError::IsDirectory(abs_path));
         }
 
-        // Perform deletion (or dry-run) — skip containment and Git checks
+        // 削除実行（またはドライラン）— 包含検証と Git チェックをスキップ
         if args.dry_run {
             println!("would remove: {} (allowed by config)", path.display());
             Ok(true)
@@ -166,16 +165,14 @@ fn process_path(
             Ok(true)
         }
     } else {
-        // Standard safety checks
+        // 標準安全チェック
 
-        // Verify path is within project FIRST (security check takes precedence)
-        // This prevents information disclosure about file existence outside project
-        // project_root is the git repo root (or cwd if no git repo)
-        // cwd is used as the base for resolving relative paths
+        // パスがプロジェクト内にあることを最初に検証（セキュリティチェック優先）
+        // プロジェクト外のファイル存在情報の漏洩を防止
         let canonical_path = PathChecker::verify_containment_with_base(project_root, cwd, path)?;
         let normalized_path = abs_path.clean();
 
-        // Get metadata with single syscall (optimization: replaces exists() + is_dir())
+        // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
         let metadata = match std::fs::symlink_metadata(&abs_path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -188,18 +185,18 @@ fn process_path(
             Err(e) => return Err(SafeRmError::IoError(e)),
         };
 
-        // Check if it's a directory without -r flag
+        // ディレクトリに -r フラグがない場合はエラー
         if metadata.is_dir() && !args.recursive {
             return Err(SafeRmError::IsDirectory(abs_path));
         }
 
-        // Check Git status using pre-fetched cache (batch optimization)
-        // Skip if allow_project_deletion is enabled (containment already verified above)
+        // 事前取得キャッシュを使用して Git ステータスをチェック（バッチ最適化）
+        // allow_project_deletion 有効時はスキップ（包含検証は上記で完了）
         if !config.allow_project_deletion {
             if let Some(checker) = git_checker {
-                // For symlinks, canonicalize only the parent directory and keep
-                // the link name itself. This preserves "check the link itself"
-                // semantics while resolving repo alias paths.
+                // シンボリックリンクの場合、親ディレクトリのみ canonicalize し
+                // リンク名自体は保持。「リンク自体をチェック」するセマンティクスを
+                // 維持しつつ、リポジトリエイリアスパスを解決する。
                 let symlink_git_check_path: Option<std::path::PathBuf> =
                     if metadata.file_type().is_symlink() {
                         Some(
@@ -221,7 +218,7 @@ fn process_path(
             }
         }
 
-        // Perform deletion (or dry-run)
+        // 削除実行（またはドライラン）
         if args.dry_run {
             println!("would remove: {}", path.display());
             Ok(true)
@@ -233,7 +230,7 @@ fn process_path(
     }
 }
 
-/// Delete a file or directory using pre-fetched metadata (avoids extra syscall)
+/// メタデータを使用してファイルまたはディレクトリを削除（追加 syscall を回避）
 fn delete_path_with_metadata(
     path: &Path,
     recursive: bool,
@@ -255,14 +252,14 @@ fn delete_path_with_metadata(
 mod tests {
     #[test]
     fn test_project_compiles() {
-        // Basic smoke test to verify the project compiles correctly
+        // プロジェクトが正しくコンパイルされることを確認するスモークテスト
     }
 
     #[test]
     fn test_version_available() {
         let version = env!("CARGO_PKG_VERSION");
         assert!(!version.is_empty());
-        // Version is defined in Cargo.toml, just verify it's a valid semver format
+        // Cargo.toml のバージョンが有効な semver 形式であることを検証
         assert!(version.contains('.'), "Version should be in semver format");
     }
 }

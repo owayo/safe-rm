@@ -1,11 +1,11 @@
-//! CLI argument parser for safe-rm
+//! safe-rm の CLI 引数パーサー
 //!
-//! Provides type-safe argument parsing using clap derive.
+//! clap derive による型安全な引数パースを提供する。
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-/// CLI arguments for safe-rm
+/// safe-rm の CLI 引数
 #[derive(Parser, Debug)]
 #[command(
     name = "safe-rm",
@@ -17,36 +17,36 @@ use std::path::PathBuf;
     subcommand_negates_reqs = true
 )]
 pub struct CliArgs {
-    /// Subcommand (e.g., init)
+    /// サブコマンド（例: init）
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Files or directories to delete
+    /// 削除対象のファイルまたはディレクトリ
     #[arg(required = true, value_name = "PATH")]
     pub paths: Vec<PathBuf>,
 
-    /// Recursive deletion (remove directories and their contents)
+    /// 再帰削除（ディレクトリとその内容を削除）
     #[arg(short, long)]
     pub recursive: bool,
 
-    /// Force deletion (ignore nonexistent files)
+    /// 強制削除（存在しないファイルを無視）
     #[arg(short, long)]
     pub force: bool,
 
-    /// Dry run mode (show what would be deleted without actually deleting)
+    /// ドライランモード（実際には削除せず、削除対象を表示）
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 }
 
-/// Subcommands
+/// サブコマンド
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Initialize configuration file (~/.config/safe-rm/config.toml)
+    /// 設定ファイルを初期化（~/.config/safe-rm/config.toml）
     Init,
 }
 
 impl CliArgs {
-    /// Parse CLI arguments from command line
+    /// コマンドライン引数をパース
     pub fn parse_args() -> Self {
         Self::parse()
     }

@@ -1,7 +1,7 @@
-//! safe-rm: Safe file deletion tool for AI agents
+//! safe-rm: AIエージェント向け安全なファイル削除ツール
 //!
-//! This library provides Git-aware access control for file deletion,
-//! allowing AI agents to safely delete only clean or ignored files.
+//! Git状態に基づくアクセス制御を備えたファイル削除ライブラリ。
+//! Clean または Ignored 状態のファイルのみ削除を許可する。
 
 pub mod cli;
 pub mod config;

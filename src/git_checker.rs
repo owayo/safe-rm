@@ -1,6 +1,6 @@
-//! Git status checking for safe-rm
+//! safe-rm の Git ステータスチェック
 //!
-//! Detects Git repositories and checks file status for safe deletion.
+//! Git リポジトリを検出し、安全な削除のためにファイルステータスを確認する。
 
 use crate::error::{FileStatus, SafeRmError};
 use git2::{Repository, Status, StatusOptions};
@@ -1062,6 +1062,68 @@ mod tests {
 
         let status = checker.get_file_status_from_cache(&nested_file, &cache);
         assert_eq!(status, FileStatus::Untracked);
+    }
+
+    #[test]
+    fn test_convert_status_index_and_wt_combined() {
+        // INDEX_MODIFIED + WT_MODIFIED の場合、Staged が優先される
+        let status = GitChecker::convert_status(Status::INDEX_MODIFIED | Status::WT_MODIFIED);
+        assert_eq!(status, FileStatus::Staged);
+    }
+
+    #[test]
+    fn test_convert_status_index_new_and_wt_modified() {
+        // INDEX_NEW + WT_MODIFIED の場合、Staged が優先される
+        let status = GitChecker::convert_status(Status::INDEX_NEW | Status::WT_MODIFIED);
+        assert_eq!(status, FileStatus::Staged);
+    }
+
+    #[test]
+    fn test_get_file_status_not_in_workdir() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "dummy.txt", "dummy");
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+
+        // リポジトリ外のパスは NotInRepo
+        let outside = Path::new("/tmp/outside_file.txt");
+        let status = checker.get_file_status(outside);
+        assert_eq!(status, FileStatus::NotInRepo);
+    }
+
+    #[test]
+    fn test_check_directory_empty() {
+        // 空ディレクトリのチェック（ファイルなし = 全 Clean）
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "initial.txt", "init");
+
+        let empty_dir = repo_path.join("empty");
+        fs::create_dir(&empty_dir).unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let result = checker.check_directory(&empty_dir);
+        assert!(result.is_ok(), "空ディレクトリは削除可能であるべき");
+    }
+
+    #[test]
+    fn test_check_directory_with_cache_empty() {
+        // 空ディレクトリのキャッシュ付きチェック
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "initial.txt", "init");
+
+        let empty_dir = repo_path.join("empty_cached");
+        fs::create_dir(&empty_dir).unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses();
+        let result = checker.check_directory_with_cache(&empty_dir, &cache);
+        assert!(
+            result.is_ok(),
+            "空ディレクトリはキャッシュ付きでも削除可能であるべき"
+        );
     }
 
     #[test]

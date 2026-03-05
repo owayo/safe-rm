@@ -1,11 +1,11 @@
-//! Configuration initialization for safe-rm
+//! safe-rm の設定初期化
 //!
-//! Generates a default config file at ~/.config/safe-rm/config.toml
+//! ~/.config/safe-rm/config.toml にデフォルト設定ファイルを生成する。
 
 use crate::config::Config;
 use std::fs;
 
-/// Default config template with ~/.claude/skills enabled
+/// ~/.claude/skills を有効にしたデフォルト設定テンプレート
 const CONFIG_TEMPLATE: &str = r#"# safe-rm configuration
 # Location: ~/.config/safe-rm/config.toml
 #
@@ -24,7 +24,7 @@ recursive = true
 # recursive = false
 "#;
 
-/// Run the init subcommand
+/// init サブコマンドを実行
 pub fn run_init() -> Result<(), String> {
     let config_path =
         Config::config_path().ok_or_else(|| "Cannot determine config directory".to_string())?;
@@ -33,20 +33,20 @@ pub fn run_init() -> Result<(), String> {
         .parent()
         .ok_or_else(|| "Cannot determine config directory".to_string())?;
 
-    // Create config directory if needed
+    // 必要に応じて設定ディレクトリを作成
     if !config_dir.exists() {
         fs::create_dir_all(config_dir)
             .map_err(|e| format!("Cannot create directory {}: {}", config_dir.display(), e))?;
     }
 
-    // Check if config already exists
+    // 設定ファイルが既に存在するか確認
     if config_path.exists() {
         eprintln!("Config file already exists: {}", config_path.display());
         eprintln!("To regenerate, delete the file first and run `safe-rm init` again.");
         return Ok(());
     }
 
-    // Write template
+    // テンプレートを書き出し
     fs::write(&config_path, CONFIG_TEMPLATE)
         .map_err(|e| format!("Cannot write config file: {}", e))?;
 
@@ -58,7 +58,7 @@ pub fn run_init() -> Result<(), String> {
     Ok(())
 }
 
-/// Get the config path for display purposes
+/// 表示用の設定パスを取得
 pub fn config_path_display() -> String {
     Config::config_path()
         .map(|p| p.display().to_string())

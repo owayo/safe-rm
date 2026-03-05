@@ -1,14 +1,14 @@
-//! Configuration for safe-rm
+//! safe-rm の設定管理
 //!
-//! Loads user configuration from `~/.config/safe-rm/config.toml`.
-//! Supports allowed_paths for bypassing safety checks on specified directories.
+//! `~/.config/safe-rm/config.toml` からユーザー設定を読み込む。
+//! 指定ディレクトリの安全チェックをバイパスする allowed_paths をサポート。
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-/// Configuration structure
+/// 設定構造体
 ///
-/// Example config.toml:
+/// config.toml の例:
 /// ```toml
 /// # Allow deletion of any file within the current project (Git repository)
 /// # without requiring the file to be committed or ignored.
@@ -23,34 +23,33 @@ use std::path::{Path, PathBuf};
 /// path = "/tmp/logs"
 /// recursive = false  # only direct children
 /// ```
-/// Helper function to provide default value of true
+/// デフォルト値 true を返すヘルパー関数
 fn default_true() -> bool {
     true
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// If true, allow deletion of any file within the current project
-    /// without Git status checks. Containment is still enforced.
-    /// Default: true
+    /// true の場合、プロジェクト内の任意のファイルを Git ステータスチェックなしで削除可能。
+    /// 包含検証は引き続き適用。デフォルト: true
     #[serde(default = "default_true")]
     pub allow_project_deletion: bool,
 
-    /// List of allowed path entries
+    /// 許可パスエントリのリスト
     #[serde(default)]
     pub allowed_paths: Vec<AllowedPathEntry>,
 
-    /// Pre-resolved allowed paths (canonicalized at load time for performance)
+    /// 事前解決済み許可パス（パフォーマンスのためロード時に canonicalize 済み）
     #[serde(skip)]
     allowed_paths_resolved: Vec<AllowedPathResolved>,
 }
 
-/// Pre-resolved allowed path entry (canonicalized for fast lookup)
+/// 事前解決済み許可パスエントリ（高速検索のため canonicalize 済み）
 #[derive(Debug, Clone)]
 struct AllowedPathResolved {
-    /// Canonicalized path (or expanded path if canonicalize fails)
+    /// canonicalize 済みパス（失敗時は展開パスにフォールバック）
     canonical_path: PathBuf,
-    /// If true, all files/subdirectories recursively are allowed.
+    /// true の場合、全ファイル/サブディレクトリを再帰的に許可
     recursive: bool,
 }
 
@@ -64,24 +63,24 @@ impl Default for Config {
     }
 }
 
-/// An allowed path entry with per-directory settings
+/// ディレクトリごとの設定を持つ許可パスエントリ
 #[derive(Debug, Clone, Deserialize)]
 pub struct AllowedPathEntry {
-    /// Directory path where deletion is permitted
+    /// 削除を許可するディレクトリパス
     pub path: String,
-    /// If true, all files/subdirectories recursively are allowed.
-    /// If false, only direct children of this directory are allowed.
+    /// true の場合、全ファイル/サブディレクトリを再帰的に許可。
+    /// false の場合、直下の子のみ許可。
     #[serde(default)]
     pub recursive: bool,
 }
 
 impl Config {
-    /// Get the config file path: ~/.config/safe-rm/config.toml
+    /// 設定ファイルパスを取得: ~/.config/safe-rm/config.toml
     ///
-    /// Uses XDG-style path (~/.config/) on all platforms for consistency
-    /// with safe-kill and other CLI tools.
+    /// safe-kill 等の CLI ツールとの一貫性のため、全プラットフォームで
+    /// XDG スタイルパス (~/.config/) を使用。
     ///
-    /// If SAFE_RM_CONFIG environment variable is set, uses that path instead.
+    /// SAFE_RM_CONFIG 環境変数が設定されている場合はそのパスを使用。
     pub fn config_path() -> Option<PathBuf> {
         if let Ok(path) = std::env::var("SAFE_RM_CONFIG") {
             return Some(PathBuf::from(path));
@@ -89,12 +88,12 @@ impl Config {
         dirs::home_dir().map(|d| d.join(".config").join("safe-rm").join("config.toml"))
     }
 
-    /// Load configuration from default path
+    /// デフォルトパスから設定を読み込み
     pub fn load() -> Self {
         Self::load_from_path(Self::config_path())
     }
 
-    /// Load configuration from a specific path
+    /// 指定パスから設定を読み込み
     pub fn load_from_path(path: Option<PathBuf>) -> Self {
         let Some(path) = path else {
             return Self::default();
@@ -147,7 +146,7 @@ impl Config {
             .collect();
     }
 
-    /// Expand tilde (~) prefix to the user's home directory
+    /// チルダ（~）プレフィックスをユーザーのホームディレクトリに展開
     fn expand_tilde(path: &str) -> PathBuf {
         if path == "~" {
             dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
@@ -160,17 +159,17 @@ impl Config {
         }
     }
 
-    /// Check if a path is within an allowed directory
+    /// パスが許可ディレクトリ内にあるかチェック
     ///
-    /// Returns true if the given path matches any allowed_paths entry,
-    /// respecting the `recursive` flag for each entry.
-    /// Uses pre-resolved paths for performance (canonicalized at load time).
+    /// 指定パスが allowed_paths のいずれかのエントリに一致する場合 true を返す。
+    /// 各エントリの `recursive` フラグを考慮。
+    /// パフォーマンスのため事前解決済みパスを使用。
     pub fn is_path_allowed(&self, target: &Path) -> bool {
         if self.allowed_paths_resolved.is_empty() {
             return false;
         }
 
-        // Normalize target path (resolve to absolute if possible)
+        // ターゲットパスを正規化（可能であれば絶対パスに解決）
         let target_normalized = if target.is_absolute() {
             target.to_path_buf()
         } else {
@@ -179,19 +178,19 @@ impl Config {
                 .unwrap_or_else(|_| target.to_path_buf())
         };
 
-        // Try to canonicalize for symlink resolution
+        // シンボリックリンク解決のため canonicalize を試行
         let target_resolved =
             std::fs::canonicalize(&target_normalized).unwrap_or(target_normalized);
 
-        // Use pre-resolved paths (no canonicalize calls here - already done at load time)
+        // 事前解決済みパスを使用（ここでは canonicalize を呼ばない — ロード時に完了済み）
         for entry in &self.allowed_paths_resolved {
             if entry.recursive {
-                // Recursive: target can be anywhere under the allowed path
+                // 再帰: ターゲットは許可パス配下の任意の場所に存在可能
                 if target_resolved.starts_with(&entry.canonical_path) {
                     return true;
                 }
             } else {
-                // Non-recursive: target must be a direct child of the allowed path
+                // 非再帰: ターゲットは許可パスの直接の子でなければならない
                 if let Some(parent) = target_resolved.parent() {
                     if parent == entry.canonical_path {
                         return true;
@@ -742,6 +741,54 @@ recursive = true
         assert!(
             config.is_path_allowed(&nonexistent),
             "Non-existent file in allowed dir should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_is_path_allowed_directory_itself() {
+        // 許可ディレクトリ自体が対象の場合（recursive=true）
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: true,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        // 許可ディレクトリ自体は starts_with で一致するため true
+        assert!(
+            config.is_path_allowed(&allowed_dir),
+            "許可ディレクトリ自体は recursive=true の場合に許可されるべき"
+        );
+    }
+
+    #[test]
+    fn test_is_path_allowed_directory_itself_non_recursive() {
+        // 許可ディレクトリ自体が対象の場合（recursive=false）
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: false,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        // non-recursive ではディレクトリ自体は parent チェックで一致しない
+        assert!(
+            !config.is_path_allowed(&allowed_dir),
+            "許可ディレクトリ自体は recursive=false の場合に許可されないべき"
         );
     }
 

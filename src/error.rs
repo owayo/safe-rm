@@ -1,11 +1,11 @@
-//! Error types for safe-rm
+//! safe-rm のエラー型
 //!
-//! Defines SafeRmError and related types for handling all error states.
+//! SafeRmError および関連型を定義し、全エラー状態を処理する。
 
 use std::fmt;
 use std::path::PathBuf;
 
-/// File status for Git-tracked files (forward declaration for error messages)
+/// Git 追跡ファイルのステータス（エラーメッセージ用の前方宣言）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FileStatus {
     /// HEAD と一致（削除許可）
