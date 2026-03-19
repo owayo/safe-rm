@@ -19,26 +19,26 @@ name = "safe-rm"
 path = "src/main.rs"
 
 [dependencies]
-# CLI argument parsing
-clap = { version = "4.5.60", features = ["derive"] }
+# CLI 引数解析
+clap = { version = "4.6.0", features = ["derive"] }
 
-# Path normalization
+# パス正規化
 path-clean = "1.0.1"
 
-# Git operations (vendored for cross-compilation on CI)
+# Git 操作（CI のクロスコンパイル向けに vendored 化）
 git2 = { version = "0.20.4", features = ["vendored-libgit2", "vendored-openssl"] }
 
-# Configuration file parsing
+# 設定ファイル解析
 serde = { version = "1.0.228", features = ["derive"] }
-toml = "1.0.4"
+toml = "1.0.7"
 
-# Home directory detection
+# ホームディレクトリ検出
 dirs = "6.0"
 
 [dev-dependencies]
-assert_cmd = "2.1.2"
+assert_cmd = "2.2.0"
 predicates = "3.1.4"
-tempfile = "3.26.0"
+tempfile = "3.27.0"
 
 [profile.release]
 lto = true

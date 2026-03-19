@@ -34,7 +34,7 @@
 - **Directory Traversal Prevention**: Block `../` escape attempts
 - **Ignored File Passthrough**: Allow deletion of `.gitignore`d files (build artifacts, etc.)
 - **Symlink-Safe Git Checks**: Directory symlinks are checked as links themselves (not traversed)
-- **Alias-Path Safety (Containment + Strict Mode)**: Containment checks canonicalize up to the nearest existing parent and re-append missing segments, while strict-mode Git checks canonicalize non-symlink paths and canonicalize only symlink parents (checking the link itself), blocking bypasses via alternate absolute aliases
+- **Alias-Path Safety (Containment + allowed_paths + Strict Mode)**: Containment checks and `allowed_paths` matching canonicalize up to the nearest existing parent and re-append missing segments, while strict-mode Git checks canonicalize non-symlink paths and canonicalize only symlink parents (checking the link itself), blocking bypasses via alternate absolute aliases
 - **Configurable Allowed Paths**: Bypass safety checks for specified directories (per-directory recursive control)
 - **Non-Git Support**: Works safely in non-Git directories
 - **Dry Run Mode**: Preview what would be deleted without actually deleting
@@ -138,7 +138,7 @@ recursive = false
 
 - **`allow_project_deletion = true` (default)**: All files inside the project can be deleted without Git status checks. This is suitable for AI agents that need to freely delete files within their working project.
 - **`allow_project_deletion = false`**: Only clean (committed) or ignored files can be deleted. Uncommitted changes are protected.
-- Paths matching `allowed_paths` bypass both project containment and Git status checks
+- Paths matching `allowed_paths` bypass both project containment and Git status checks. For nonexistent targets, the nearest existing parent is canonicalized so alias-path differences are still absorbed
 - The `recursive` flag controls whether subdirectories are included:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` is allowed
   - `recursive = false`: Only `/path/to/dir/file.txt` is allowed (direct children)
@@ -180,7 +180,7 @@ flowchart TB
 2. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked)
 3. **Recursive Check**: For real directories, validates all contained files
 4. **Fail-Closed Directory Reads**: Any directory read failure (including entry iteration errors) is blocked
-5. **Alias-Path Hardening**: Git checks canonicalize non-symlink paths, and for symlink paths canonicalize only parent directories while checking the link itself, to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
+5. **Alias-Path Hardening**: Path containment and `allowed_paths` matching canonicalize the nearest existing parent and reattach missing segments, while Git checks canonicalize non-symlink paths and only parent directories for symlink paths, to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
 
 ### File System and Deletable Scope
 
@@ -407,8 +407,8 @@ cargo build --release
 
 ### Test Coverage
 
-- **Unit Tests**: 148 tests covering all modules (CLI, config, error, path_checker, git_checker, init)
-- **Integration Tests**: 60 tests with real Git repositories (allow/block flows, strict mode, symlinks, alias-path hardening, batch operations, special filenames)
+- **Unit Tests**: 157 tests covering all modules (CLI, config, error, path_checker, git_checker, init)
+- **Integration Tests**: 65 tests with real Git repositories (allow/block flows, strict mode, symlinks, alias-path hardening including relative execution from symlink-alias cwd, batch operations, dry-run in strict mode, special filenames)
 
 ## Contributing
 

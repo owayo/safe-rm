@@ -1,6 +1,6 @@
-//! Integration tests for safe-rm CLI
+//! safe-rm CLI の統合テスト
 //!
-//! Tests the CLI interface with real file system operations.
+//! 実際のファイルシステム操作で CLI の挙動を検証する。
 
 use std::fs;
 use std::process::Command;
@@ -1207,6 +1207,49 @@ recursive = true
         );
         assert!(!outside_file.exists(), "File should be deleted");
     }
+
+    #[test]
+    fn test_allowed_paths_recursive_directory_deletion() {
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        // 許可ディレクトリとファイルを作成
+        let allowed_dir = TempDir::new().unwrap();
+        let allowed_path = allowed_dir.path().canonicalize().unwrap();
+        let subdir = allowed_path.join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        fs::write(subdir.join("file.txt"), "content").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+[[allowed_paths]]
+path = "{}"
+recursive = true
+"#,
+            allowed_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // -r で許可パス内のディレクトリを削除
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &["-r", subdir.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "Directory in allowed_paths should be deletable with -r. stderr: {}",
+            stderr
+        );
+        assert!(
+            stdout.contains("allowed by config"),
+            "Should show allowed by config: {}",
+            stdout
+        );
+        assert!(!subdir.exists(), "Directory should be deleted");
+    }
 }
 
 // =============================================================================
@@ -1465,6 +1508,64 @@ recursive = true
             "dry2.txt should NOT be deleted"
         );
     }
+
+    #[test]
+    fn test_dry_run_strict_mode_dirty_file_blocked() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        // 変更済みファイルを用意
+        commit_file(&repo_path, "dirty.txt", "original");
+        fs::write(repo_path.join("dirty.txt"), "modified").unwrap();
+
+        // --dry-run でも strict モードの dirty ファイルはブロック
+        let (exit_code, stdout, stderr) =
+            run_safe_rm_with_config(&["-n", "dirty.txt"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "Dry-run with dirty file in strict mode should return exit 2. stderr: {}",
+            stderr
+        );
+        assert!(
+            !stdout.contains("would remove"),
+            "Should NOT show 'would remove' for blocked file"
+        );
+        assert!(
+            repo_path.join("dirty.txt").exists(),
+            "File should NOT be deleted"
+        );
+    }
+
+    #[test]
+    fn test_dry_run_strict_mode_clean_file_shows_would_remove() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        commit_file(&repo_path, "clean.txt", "content");
+
+        let (exit_code, stdout, _) =
+            run_safe_rm_with_config(&["-n", "clean.txt"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "Dry-run with clean file in strict mode should succeed"
+        );
+        assert!(
+            stdout.contains("would remove:"),
+            "Should show 'would remove' for clean file"
+        );
+        assert!(
+            repo_path.join("clean.txt").exists(),
+            "File should NOT be deleted in dry-run"
+        );
+    }
 }
 
 // =============================================================================
@@ -1487,7 +1588,7 @@ mod symlink_tests {
         let link_path = repo_path.join("link.txt");
         std::os::unix::fs::symlink(repo_path.join("target.txt"), &link_path).unwrap();
 
-        // git add + commit
+        // git add してコミット
         Command::new("git")
             .args(["add", "link.txt"])
             .current_dir(&repo_path)
@@ -1552,7 +1653,7 @@ mod symlink_tests {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
 
-        // strict mode 設定
+        // strict モード設定
         let config = tempfile::NamedTempFile::new().unwrap();
         fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
 
@@ -1573,7 +1674,7 @@ mod symlink_tests {
             .output()
             .unwrap();
 
-        // リンク先を unreadable にして、辿る実装だと失敗する状況を作る
+        // リンク先を読めない状態にして、辿る実装だと失敗する状況を作る
         let restricted_dir = repo_path.join("restricted");
         let mut locked_perms = fs::metadata(&restricted_dir).unwrap().permissions();
         locked_perms.set_mode(0o000);
@@ -1605,11 +1706,11 @@ mod symlink_tests {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
 
-        // strict mode 設定
+        // strict モード設定
         let config = tempfile::NamedTempFile::new().unwrap();
         fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
 
-        // Dirty ファイルを用意
+        // 変更済みファイルを用意
         commit_file(&repo_path, "dirty.txt", "original");
         fs::write(repo_path.join("dirty.txt"), "modified").unwrap();
 
@@ -1646,7 +1747,7 @@ mod symlink_tests {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
 
-        // strict mode 設定
+        // strict モード設定
         let config = tempfile::NamedTempFile::new().unwrap();
         fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
 
@@ -1654,7 +1755,7 @@ mod symlink_tests {
         commit_file(&repo_path, "init.txt", "init");
         commit_file(&repo_path, "target.txt", "target");
 
-        // 未追跡 symlink（strict mode ではブロック対象）
+        // 未追跡 symlink（strict モードではブロック対象）
         let link_path = repo_path.join("untracked_link");
         std::os::unix::fs::symlink("target.txt", &link_path).unwrap();
 
@@ -1683,6 +1784,77 @@ mod symlink_tests {
         assert!(
             link_path.symlink_metadata().is_ok(),
             "Untracked symlink should NOT be deleted"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_strict_mode_clean_file_deletable_when_cwd_is_repo_symlink_alias() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // strict モード設定
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        // Clean ファイルを用意
+        commit_file(&repo_path, "clean.txt", "clean");
+
+        // リポジトリの別名 symlink を作成し、その配下を cwd として実行
+        let alias_dir = TempDir::new().unwrap();
+        let alias_repo = alias_dir.path().join("repo-link");
+        std::os::unix::fs::symlink(&repo_path, &alias_repo).unwrap();
+
+        let (exit_code, stdout, stderr) =
+            run_safe_rm_with_config(&["clean.txt"], &alias_repo, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "Clean file must remain deletable in strict mode when cwd is a repo symlink alias. stderr: {}",
+            stderr
+        );
+        assert!(stdout.contains("removed:"), "Should show removed message");
+        assert!(
+            !repo_path.join("clean.txt").exists(),
+            "Clean target file should be deleted"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_strict_mode_dirty_file_blocked_when_cwd_is_repo_symlink_alias() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // strict モード設定
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        // 変更済みファイルを用意
+        commit_file(&repo_path, "dirty.txt", "original");
+        fs::write(repo_path.join("dirty.txt"), "modified").unwrap();
+
+        // リポジトリの別名 symlink を作成し、その配下を cwd として実行
+        let alias_dir = TempDir::new().unwrap();
+        let alias_repo = alias_dir.path().join("repo-link");
+        std::os::unix::fs::symlink(&repo_path, &alias_repo).unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["dirty.txt"], &alias_repo, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "Dirty file must be blocked in strict mode even when cwd is a repo symlink alias. stderr: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("Status: Modified"),
+            "Error should report modified status. stderr: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("dirty.txt").exists(),
+            "Dirty target file should remain"
         );
     }
 }
@@ -1767,9 +1939,9 @@ mod batch_tests {
             Some(config.path()),
         );
 
-        // exit code 2 (security block takes precedence)
+        // exit code 2 を返す（セキュリティブロックを優先）
         assert_eq!(exit_code, 2, "Should exit with 2 due to dirty file");
-        // clean files should still be deleted
+        // clean ファイルは削除済みであるべき
         assert!(
             !repo_path.join("clean1.txt").exists(),
             "clean1.txt should be deleted"
@@ -1778,7 +1950,7 @@ mod batch_tests {
             !repo_path.join("clean2.txt").exists(),
             "clean2.txt should be deleted"
         );
-        // dirty file should NOT be deleted
+        // dirty ファイルは削除されてはいけない
         assert!(
             repo_path.join("dirty.txt").exists(),
             "dirty.txt should NOT be deleted"
@@ -1795,7 +1967,7 @@ mod batch_tests {
 }
 
 // =============================================================================
-// 特殊ファイル名のテスト
+// 部分失敗のテスト
 // =============================================================================
 
 mod partial_failure_tests {
@@ -1806,10 +1978,10 @@ mod partial_failure_tests {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
 
-        // Initial commit so the repo is valid
+        // リポジトリを有効化するため初期コミットを作成
         commit_file(&repo_path, "init.txt", "init");
 
-        // Multiple non-existent files (no -f flag) should all fail with exit 1
+        // 存在しない複数ファイルを -f なしで削除すると、すべて exit 1 で失敗する
         let (exit_code, _, stderr) = run_safe_rm(
             &["missing1.txt", "missing2.txt", "missing3.txt"],
             &repo_path,
@@ -1832,10 +2004,10 @@ mod partial_failure_tests {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
 
-        // One file exists and is clean
+        // 片方は存在して Clean
         commit_file(&repo_path, "exists.txt", "content");
 
-        // One exists, one does not
+        // 片方だけ存在する状態で実行
         let (exit_code, stdout, stderr) = run_safe_rm(&["exists.txt", "missing.txt"], &repo_path);
 
         assert_eq!(
@@ -1856,7 +2028,7 @@ mod partial_failure_tests {
 }
 
 // =============================================================================
-// Dirty symlink テスト（厳格モード）
+// 未コミット symlink のテスト（厳格モード）
 // =============================================================================
 
 #[cfg(unix)]
@@ -1871,13 +2043,13 @@ mod dirty_symlink_tests {
         let config = tempfile::NamedTempFile::new().unwrap();
         fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
 
-        // Initial commit
+        // 初期コミット
         commit_file(&repo_path, "init.txt", "init");
 
-        // Create a target file and commit it
+        // ターゲットファイルを作成してコミット
         commit_file(&repo_path, "target.txt", "target");
 
-        // Create an untracked symlink (not committed)
+        // 未追跡の symlink を作成（未コミット）
         let link_path = repo_path.join("untracked_link");
         std::os::unix::fs::symlink("target.txt", &link_path).unwrap();
 
@@ -1903,7 +2075,7 @@ mod dirty_symlink_tests {
         let config = tempfile::NamedTempFile::new().unwrap();
         fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
 
-        // Create target and symlink, both committed
+        // ターゲットと symlink を作成し、両方コミットする
         commit_file(&repo_path, "target.txt", "target content");
         let link_path = repo_path.join("clean_link");
         std::os::unix::fs::symlink("target.txt", &link_path).unwrap();

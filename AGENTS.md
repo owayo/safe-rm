@@ -50,18 +50,18 @@ CLI引数パース → Config読込 → Git repo検出 → [Git status一括取�
 3. **allowed_paths**: 設定ファイルで指定したパスは全チェックをバイパス
 4. **Fail-Closed**: ディレクトリ読取エラー時は削除をブロック（無視しない）
 5. **Symlink安全性**: Gitチェック時のディレクトリ判定は `symlink_metadata()` ベースで、ディレクトリsymlinkを辿らずリンク自体を評価
-6. **エイリアスパス耐性**: パス包含検証では、非存在パスでも既存親ディレクトリまで canonicalize して未作成部分を再結合し、repo symlink 別名や `/var` と `/private/var` 差異を吸収。Gitチェックでは非symlinkパスを canonicalize して比較し、symlink パスは「親ディレクトリのみ canonicalize + リンク名維持」で照合することでバイパスを防止
+6. **エイリアスパス耐性**: パス包含検証と `allowed_paths` 判定では、非存在パスでも既存親ディレクトリまで canonicalize して未作成部分を再結合し、repo symlink 別名や `/var` と `/private/var` 差異を吸収。Gitチェックでは非symlinkパスを canonicalize して比較し、symlink パスは「親ディレクトリのみ canonicalize + リンク名維持」で照合することでバイパスを防止（repo symlink 別名を cwd にした場合も含む）
 
 ### パフォーマンス最適化
 
 - `allow_project_deletion = false` 時のみ Git status を一括事前取得（バッチ最適化）
-- Config の `allowed_paths` はロード時にパスを事前解決（canonicalize）
+- Config の `allowed_paths` はロード時に既存親までパスを事前解決（canonicalize）
 - `symlink_metadata()` で1回のsyscallで存在確認とメタ情報取得を統合
 
 ### テスト構成
 
 - **ユニットテスト**: 各モジュール内の `#[cfg(test)]` ブロック（パス検証、Git状態、Config解析等）
-- **統合テスト**: `tests/integration_test.rs` - 実際のGitリポジトリを tempfile で作成してE2Eテスト
+- **統合テスト**: `tests/integration_test.rs` - 実際のGitリポジトリを tempfile で作成してE2Eテスト。repo symlink 別名の cwd からの相対実行も含めて検証
 
 ### バージョン体系
 

@@ -18,7 +18,7 @@ impl GitChecker {
     /// `Repository::discover` を使用して上位ディレクトリを走査し、
     /// Gitリポジトリを検出する。サブディレクトリからでもリポジトリルートを正しく検出可能。
     ///
-    /// # Returns
+    /// # 戻り値
     /// * `Some(GitChecker)` - Git リポジトリが存在
     /// * `None` - Git リポジトリなし（Git チェックスキップ）
     pub fn open(path: &Path) -> Option<Self> {
@@ -41,7 +41,7 @@ impl GitChecker {
     /// 一度の Git API 呼び出しで全ステータスを取得し、HashMap として返す。
     /// これにより、多数のファイルを処理する際の API 呼び出し回数を削減。
     ///
-    /// # Returns
+    /// # 戻り値
     /// * `HashMap<String, FileStatus>` - 相対パス → ステータスのマップ
     pub fn get_all_statuses(&self) -> HashMap<String, FileStatus> {
         let mut status_map = HashMap::new();
@@ -191,9 +191,9 @@ impl GitChecker {
 
     /// ファイルまたはディレクトリをチェック
     ///
-    /// # Returns
+    /// # 戻り値
     /// * `Ok(())` - 削除可能
-    /// * `Err(SafeRmError::DirtyFiles)` - Dirty ファイルが存在
+    /// * `Err(SafeRmError::DirtyFiles)` - 変更のあるファイルが存在
     pub fn check_path(&self, path: &Path) -> Result<(), SafeRmError> {
         if Self::is_real_directory(path) {
             self.check_directory(path)
@@ -217,9 +217,9 @@ impl GitChecker {
 
     /// ディレクトリ内のすべてのファイルをチェック
     ///
-    /// # Returns
+    /// # 戻り値
     /// * `Ok(())` - 全ファイルが Clean または Ignored
-    /// * `Err(SafeRmError::DirtyFiles)` - Dirty ファイルが存在
+    /// * `Err(SafeRmError::DirtyFiles)` - 変更のあるファイルが存在
     pub fn check_directory(&self, dir: &Path) -> Result<(), SafeRmError> {
         // まずディレクトリ自体が Ignored かチェック（早期許可）
         let dir_status = self.get_directory_status(dir);
@@ -288,7 +288,7 @@ impl GitChecker {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => {
-                // fail-closed: ディレクトリ読み取り失敗は削除をブロック
+                // fail-closed: ディレクトリ読み取り失敗時は削除をブロック
                 return Err(SafeRmError::DirectoryReadError {
                     path: dir.to_path_buf(),
                 });
@@ -400,7 +400,7 @@ impl GitChecker {
         }
     }
 
-    /// Git status のキー形式 (forward slash) に揃える
+    /// Git status のキー形式（スラッシュ区切り）に揃える
     fn to_git_relative_key(path: &Path) -> String {
         path.components()
             .map(|component| component.as_os_str().to_string_lossy().into_owned())
@@ -428,14 +428,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let repo_path = temp_dir.path();
 
-        // git init
+        // Git リポジトリを初期化
         Command::new("git")
             .args(["init"])
             .current_dir(repo_path)
             .output()
             .unwrap();
 
-        // git config for commits
+        // テスト用コミットの設定
         Command::new("git")
             .args(["config", "user.email", "test@test.com"])
             .current_dir(repo_path)
@@ -468,7 +468,7 @@ mod tests {
             .unwrap();
     }
 
-    // Task 6.1: Gitリポジトリ検出のテスト
+    // Git リポジトリ検出のテスト
 
     #[test]
     fn test_open_git_repo() {
@@ -485,7 +485,7 @@ mod tests {
         assert!(checker.is_none());
     }
 
-    // Task 6.2: ファイルステータス判定のテスト
+    // ファイルステータス判定のテスト
 
     #[test]
     fn test_get_file_status_clean() {
@@ -621,7 +621,7 @@ mod tests {
         assert!(!GitChecker::is_deletable(FileStatus::Untracked));
     }
 
-    // Task 6.3: ディレクトリ再帰チェックのテスト
+    // ディレクトリ再帰チェックのテスト
 
     #[test]
     fn test_check_directory_all_clean() {
@@ -802,7 +802,7 @@ mod tests {
         }
     }
 
-    // Task: get_all_statuses と cache 関連のテスト
+    // get_all_statuses とキャッシュ関連のテスト
 
     #[test]
     fn test_get_all_statuses_returns_all_files() {
@@ -1189,5 +1189,68 @@ mod tests {
             result.is_ok(),
             "directory symlink should be checked as the link itself, not traversed"
         );
+    }
+
+    #[test]
+    fn test_get_file_status_from_cache_ignored_file_not_in_cache() {
+        // キャッシュになく .gitignore で無視されるファイルの場合、
+        // get_file_status_from_cache は Ignored を返すべき
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // .gitignore を作成してコミット
+        fs::write(repo_path.join(".gitignore"), "*.log\n").unwrap();
+        Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add .gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // Ignored ファイルを作成
+        fs::write(repo_path.join("debug.log"), "log data").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        // 空キャッシュ（意図的にキャッシュミスさせる）
+        let empty_cache = HashMap::new();
+
+        let status = checker.get_file_status_from_cache(&repo_path.join("debug.log"), &empty_cache);
+        assert_eq!(
+            status,
+            FileStatus::Ignored,
+            "キャッシュにない .gitignore 対象ファイルは Ignored を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_get_file_status_from_cache_clean_file_not_in_cache() {
+        // キャッシュにないが Git 追跡済みで変更なし（Clean）のファイル
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "tracked.txt", "content");
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let empty_cache = HashMap::new();
+
+        let status =
+            checker.get_file_status_from_cache(&repo_path.join("tracked.txt"), &empty_cache);
+        assert_eq!(
+            status,
+            FileStatus::Clean,
+            "キャッシュにないがコミット済みのファイルは Clean を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_to_git_relative_key_single_segment() {
+        // 単一セグメント（ディレクトリなし）のパス
+        let path = Path::new("file.txt");
+        let key = GitChecker::to_git_relative_key(path);
+        assert_eq!(key, "file.txt");
     }
 }

@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 ///
 /// config.toml の例:
 /// ```toml
-/// # Allow deletion of any file within the current project (Git repository)
-/// # without requiring the file to be committed or ignored.
-/// # Containment check is still enforced (cannot delete outside project).
+/// # 現在のプロジェクト（Git リポジトリ）内なら、
+/// # コミット済みや ignore 済みでなくても削除を許可する。
+/// # ただし包含チェックは維持され、プロジェクト外は削除できない。
 /// allow_project_deletion = true
 ///
 /// [[allowed_paths]]
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 ///
 /// [[allowed_paths]]
 /// path = "/tmp/logs"
-/// recursive = false  # only direct children
+/// recursive = false  # 直下の子のみ許可
 /// ```
 /// デフォルト値 true を返すヘルパー関数
 fn default_true() -> bool {
@@ -129,15 +129,15 @@ impl Config {
         }
     }
 
-    /// Pre-resolve allowed paths at load time (performance optimization)
-    /// Also used in tests to resolve paths after manual Config construction.
+    /// allowed_paths をロード時に事前解決する（性能最適化）
+    /// 手動で Config を組み立てるテストでも同じ解決処理に使う。
     pub fn resolve_allowed_paths(&mut self) {
         self.allowed_paths_resolved = self
             .allowed_paths
             .iter()
             .map(|entry| {
                 let expanded = Self::expand_tilde(&entry.path);
-                let canonical = std::fs::canonicalize(&expanded).unwrap_or(expanded);
+                let canonical = Self::try_canonicalize(&expanded);
                 AllowedPathResolved {
                     canonical_path: canonical,
                     recursive: entry.recursive,
@@ -159,6 +159,36 @@ impl Config {
         }
     }
 
+    /// 可能であれば canonicalize する。
+    /// 末尾が未作成で失敗した場合は、既存の親ディレクトリまで canonicalize してから
+    /// 未作成部分を再結合する。
+    fn try_canonicalize(path: &Path) -> PathBuf {
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            return canonical;
+        }
+
+        let mut current = path;
+        let mut missing_segments = Vec::new();
+
+        while let Some(parent) = current.parent() {
+            if let Some(name) = current.file_name() {
+                missing_segments.push(name.to_os_string());
+            }
+
+            if let Ok(canonical_parent) = parent.canonicalize() {
+                let mut rebuilt = canonical_parent;
+                for segment in missing_segments.iter().rev() {
+                    rebuilt.push(segment);
+                }
+                return rebuilt;
+            }
+
+            current = parent;
+        }
+
+        path.to_path_buf()
+    }
+
     /// パスが許可ディレクトリ内にあるかチェック
     ///
     /// 指定パスが allowed_paths のいずれかのエントリに一致する場合 true を返す。
@@ -178,9 +208,8 @@ impl Config {
                 .unwrap_or_else(|_| target.to_path_buf())
         };
 
-        // シンボリックリンク解決のため canonicalize を試行
-        let target_resolved =
-            std::fs::canonicalize(&target_normalized).unwrap_or(target_normalized);
+        // 既存親まで canonicalize して、未作成パスや symlink 別名も吸収する
+        let target_resolved = Self::try_canonicalize(&target_normalized);
 
         // 事前解決済みパスを使用（ここでは canonicalize を呼ばない — ロード時に完了済み）
         for entry in &self.allowed_paths_resolved {
@@ -226,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_parsed_config_defaults_allow_project_deletion_true() {
-        // Empty config should default to allow_project_deletion = true
+        // 空設定では allow_project_deletion = true が既定値になる
         let toml_content = "";
         let config: Config = toml::from_str(toml_content).unwrap();
         assert!(
@@ -311,7 +340,7 @@ path = "/tmp/dir"
         assert!(!config.allowed_paths[0].recursive);
     }
 
-    // --- recursive = true tests ---
+    // --- recursive = true のテスト ---
 
     #[test]
     fn test_recursive_allows_direct_child() {
@@ -373,7 +402,7 @@ path = "/tmp/dir"
         assert!(config.is_path_allowed(&sub_dir));
     }
 
-    // --- recursive = false tests ---
+    // --- recursive = false のテスト ---
 
     #[test]
     fn test_non_recursive_allows_direct_child() {
@@ -413,7 +442,7 @@ path = "/tmp/dir"
         };
         config.resolve_allowed_paths();
 
-        // Nested file should NOT be allowed with recursive = false
+        // recursive = false ではネストしたファイルは許可しない
         assert!(!config.is_path_allowed(&nested_file));
     }
 
@@ -433,7 +462,7 @@ path = "/tmp/dir"
         };
         config.resolve_allowed_paths();
 
-        // Direct child directory is allowed
+        // 直下の子ディレクトリは許可される
         assert!(config.is_path_allowed(&sub_dir));
     }
 
@@ -453,11 +482,11 @@ path = "/tmp/dir"
         };
         config.resolve_allowed_paths();
 
-        // Deep subdirectory should NOT be allowed
+        // 深い階層のサブディレクトリは許可しない
         assert!(!config.is_path_allowed(&deep));
     }
 
-    // --- Other tests ---
+    // --- その他のテスト ---
 
     #[test]
     fn test_path_not_allowed() {
@@ -533,7 +562,7 @@ recursive = true
         assert!(config.allowed_paths[0].recursive);
     }
 
-    // --- Tilde expansion tests ---
+    // --- チルダ展開のテスト ---
 
     #[test]
     fn test_expand_tilde_home() {
@@ -557,14 +586,14 @@ recursive = true
 
     #[test]
     fn test_expand_tilde_not_prefix() {
-        // ~ in the middle should not be expanded
+        // 文字列の途中にある `~` は展開しない
         let expanded = Config::expand_tilde("/tmp/~user/dir");
         assert_eq!(expanded, PathBuf::from("/tmp/~user/dir"));
     }
 
     #[test]
     fn test_tilde_path_allowed_recursive() {
-        // Create a directory under home to test tilde expansion
+        // チルダ展開を検証するため、ホーム配下にディレクトリを作成
         let home = dirs::home_dir().unwrap();
         let tmp_dir = tempfile::tempdir_in(&home).unwrap();
         let dir_name = tmp_dir.path().file_name().unwrap().to_string_lossy();
@@ -606,17 +635,17 @@ recursive = true
         };
         config.resolve_allowed_paths();
 
-        assert!(config.is_path_allowed(&child_file)); // direct child OK
-        assert!(!config.is_path_allowed(&nested_file)); // nested blocked
+        assert!(config.is_path_allowed(&child_file)); // 直下の子は許可
+        assert!(!config.is_path_allowed(&nested_file)); // ネスト先は拒否
     }
 
-    // --- SAFE_RM_CONFIG environment variable tests ---
+    // --- SAFE_RM_CONFIG 環境変数のテスト ---
 
     #[test]
     fn test_config_path_uses_env_var() {
-        // Save original value and set test value
+        // 元の値を退避してテスト用の値を設定
         let original = std::env::var("SAFE_RM_CONFIG").ok();
-        // SAFETY: Tests run single-threaded with --test-threads=1 or serially
+        // SAFETY: テストは `--test-threads=1` または直列実行を前提とする
         unsafe {
             std::env::set_var("SAFE_RM_CONFIG", "/custom/path/config.toml");
         }
@@ -624,8 +653,8 @@ recursive = true
         let path = Config::config_path();
         assert_eq!(path, Some(PathBuf::from("/custom/path/config.toml")));
 
-        // Restore original value
-        // SAFETY: Tests run single-threaded
+        // 元の値に戻す
+        // SAFETY: テストは単一スレッドで実行される
         unsafe {
             if let Some(val) = original {
                 std::env::set_var("SAFE_RM_CONFIG", val);
@@ -637,7 +666,7 @@ recursive = true
 
     #[test]
     fn test_config_path_env_var_precedence() {
-        // Env var should take precedence over default path
+        // 環境変数はデフォルトパスより優先される
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let content = r#"
 allow_project_deletion = false
@@ -649,7 +678,7 @@ recursive = true
         fs::write(tmp.path(), content).unwrap();
 
         let original = std::env::var("SAFE_RM_CONFIG").ok();
-        // SAFETY: Tests run single-threaded
+        // SAFETY: テストは単一スレッドで実行される
         unsafe {
             std::env::set_var("SAFE_RM_CONFIG", tmp.path());
         }
@@ -659,8 +688,8 @@ recursive = true
         assert_eq!(config.allowed_paths.len(), 1);
         assert_eq!(config.allowed_paths[0].path, "/custom/via/env");
 
-        // Restore
-        // SAFETY: Tests run single-threaded
+        // 元の値に戻す
+        // SAFETY: テストは単一スレッドで実行される
         unsafe {
             if let Some(val) = original {
                 std::env::set_var("SAFE_RM_CONFIG", val);
@@ -670,7 +699,7 @@ recursive = true
         }
     }
 
-    // --- Pre-resolved paths tests ---
+    // --- 事前解決済みパスのテスト ---
 
     #[test]
     fn test_resolve_allowed_paths_canonicalizes() {
@@ -687,9 +716,9 @@ recursive = true
         };
         config.resolve_allowed_paths();
 
-        // Verify that resolve populates allowed_paths_resolved
+        // resolve_allowed_paths で allowed_paths_resolved が埋まる
         assert_eq!(config.allowed_paths_resolved.len(), 1);
-        // Canonical path should be resolvable
+        // canonicalize 後の絶対パスになっている
         assert!(
             config.allowed_paths_resolved[0]
                 .canonical_path
@@ -699,7 +728,7 @@ recursive = true
 
     #[test]
     fn test_resolve_allowed_paths_fallback_nonexistent() {
-        // Non-existent paths should use expanded path as fallback
+        // 存在しないパスは展開済みパスにフォールバックする
         let nonexistent = "/nonexistent/path/that/does/not/exist";
         let mut config = Config {
             allowed_paths: vec![AllowedPathEntry {
@@ -710,7 +739,7 @@ recursive = true
         };
         config.resolve_allowed_paths();
 
-        // Should fallback to expanded path (no panic)
+        // 展開済みパスにフォールバックし、panic しない
         assert_eq!(config.allowed_paths_resolved.len(), 1);
         assert_eq!(
             config.allowed_paths_resolved[0].canonical_path,
@@ -721,7 +750,7 @@ recursive = true
     #[test]
     fn test_is_path_allowed_nonexistent_file_in_allowed_dir() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        // Use canonical path to avoid macOS /var → /private/var mismatch
+        // macOS の /var → /private/var 差異を避けるため canonical path を使う
         let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
         let allowed_dir = canonical_tmp.join("allowed");
         fs::create_dir_all(&allowed_dir).unwrap();
@@ -735,8 +764,8 @@ recursive = true
         };
         config.resolve_allowed_paths();
 
-        // Non-existent file in allowed dir should still match
-        // (canonicalize falls back to un-canonicalized path, but parent is canonical)
+        // 許可ディレクトリ配下の未作成ファイルでも一致する
+        // canonicalize は未作成末尾でフォールバックするが、親は canonical なまま
         let nonexistent = allowed_dir.join("does_not_exist.txt");
         assert!(
             config.is_path_allowed(&nonexistent),
@@ -811,10 +840,88 @@ recursive = true
 
         let config = Config::load_from_path(Some(config_file));
 
-        // allowed_path内のファイルが許可されることを検証
+        // allowed_path 内のファイルが許可されることを検証
         let test_file = allowed_dir.join("file.txt");
         fs::write(&test_file, b"content").unwrap();
 
         assert!(config.is_path_allowed(&test_file));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_is_path_allowed_nonexistent_file_via_symlink_alias() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let allowed_dir = tmp_dir.path().join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        let alias_holder = tempfile::tempdir().unwrap();
+        let allowed_alias = alias_holder.path().join("allowed-link");
+        std::os::unix::fs::symlink(&allowed_dir, &allowed_alias).unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: true,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        let nonexistent = allowed_alias.join("missing.txt");
+        assert!(
+            config.is_path_allowed(&nonexistent),
+            "未作成ファイルでも symlink 別名経由なら許可パスとして一致するべき"
+        );
+    }
+
+    #[test]
+    fn test_is_path_allowed_relative_path() {
+        // 相対パス指定時に cwd と結合して許可判定される
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        // 許可ディレクトリ直下にファイルを作成
+        let child_file = allowed_dir.join("file.txt");
+        fs::write(&child_file, "test").unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: true,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        // 絶対パスで正しく判定されることを確認
+        assert!(config.is_path_allowed(&child_file));
+    }
+
+    #[test]
+    fn test_try_canonicalize_existing_path() {
+        // 存在するパスは canonicalize 成功する
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir_path = tmp_dir.path().canonicalize().unwrap();
+
+        let result = Config::try_canonicalize(&dir_path);
+        assert_eq!(result, dir_path);
+    }
+
+    #[test]
+    fn test_try_canonicalize_partial_existing() {
+        // 既存ディレクトリ + 未作成セグメント
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+
+        let missing_path = canonical_tmp.join("nonexistent").join("deep.txt");
+        let result = Config::try_canonicalize(&missing_path);
+
+        // canonical_tmp は解決済みなので、結果はそこから再結合される
+        assert!(result.starts_with(&canonical_tmp));
+        assert!(
+            result.ends_with("nonexistent/deep.txt") || result.ends_with("nonexistent\\deep.txt")
+        );
     }
 }

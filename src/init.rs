@@ -6,19 +6,19 @@ use crate::config::Config;
 use std::fs;
 
 /// ~/.claude/skills を有効にしたデフォルト設定テンプレート
-const CONFIG_TEMPLATE: &str = r#"# safe-rm configuration
-# Location: ~/.config/safe-rm/config.toml
+const CONFIG_TEMPLATE: &str = r#"# safe-rm の設定
+# 保存先: ~/.config/safe-rm/config.toml
 #
-# Define directories where deletion is always permitted,
-# bypassing project containment and Git status checks.
-# Supports tilde (~) expansion for home directory.
+# 常に削除を許可するディレクトリを定義する。
+# これらのパスはプロジェクト包含チェックと Git ステータスチェックをバイパスする。
+# ホームディレクトリ指定にはチルダ（~）展開を使える。
 
-# Allow recursive deletion under ~/.claude/skills
+# ~/.claude/skills 配下を再帰的に許可
 [[allowed_paths]]
 path = "~/.claude/skills"
 recursive = true
 
-# Example: Allow only direct children of /tmp/logs
+# 例: /tmp/logs の直下の子だけを許可
 # [[allowed_paths]]
 # path = "/tmp/logs"
 # recursive = false
@@ -99,7 +99,7 @@ recursive = false
         let tmp_dir = tempfile::tempdir().unwrap();
         let config_path = tmp_dir.path().join("safe-rm").join("config.toml");
 
-        // Manually test the creation logic
+        // 作成ロジックを簡易的に検証
         let config_dir = config_path.parent().unwrap();
         fs::create_dir_all(config_dir).unwrap();
         fs::write(&config_path, CONFIG_TEMPLATE).unwrap();

@@ -12,11 +12,11 @@ pub struct PathChecker;
 impl PathChecker {
     /// パスがプロジェクトルート内にあることを検証
     ///
-    /// # Arguments
+    /// # 引数
     /// * `project_root` - プロジェクト境界の絶対パス（Gitリポジトリルート等）
     /// * `target_path` - 検証対象のパス（相対または絶対）
     ///
-    /// # Returns
+    /// # 戻り値
     /// * `Ok(PathBuf)` - 正規化された絶対パス
     /// * `Err(SafeRmError::OutsideProject)` - プロジェクト外へのアクセス
     pub fn verify_containment(
@@ -28,12 +28,12 @@ impl PathChecker {
 
     /// パスがプロジェクトルート内にあることを検証（解決ベース指定）
     ///
-    /// # Arguments
+    /// # 引数
     /// * `project_root` - プロジェクト境界の絶対パス（Gitリポジトリルート等）
     /// * `resolve_base` - 相対パスの解決基底（通常はカレントディレクトリ）
     /// * `target_path` - 検証対象のパス（相対または絶対）
     ///
-    /// # Returns
+    /// # 戻り値
     /// * `Ok(PathBuf)` - 正規化された絶対パス
     /// * `Err(SafeRmError::OutsideProject)` - プロジェクト外へのアクセス
     pub fn verify_containment_with_base(
@@ -124,7 +124,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    // Task 5.1: パス正規化処理のテスト
+    // パス正規化処理のテスト
 
     #[test]
     fn test_verify_containment_relative_path() {
@@ -194,7 +194,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // Task 5.2: プロジェクト境界チェックのテスト
+    // プロジェクト境界チェックのテスト
 
     #[test]
     fn test_verify_containment_outside_project() {
@@ -343,7 +343,7 @@ mod tests {
         assert!(!PathChecker::is_home_reference(Path::new("./file.txt")));
     }
 
-    // --- verify_containment_with_base テスト ---
+    // --- verify_containment_with_base のテスト ---
 
     #[test]
     fn test_verify_containment_with_base_different_from_root() {
@@ -416,8 +416,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let project_root = temp_dir.path().canonicalize().unwrap();
 
-        // Attempting to delete the project root itself should succeed
-        // (containment check passes since root starts_with root)
+        // プロジェクトルート自身の削除判定は成功する
+        // ルートは自身を starts_with するため包含チェックを通過する
         let result = PathChecker::verify_containment(&project_root, &project_root);
         assert!(
             result.is_ok(),

@@ -34,7 +34,7 @@
 - **ディレクトリトラバーサル防止**: `../` によるエスケープ試行をブロック
 - **無視ファイルの許可**: `.gitignore` で指定されたファイル（ビルド成果物など）の削除を許可
 - **シンボリックリンク安全なGitチェック**: ディレクトリ symlink は辿らず、リンク自体として判定
-- **エイリアスパス耐性（包含検証 + 厳格モード）**: 包含検証では「既存親ディレクトリまで canonicalize + 未作成部分を再結合」、厳格モードの Git チェックでは「非 symlink パスを canonicalize、symlink パスは親ディレクトリのみ canonicalize + リンク自体を判定」として、別名絶対パス経由のバイパスを防止
+- **エイリアスパス耐性（包含検証 + allowed_paths + 厳格モード）**: 包含検証と `allowed_paths` 判定では「既存親ディレクトリまで canonicalize + 未作成部分を再結合」、厳格モードの Git チェックでは「非 symlink パスを canonicalize、symlink パスは親ディレクトリのみ canonicalize + リンク自体を判定」として、別名絶対パス経由のバイパスを防止
 - **許可パス設定**: 指定ディレクトリの安全チェックをバイパス（ディレクトリごとの再帰設定）
 - **非Gitサポート**: 非Gitディレクトリでも安全に動作
 - **ドライランモード**: 実際に削除せずに削除対象をプレビュー
@@ -138,7 +138,7 @@ recursive = false
 
 - **`allow_project_deletion = true`（デフォルト）**: プロジェクト内のすべてのファイルをGitステータスチェックなしで削除可能。作業プロジェクト内でファイルを自由に削除する必要があるAIエージェントに最適。
 - **`allow_project_deletion = false`**: クリーン（コミット済み）または無視されたファイルのみ削除可能。未コミットの変更は保護。
-- `allowed_paths` にマッチするパスは、プロジェクト境界チェックとGitステータスチェックの両方をバイパス
+- `allowed_paths` にマッチするパスは、プロジェクト境界チェックとGitステータスチェックの両方をバイパス。未作成パスでも既存親ディレクトリまで canonicalize して別名パス差異を吸収
 - `recursive` フラグでサブディレクトリの扱いを制御:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可
   - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可
@@ -180,7 +180,7 @@ flowchart TB
 2. **Git保護**: `allow_project_deletion = false` の場合、ダーティファイル（変更済み/ステージング済み/未追跡）の削除をブロック
 3. **再帰チェック**: 実ディレクトリの場合、含まれるすべてのファイルを検証
 4. **Fail-Closedなディレクトリ読取**: ディレクトリ走査中のエラー（エントリ列挙エラーを含む）時は削除をブロック
-5. **エイリアスパス対策**: Gitチェックでは非symlinkパスを canonicalize 比較し、symlink パスは「親ディレクトリのみ canonicalize + リンク自体を判定」することで、repo symlink 別名や `/var` と `/private/var` の差異による回避を防止
+5. **エイリアスパス対策**: 包含検証と `allowed_paths` 判定では既存親ディレクトリまで canonicalize して未作成部分を再結合し、Gitチェックでは非symlinkパスを canonicalize 比較し、symlink パスは「親ディレクトリのみ canonicalize + リンク自体を判定」することで、repo symlink 別名や `/var` と `/private/var` の差異による回避を防止
 
 ### ファイルシステムと削除可能スコープ
 
@@ -407,8 +407,8 @@ cargo build --release
 
 ### テストカバレッジ
 
-- **ユニットテスト**: 全モジュールをカバーする148件のテスト（CLI、config、error、path_checker、git_checker、init）
-- **統合テスト**: 実際のGitリポジトリを使用した60件のテスト（許可/ブロックフロー、厳格モード、シンボリックリンク、エイリアスパス対策、バッチ処理、特殊ファイル名）
+- **ユニットテスト**: 全モジュールをカバーする157件のテスト（CLI、config、error、path_checker、git_checker、init）
+- **統合テスト**: 実際のGitリポジトリを使用した65件のテスト（許可/ブロックフロー、厳格モード、シンボリックリンク、repo symlink 別名の cwd からの相対実行を含むエイリアスパス対策、バッチ処理、ドライラン厳格モード、特殊ファイル名）
 
 ## コントリビューション
 

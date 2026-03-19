@@ -284,18 +284,18 @@ mod tests {
 
     #[test]
     fn test_file_status_is_deletable() {
-        // Clean, Ignored, NotInRepo are deletable
+        // Clean / Ignored / NotInRepo は削除可能
         assert!(matches!(FileStatus::Clean, FileStatus::Clean));
         assert!(matches!(FileStatus::Ignored, FileStatus::Ignored));
         assert!(matches!(FileStatus::NotInRepo, FileStatus::NotInRepo));
 
-        // Modified, Staged, Untracked are not deletable
+        // Modified / Staged / Untracked は削除不可
         assert!(!matches!(FileStatus::Modified, FileStatus::Clean));
         assert!(!matches!(FileStatus::Staged, FileStatus::Clean));
         assert!(!matches!(FileStatus::Untracked, FileStatus::Clean));
     }
 
-    // Security: セキュリティ関連エラーのテスト
+    // セキュリティ関連エラーのテスト
 
     #[test]
     fn test_exit_code_shell_expansion_returns_2() {
@@ -363,7 +363,7 @@ mod tests {
         assert!(msg.contains("ディレクトリの読み取り"));
     }
 
-    // --- IoError / GitError のテスト ---
+    // --- IoError / GitError 周りのテスト ---
 
     #[test]
     fn test_user_message_io_error() {
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(SafeRmError::GitError(git_err).exit_code(), 1);
     }
 
-    // --- std::error::Error の source() テスト ---
+    // --- std::error::Error の source() に関するテスト ---
 
     #[test]
     fn test_source_io_error() {
@@ -445,5 +445,29 @@ mod tests {
         let err: SafeRmError = git_err.into();
         assert!(matches!(err, SafeRmError::GitError(_)));
         assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn test_user_message_dirty_files_staged() {
+        let err = SafeRmError::DirtyFiles {
+            path: PathBuf::from("./staged.txt"),
+            status: FileStatus::Staged,
+        };
+        let msg = err.user_message();
+        assert!(msg.contains("staged.txt"));
+        assert!(msg.contains("Staged"));
+        assert!(msg.contains("git commit"));
+    }
+
+    #[test]
+    fn test_user_message_dirty_files_untracked() {
+        let err = SafeRmError::DirtyFiles {
+            path: PathBuf::from("./new.txt"),
+            status: FileStatus::Untracked,
+        };
+        let msg = err.user_message();
+        assert!(msg.contains("new.txt"));
+        assert!(msg.contains("Untracked"));
+        assert!(msg.contains("git commit"));
     }
 }
