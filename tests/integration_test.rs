@@ -393,6 +393,36 @@ mod block_flow_tests {
     }
 
     #[test]
+    fn test_single_path_error_is_reported_once() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // 単一パスの失敗では、同じエラー本文を重複出力しない
+        commit_file(&repo_path, "modified.txt", "original");
+        fs::write(repo_path.join("modified.txt"), "modified content").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["modified.txt"], &repo_path, Some(config.path()));
+
+        assert_eq!(exit_code, 2, "Modified file deletion should be blocked");
+        assert_eq!(
+            stderr.matches("safe-rm:").count(),
+            1,
+            "単一パス失敗時の stderr は 1 回だけ出力されるべき: {}",
+            stderr
+        );
+        assert_eq!(
+            stderr
+                .matches("未コミットの変更があるファイルは削除できません。")
+                .count(),
+            1,
+            "同じエラー本文が重複してはいけない: {}",
+            stderr
+        );
+    }
+
+    #[test]
     fn test_staged_file_blocked() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();

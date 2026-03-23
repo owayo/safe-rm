@@ -38,6 +38,7 @@
 - **Configurable Allowed Paths**: Bypass safety checks for specified directories (per-directory recursive control)
 - **Non-Git Support**: Works safely in non-Git directories
 - **Dry Run Mode**: Preview what would be deleted without actually deleting
+- **Deterministic Error Output**: Single-path failures emit one stderr block, while batch runs emit one error per failed path without duplicating the same message
 
 ## Requirements
 

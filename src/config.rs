@@ -235,7 +235,55 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::fs;
+    use std::sync::{LazyLock, Mutex};
+
+    /// `SAFE_RM_CONFIG` を触るテスト同士が並列実行で干渉しないように直列化する。
+    static SAFE_RM_CONFIG_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// テスト中だけ `SAFE_RM_CONFIG` を差し替え、終了時に元へ戻す。
+    struct SafeRmConfigEnvGuard {
+        original: Option<OsString>,
+    }
+
+    impl SafeRmConfigEnvGuard {
+        fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let guard = Self {
+                original: std::env::var_os("SAFE_RM_CONFIG"),
+            };
+            // SAFETY: テスト用ロックで `SAFE_RM_CONFIG` への同時アクセスを防いでいる。
+            unsafe {
+                std::env::set_var("SAFE_RM_CONFIG", value.as_ref());
+            }
+            guard
+        }
+
+        fn clear() -> Self {
+            let guard = Self {
+                original: std::env::var_os("SAFE_RM_CONFIG"),
+            };
+            // SAFETY: テスト用ロックで `SAFE_RM_CONFIG` への同時アクセスを防いでいる。
+            unsafe {
+                std::env::remove_var("SAFE_RM_CONFIG");
+            }
+            guard
+        }
+    }
+
+    impl Drop for SafeRmConfigEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: テスト用ロックを保持した状態でのみ生成されるガードであり、
+            // 復元時も他テストとの競合は起きない。
+            unsafe {
+                if let Some(value) = &self.original {
+                    std::env::set_var("SAFE_RM_CONFIG", value);
+                } else {
+                    std::env::remove_var("SAFE_RM_CONFIG");
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_default_config() {
@@ -536,10 +584,8 @@ path = "/tmp/dir"
 
     #[test]
     fn test_config_path_location() {
-        // SAFE_RM_CONFIG が設定されている場合はその値が返るためスキップ
-        if std::env::var("SAFE_RM_CONFIG").is_ok() {
-            return;
-        }
+        let _env_lock = SAFE_RM_CONFIG_ENV_LOCK.lock().unwrap();
+        let _env_guard = SafeRmConfigEnvGuard::clear();
         let path = Config::config_path();
         if let Some(p) = path {
             assert!(p.to_string_lossy().contains("safe-rm"));
@@ -643,25 +689,11 @@ recursive = true
 
     #[test]
     fn test_config_path_uses_env_var() {
-        // 元の値を退避してテスト用の値を設定
-        let original = std::env::var("SAFE_RM_CONFIG").ok();
-        // SAFETY: テストは `--test-threads=1` または直列実行を前提とする
-        unsafe {
-            std::env::set_var("SAFE_RM_CONFIG", "/custom/path/config.toml");
-        }
+        let _env_lock = SAFE_RM_CONFIG_ENV_LOCK.lock().unwrap();
+        let _env_guard = SafeRmConfigEnvGuard::set("/custom/path/config.toml");
 
         let path = Config::config_path();
         assert_eq!(path, Some(PathBuf::from("/custom/path/config.toml")));
-
-        // 元の値に戻す
-        // SAFETY: テストは単一スレッドで実行される
-        unsafe {
-            if let Some(val) = original {
-                std::env::set_var("SAFE_RM_CONFIG", val);
-            } else {
-                std::env::remove_var("SAFE_RM_CONFIG");
-            }
-        }
     }
 
     #[test]
@@ -677,26 +709,13 @@ recursive = true
 "#;
         fs::write(tmp.path(), content).unwrap();
 
-        let original = std::env::var("SAFE_RM_CONFIG").ok();
-        // SAFETY: テストは単一スレッドで実行される
-        unsafe {
-            std::env::set_var("SAFE_RM_CONFIG", tmp.path());
-        }
+        let _env_lock = SAFE_RM_CONFIG_ENV_LOCK.lock().unwrap();
+        let _env_guard = SafeRmConfigEnvGuard::set(tmp.path());
 
         let config = Config::load();
         assert!(!config.allow_project_deletion);
         assert_eq!(config.allowed_paths.len(), 1);
         assert_eq!(config.allowed_paths[0].path, "/custom/via/env");
-
-        // 元の値に戻す
-        // SAFETY: テストは単一スレッドで実行される
-        unsafe {
-            if let Some(val) = original {
-                std::env::set_var("SAFE_RM_CONFIG", val);
-            } else {
-                std::env::remove_var("SAFE_RM_CONFIG");
-            }
-        }
     }
 
     // --- 事前解決済みパスのテスト ---

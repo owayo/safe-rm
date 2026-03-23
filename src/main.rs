@@ -30,10 +30,17 @@ fn main() -> ExitCode {
         }
     }
 
+    // 単一パス失敗は実エラーを 1 回だけ表示する。
+    // 複数パス失敗は run() 側の各パス出力を優先し、
+    // 操作エラーのみ最後に集計メッセージを補足する。
+    let path_count = args.paths.len();
+
     match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("safe-rm: {}", e);
+            if path_count == 1 || (path_count > 1 && e.exit_code() == 1) {
+                eprintln!("safe-rm: {}", e);
+            }
             e.exit_code().into()
         }
     }
@@ -72,6 +79,7 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
     let mut error_count = 0;
     let mut max_exit_code: u8 = 0;
     let mut last_error: Option<SafeRmError> = None;
+    let print_path_errors = args.paths.len() > 1;
 
     for path in &args.paths {
         match process_path(
@@ -89,7 +97,9 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
                 }
             }
             Err(e) => {
-                eprintln!("safe-rm: {}: {}", path.display(), e);
+                if print_path_errors {
+                    eprintln!("safe-rm: {}: {}", path.display(), e);
+                }
                 let exit_code = e.exit_code();
                 if exit_code > max_exit_code {
                     max_exit_code = exit_code;
@@ -103,6 +113,10 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
     }
 
     if error_count > 0 {
+        if args.paths.len() == 1 {
+            return Err(last_error.unwrap());
+        }
+
         // 最も高い終了コードのエラーを返す（セキュリティブロックが優先）
         if max_exit_code == 2 {
             // セキュリティエラーを直接返す
