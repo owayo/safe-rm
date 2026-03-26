@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 /// Git ステータスチェッカー
 pub struct GitChecker {
     repo: Repository,
+    /// canonicalize 済みワークディレクトリ（macOS /var→/private/var 等のエイリアス対策）
+    workdir_canonical: Option<PathBuf>,
 }
 
 impl GitChecker {
@@ -22,18 +24,44 @@ impl GitChecker {
     /// * `Some(GitChecker)` - Git リポジトリが存在
     /// * `None` - Git リポジトリなし（Git チェックスキップ）
     pub fn open(path: &Path) -> Option<Self> {
-        Repository::discover(path).ok().map(|repo| Self { repo })
+        Repository::discover(path).ok().map(|repo| {
+            let workdir_canonical = repo
+                .workdir()
+                .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+            Self {
+                repo,
+                workdir_canonical,
+            }
+        })
     }
 
     /// Git リポジトリのワークディレクトリ（ルート）を取得
     ///
     /// フルパス指定時のプロジェクト境界判定に使用。
     /// bare リポジトリの場合は None を返す。
-    /// macOS の /var → /private/var シンボリックリンク対策で canonicalize する。
+    /// macOS の /var → /private/var シンボリックリンク対策で canonicalize 済み。
     pub fn workdir(&self) -> Option<PathBuf> {
-        self.repo
-            .workdir()
-            .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+        self.workdir_canonical.clone()
+    }
+
+    /// 絶対パスからワークディレクトリ相対パスを取得
+    ///
+    /// canonicalize 済みパスと未解決パスの両方に対応し、
+    /// macOS の /var→/private/var 等のエイリアス差異を吸収する。
+    fn to_workdir_relative(&self, path: &Path) -> Option<PathBuf> {
+        // canonicalize 済みワークディレクトリで試行
+        if let Some(canonical) = &self.workdir_canonical {
+            if let Ok(rel) = path.strip_prefix(canonical) {
+                return Some(rel.to_path_buf());
+            }
+        }
+        // フォールバック: 未解決ワークディレクトリで試行
+        if let Some(raw) = self.repo.workdir() {
+            if let Ok(rel) = path.strip_prefix(raw) {
+                return Some(rel.to_path_buf());
+            }
+        }
+        None
     }
 
     /// 全ファイルのステータスを一括取得（バッチ処理用）
@@ -72,17 +100,12 @@ impl GitChecker {
         path: &Path,
         cache: &HashMap<String, FileStatus>,
     ) -> FileStatus {
-        let workdir = match self.repo.workdir() {
-            Some(dir) => dir,
+        let relative_path = match self.to_workdir_relative(path) {
+            Some(p) => p,
             None => return FileStatus::NotInRepo,
         };
 
-        let relative_path = match path.strip_prefix(workdir) {
-            Ok(p) => p,
-            Err(_) => return FileStatus::NotInRepo,
-        };
-
-        let path_key = Self::to_git_relative_key(relative_path);
+        let path_key = Self::to_git_relative_key(&relative_path);
 
         // キャッシュから取得
         if let Some(&status) = cache.get(&path_key) {
@@ -96,7 +119,7 @@ impl GitChecker {
 
         // Git 追跡済みで変更がない（Clean）か、リポジトリ外
         // status_file で確認
-        match self.repo.status_file(relative_path) {
+        match self.repo.status_file(&relative_path) {
             Ok(status) if status.is_empty() => FileStatus::Clean,
             Ok(status) => Self::convert_status(status),
             Err(_) => FileStatus::NotInRepo,
@@ -106,18 +129,13 @@ impl GitChecker {
     /// ファイルの Git ステータスを取得
     pub fn get_file_status(&self, path: &Path) -> FileStatus {
         // リポジトリルートからの相対パスを取得
-        let workdir = match self.repo.workdir() {
-            Some(dir) => dir,
+        let relative_path = match self.to_workdir_relative(path) {
+            Some(p) => p,
             None => return FileStatus::NotInRepo,
         };
 
-        let relative_path = match path.strip_prefix(workdir) {
-            Ok(p) => p,
-            Err(_) => return FileStatus::NotInRepo,
-        };
-
         // status_file を使用して直接ステータスを取得
-        match self.repo.status_file(relative_path) {
+        match self.repo.status_file(&relative_path) {
             Ok(status) => Self::convert_status(status),
             Err(e) => {
                 // ファイルが追跡されていない場合のエラーハンドリング
@@ -128,7 +146,7 @@ impl GitChecker {
                     opts.include_untracked(true);
                     opts.include_ignored(true);
 
-                    let relative_path_key = Self::to_git_relative_key(relative_path);
+                    let relative_path_key = Self::to_git_relative_key(&relative_path);
                     if let Ok(statuses) = self.repo.statuses(Some(&mut opts)) {
                         for entry in statuses.iter() {
                             if let Some(entry_path) = entry.path() {
@@ -233,18 +251,13 @@ impl GitChecker {
 
     /// ディレクトリ自体のステータスを取得
     fn get_directory_status(&self, dir: &Path) -> FileStatus {
-        let workdir = match self.repo.workdir() {
-            Some(d) => d,
+        let relative_path = match self.to_workdir_relative(dir) {
+            Some(p) => p,
             None => return FileStatus::NotInRepo,
         };
 
-        let relative_path = match dir.strip_prefix(workdir) {
-            Ok(p) => p,
-            Err(_) => return FileStatus::NotInRepo,
-        };
-
         // ディレクトリパスの末尾にスラッシュを追加して gitignore マッチング
-        let dir_pattern = format!("{}/", Self::to_git_relative_key(relative_path));
+        let dir_pattern = format!("{}/", Self::to_git_relative_key(&relative_path));
 
         let mut opts = StatusOptions::new();
         opts.pathspec(&dir_pattern);
@@ -268,18 +281,13 @@ impl GitChecker {
 
     /// パスが .gitignore に含まれるかチェック
     fn is_ignored_path(&self, path: &Path) -> bool {
-        let workdir = match self.repo.workdir() {
-            Some(d) => d,
+        let relative_path = match self.to_workdir_relative(path) {
+            Some(p) => p,
             None => return false,
         };
 
-        let relative_path = match path.strip_prefix(workdir) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-
         self.repo
-            .status_should_ignore(relative_path)
+            .status_should_ignore(&relative_path)
             .unwrap_or(false)
     }
 
