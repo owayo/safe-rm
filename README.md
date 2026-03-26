@@ -408,8 +408,8 @@ cargo build --release
 
 ### Test Coverage
 
-- **Unit Tests**: 157 tests covering all modules (CLI, config, error, path_checker, git_checker, init)
-- **Integration Tests**: 65 tests with real Git repositories (allow/block flows, strict mode, symlinks, alias-path hardening including relative execution from symlink-alias cwd, batch operations, dry-run in strict mode, special filenames)
+- **Unit Tests**: 161 tests covering all modules (CLI, config, error, path_checker, git_checker, init)
+- **Integration Tests**: 66 tests with real Git repositories (allow/block flows, strict mode, symlinks, alias-path hardening including relative execution from symlink-alias cwd, batch operations, dry-run in strict mode, special filenames)
 
 ## Contributing
 

@@ -1261,4 +1261,102 @@ mod tests {
         let key = GitChecker::to_git_relative_key(path);
         assert_eq!(key, "file.txt");
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_get_file_status_accepts_canonical_path_when_repo_opened_via_alias() {
+        // symlink alias 経由で repo を開き、canonical path で問い合わせるケース
+        // to_workdir_relative() のフォールバックが機能することを検証
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "content");
+
+        let alias_dir = TempDir::new().unwrap();
+        let alias_repo = alias_dir.path().join("repo-link");
+        std::os::unix::fs::symlink(&repo_path, &alias_repo).unwrap();
+
+        // alias 経由で repo を開く
+        let checker = GitChecker::open(&alias_repo).unwrap();
+
+        // canonical path で問い合わせる
+        let status = checker.get_file_status(&repo_path.join("tracked.txt"));
+        assert_eq!(
+            status,
+            FileStatus::Clean,
+            "symlink alias 経由でも canonical path から正しくステータスを取得すべき"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_get_file_status_from_cache_via_symlink_alias() {
+        // symlink alias 経由の repo でキャッシュベースのステータス取得を検証
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "clean.txt", "content");
+        fs::write(repo_path.join("dirty.txt"), "untracked").unwrap();
+
+        let alias_dir = TempDir::new().unwrap();
+        let alias_repo = alias_dir.path().join("repo-link");
+        std::os::unix::fs::symlink(&repo_path, &alias_repo).unwrap();
+
+        let checker = GitChecker::open(&alias_repo).unwrap();
+        let cache = checker.get_all_statuses();
+
+        // canonical path で clean ファイルを問い合わせ
+        let clean_status = checker.get_file_status_from_cache(&repo_path.join("clean.txt"), &cache);
+        assert_eq!(
+            clean_status,
+            FileStatus::Clean,
+            "symlink alias 経由でもキャッシュから Clean を正しく取得すべき"
+        );
+
+        // canonical path で dirty ファイルを問い合わせ
+        let dirty_status = checker.get_file_status_from_cache(&repo_path.join("dirty.txt"), &cache);
+        assert_eq!(
+            dirty_status,
+            FileStatus::Untracked,
+            "symlink alias 経由でもキャッシュから Untracked を正しく取得すべき"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_check_file_with_cache_blocks_dirty_via_symlink_alias() {
+        // symlink alias 経由の repo で dirty ファイルの削除がブロックされることを検証
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "file.txt", "original");
+        fs::write(repo_path.join("file.txt"), "modified").unwrap();
+
+        let alias_dir = TempDir::new().unwrap();
+        let alias_repo = alias_dir.path().join("repo-link");
+        std::os::unix::fs::symlink(&repo_path, &alias_repo).unwrap();
+
+        let checker = GitChecker::open(&alias_repo).unwrap();
+        let cache = checker.get_all_statuses();
+
+        // canonical path でチェック → Modified でブロックされるべき
+        let result = checker.check_file_with_cache(&repo_path.join("file.txt"), &cache);
+        assert!(
+            result.is_err(),
+            "symlink alias 経由でも Modified ファイルの削除はブロックされるべき"
+        );
+    }
+
+    #[test]
+    fn test_to_workdir_relative_returns_none_for_outside_path() {
+        // ワークディレクトリ外のパスは None を返す
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let checker = GitChecker::open(&repo_path).unwrap();
+
+        let outside_path = Path::new("/tmp/definitely-not-in-repo/file.txt");
+        let status = checker.get_file_status(outside_path);
+        assert_eq!(
+            status,
+            FileStatus::NotInRepo,
+            "リポジトリ外パスは NotInRepo を返すべき"
+        );
+    }
 }
