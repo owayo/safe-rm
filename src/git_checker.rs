@@ -117,13 +117,7 @@ impl GitChecker {
             return FileStatus::Ignored;
         }
 
-        // Git 追跡済みで変更がない（Clean）か、リポジトリ外
-        // status_file で確認
-        match self.repo.status_file(&relative_path) {
-            Ok(status) if status.is_empty() => FileStatus::Clean,
-            Ok(status) => Self::convert_status(status),
-            Err(_) => FileStatus::NotInRepo,
-        }
+        self.resolve_status_from_relative_path(&relative_path)
     }
 
     /// ファイルの Git ステータスを取得
@@ -134,35 +128,51 @@ impl GitChecker {
             None => return FileStatus::NotInRepo,
         };
 
-        // status_file を使用して直接ステータスを取得
-        match self.repo.status_file(&relative_path) {
-            Ok(status) => Self::convert_status(status),
-            Err(e) => {
-                // ファイルが追跡されていない場合のエラーハンドリング
-                if e.code() == git2::ErrorCode::NotFound {
-                    // Git管理外のファイル（.gitignore にも含まれていない新規ファイル）
-                    // この場合は statuses() API で確認する
-                    let mut opts = StatusOptions::new();
-                    opts.include_untracked(true);
-                    opts.include_ignored(true);
+        self.resolve_status_from_relative_path(&relative_path)
+    }
 
-                    let relative_path_key = Self::to_git_relative_key(&relative_path);
-                    if let Ok(statuses) = self.repo.statuses(Some(&mut opts)) {
-                        for entry in statuses.iter() {
-                            if let Some(entry_path) = entry.path() {
-                                if entry_path == relative_path_key {
-                                    return Self::convert_status(entry.status());
-                                }
-                            }
-                        }
+    /// 相対パスの Git ステータスを解決
+    ///
+    /// `status_file()` は未追跡ディレクトリを 1 エントリに畳み込むため、
+    /// その配下のファイルを直接問い合わせると `NotFound` になることがある。
+    /// その場合は再帰付きの status 一覧で再確認し、未追跡ファイルを取りこぼさない。
+    fn resolve_status_from_relative_path(&self, relative_path: &Path) -> FileStatus {
+        match self.repo.status_file(relative_path) {
+            Ok(status) => Self::convert_status(status),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => self
+                .lookup_status_in_listing(relative_path)
+                .unwrap_or(FileStatus::NotInRepo),
+            Err(_) => FileStatus::NotInRepo,
+        }
+    }
+
+    /// status 一覧から相対パスに対応するステータスを検索
+    fn lookup_status_in_listing(&self, relative_path: &Path) -> Option<FileStatus> {
+        let mut opts = StatusOptions::new();
+        opts.include_untracked(true);
+        opts.recurse_untracked_dirs(true);
+        opts.include_ignored(true);
+
+        let relative_path_key = Self::to_git_relative_key(relative_path);
+        if let Ok(statuses) = self.repo.statuses(Some(&mut opts)) {
+            for entry in statuses.iter() {
+                if let Some(entry_path) = entry.path() {
+                    if entry_path == relative_path_key {
+                        return Some(Self::convert_status(entry.status()));
                     }
-                    // 見つからない場合は NotInRepo
-                    FileStatus::NotInRepo
-                } else {
-                    FileStatus::NotInRepo
                 }
             }
         }
+
+        if self
+            .repo
+            .status_should_ignore(relative_path)
+            .unwrap_or(false)
+        {
+            return Some(FileStatus::Ignored);
+        }
+
+        None
     }
 
     /// git2 のステータスフラグから FileStatus への変換
@@ -569,6 +579,29 @@ mod tests {
     }
 
     #[test]
+    fn test_get_file_status_nested_untracked_file() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // 空リポジトリ扱いを避けるため初期コミットを作成
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        let nested_dir = repo_path.join("newdir").join("deep");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let file_path = nested_dir.join("untracked.txt");
+        fs::write(&file_path, "untracked content").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let status = checker.get_file_status(&file_path);
+
+        assert_eq!(
+            status,
+            FileStatus::Untracked,
+            "未追跡ディレクトリ配下のファイルも Untracked と判定されるべき"
+        );
+    }
+
+    #[test]
     fn test_get_file_status_ignored() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
@@ -700,6 +733,35 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             SafeRmError::DirtyFiles { status, .. } => {
+                assert_eq!(status, FileStatus::Untracked);
+            }
+            _ => panic!("Expected DirtyFiles error"),
+        }
+    }
+
+    #[test]
+    fn test_check_directory_with_nested_untracked_file() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        let dirty_dir = repo_path.join("dirty_dir");
+        let nested_dir = dirty_dir.join("nested");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let dirty_file = nested_dir.join("untracked.txt");
+        fs::write(&dirty_file, "untracked").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let result = checker.check_directory(&dirty_dir);
+
+        assert!(
+            result.is_err(),
+            "未追跡ファイルを含むディレクトリは失敗するべき"
+        );
+        match result.unwrap_err() {
+            SafeRmError::DirtyFiles { path, status } => {
+                assert_eq!(path, dirty_file);
                 assert_eq!(status, FileStatus::Untracked);
             }
             _ => panic!("Expected DirtyFiles error"),
@@ -1251,6 +1313,29 @@ mod tests {
             status,
             FileStatus::Clean,
             "キャッシュにないがコミット済みのファイルは Clean を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_get_file_status_from_cache_nested_untracked_file_not_in_cache() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        let nested_dir = repo_path.join("newdir").join("deep");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let file_path = nested_dir.join("untracked.txt");
+        fs::write(&file_path, "untracked").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let empty_cache = HashMap::new();
+
+        let status = checker.get_file_status_from_cache(&file_path, &empty_cache);
+        assert_eq!(
+            status,
+            FileStatus::Untracked,
+            "キャッシュミス時でも未追跡ディレクトリ配下のファイルは Untracked を返すべき"
         );
     }
 

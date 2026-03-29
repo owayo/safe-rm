@@ -31,6 +31,7 @@
 
 - **Path Containment**: Block deletion of files outside project directory
 - **Git Status Protection**: Prevent deletion of modified, staged, or untracked files
+- **Nested Untracked Protection**: Strict-mode checks also catch files inside untracked directories instead of treating them as outside Git
 - **Directory Traversal Prevention**: Block `../` escape attempts
 - **Ignored File Passthrough**: Allow deletion of `.gitignore`d files (build artifacts, etc.)
 - **Symlink-Safe Git Checks**: Directory symlinks are checked as links themselves (not traversed)
@@ -178,7 +179,7 @@ flowchart TB
 ### Safety Layers
 
 1. **Path Containment**: Ensures all paths resolve within the project directory (Git repository root, or cwd if not a Git repo) (always enforced). For nonexistent targets, it canonicalizes the nearest existing parent to absorb alias differences (e.g. repo symlink alias, `/var` vs `/private/var`).
-2. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked)
+2. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked), including files nested under untracked directories
 3. **Recursive Check**: For real directories, validates all contained files
 4. **Fail-Closed Directory Reads**: Any directory read failure (including entry iteration errors) is blocked
 5. **Alias-Path Hardening**: Path containment and `allowed_paths` matching canonicalize the nearest existing parent and reattach missing segments, while Git checks canonicalize non-symlink paths and only parent directories for symlink paths, to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
