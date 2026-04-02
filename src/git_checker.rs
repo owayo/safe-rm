@@ -1614,4 +1614,125 @@ mod tests {
         let key = GitChecker::to_git_relative_key(&path);
         assert_eq!(key, "src/components/App.tsx");
     }
+
+    #[test]
+    fn test_check_file_staged_blocked() {
+        // ステージ済みファイルの削除が DirtyFiles(Staged) でブロックされることを確認
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // 初期コミットを作成
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        // ファイルを作成して git add のみ（コミットしない）
+        let file_path = repo_path.join("staged_only.txt");
+        fs::write(&file_path, "staged content").unwrap();
+        Command::new("git")
+            .args(["add", "staged_only.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let result = checker.check_file(&file_path);
+
+        assert!(result.is_err(), "Staged ファイルの削除はブロックされるべき");
+        match result.unwrap_err() {
+            SafeRmError::DirtyFiles { path, status } => {
+                assert_eq!(path, file_path);
+                assert_eq!(status, FileStatus::Staged);
+            }
+            _ => panic!("Expected DirtyFiles error"),
+        }
+    }
+
+    #[test]
+    fn test_check_path_with_cache_file() {
+        // check_path_with_cache がファイル（非ディレクトリ）に対して正しく動作することを確認
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // Clean ファイルを作成
+        commit_file(&repo_path, "cached_file.txt", "content");
+
+        // Modified ファイルを作成
+        commit_file(&repo_path, "dirty_file.txt", "original");
+        fs::write(repo_path.join("dirty_file.txt"), "changed").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses();
+
+        // Clean ファイルは成功
+        let clean_result =
+            checker.check_path_with_cache(&repo_path.join("cached_file.txt"), &cache);
+        assert!(
+            clean_result.is_ok(),
+            "Clean ファイルはキャッシュ経由でも削除可能であるべき"
+        );
+
+        // Modified ファイルは失敗
+        let dirty_result = checker.check_path_with_cache(&repo_path.join("dirty_file.txt"), &cache);
+        assert!(
+            dirty_result.is_err(),
+            "Modified ファイルはキャッシュ経由でもブロックされるべき"
+        );
+        match dirty_result.unwrap_err() {
+            SafeRmError::DirtyFiles { status, .. } => {
+                assert_eq!(status, FileStatus::Modified);
+            }
+            _ => panic!("Expected DirtyFiles error"),
+        }
+    }
+
+    #[test]
+    fn test_check_directory_recursive_with_ignored_subdir() {
+        // Ignored ファイルのみを含むディレクトリの削除が許可されることを確認
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // .gitignore で特定パターンを無視
+        commit_file(&repo_path, ".gitignore", "*.log\n*.tmp\n");
+
+        // ディレクトリを作成し、無視対象ファイルのみを配置
+        let subdir = repo_path.join("logs");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::write(subdir.join("app.log"), "log data").unwrap();
+        fs::write(subdir.join("debug.tmp"), "tmp data").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let result = checker.check_directory(&subdir);
+
+        assert!(
+            result.is_ok(),
+            "Ignored ファイルのみを含むディレクトリは削除可能であるべき"
+        );
+    }
+
+    #[test]
+    fn test_get_file_status_from_cache_returns_clean_for_tracked_file() {
+        // キャッシュに含まれない追跡済みファイルは Clean を返すことを確認
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // ファイルを作成してコミット（変更なし = Clean）
+        commit_file(&repo_path, "tracked_clean.txt", "content");
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses();
+
+        // Clean ファイルはキャッシュに含まれないため、フォールバックで Clean が返る
+        let file_path = repo_path.join("tracked_clean.txt");
+        let status = checker.get_file_status_from_cache(&file_path, &cache);
+        assert_eq!(
+            status,
+            FileStatus::Clean,
+            "キャッシュに含まれない追跡済みファイルは Clean を返すべき"
+        );
+
+        // キャッシュにエントリがないことも確認
+        assert!(
+            !cache.contains_key("tracked_clean.txt"),
+            "Clean ファイルは get_all_statuses のキャッシュに含まれないべき"
+        );
+    }
 }
