@@ -276,4 +276,55 @@ mod tests {
         // Cargo.toml のバージョンが有効な semver 形式であることを検証
         assert!(version.contains('.'), "Version should be in semver format");
     }
+
+    #[test]
+    fn test_delete_path_with_metadata_removes_file() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file = tmp_dir.path().join("test.txt");
+        std::fs::write(&file, "content").unwrap();
+
+        let metadata = std::fs::symlink_metadata(&file).unwrap();
+        let result = super::delete_path_with_metadata(&file, false, &metadata);
+        assert!(result.is_ok());
+        assert!(!file.exists(), "ファイルが削除されているべき");
+    }
+
+    #[test]
+    fn test_delete_path_with_metadata_removes_directory() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().join("subdir");
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested").join("file.txt"), "content").unwrap();
+
+        let metadata = std::fs::symlink_metadata(&dir).unwrap();
+        let result = super::delete_path_with_metadata(&dir, true, &metadata);
+        assert!(result.is_ok());
+        assert!(!dir.exists(), "ディレクトリが再帰削除されているべき");
+    }
+
+    #[test]
+    fn test_delete_path_with_metadata_non_recursive_empty_dir() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().join("empty");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&dir).unwrap();
+        // recursive=false で空ディレクトリは remove_dir で削除可能
+        let result = super::delete_path_with_metadata(&dir, false, &metadata);
+        assert!(result.is_ok());
+        assert!(!dir.exists(), "空ディレクトリが削除されているべき");
+    }
+
+    #[test]
+    fn test_delete_path_with_metadata_non_recursive_nonempty_dir_fails() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().join("nonempty");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.txt"), "content").unwrap();
+
+        let metadata = std::fs::symlink_metadata(&dir).unwrap();
+        // recursive=false で非空ディレクトリは remove_dir が失敗する
+        let result = super::delete_path_with_metadata(&dir, false, &metadata);
+        assert!(result.is_err(), "非空ディレクトリの非再帰削除は失敗すべき");
+    }
 }

@@ -409,7 +409,7 @@ cargo build --release
 
 ### テストカバレッジ
 
-- **ユニットテスト**: 全モジュールをカバーする161件のテスト（CLI、config、error、path_checker、git_checker、init）
+- **ユニットテスト**: 全モジュールをカバーする176件のテスト（CLI、config、error、path_checker、git_checker、init）
 - **統合テスト**: 実際のGitリポジトリを使用した66件のテスト（許可/ブロックフロー、厳格モード、シンボリックリンク、repo symlink 別名の cwd からの相対実行を含むエイリアスパス対策、バッチ処理、ドライラン厳格モード、特殊ファイル名）
 
 ## コントリビューション

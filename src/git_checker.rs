@@ -1444,4 +1444,174 @@ mod tests {
             "リポジトリ外パスは NotInRepo を返すべき"
         );
     }
+
+    #[test]
+    fn test_get_directory_status_ignored() {
+        // .gitignore で無視されたディレクトリのステータス確認
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // .gitignore を作成してコミット
+        commit_file(&repo_path, ".gitignore", "build/\n");
+
+        // 無視対象ディレクトリを作成
+        let build_dir = repo_path.join("build");
+        fs::create_dir_all(&build_dir).unwrap();
+        fs::write(build_dir.join("output.bin"), "binary").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+
+        // ディレクトリ自体が Ignored として判定される
+        let status = checker.get_directory_status(&build_dir);
+        assert_eq!(
+            status,
+            FileStatus::Ignored,
+            "gitignore 対象ディレクトリは Ignored として扱うべき"
+        );
+    }
+
+    #[test]
+    fn test_get_directory_status_not_ignored() {
+        // 通常のディレクトリは Clean として判定される
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let src_dir = repo_path.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        commit_file(&repo_path, "src/main.rs", "fn main() {}");
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let status = checker.get_directory_status(&src_dir);
+        assert_eq!(
+            status,
+            FileStatus::Clean,
+            "通常のディレクトリは Clean として扱うべき"
+        );
+    }
+
+    #[test]
+    fn test_convert_status_current() {
+        // Status が空（CURRENT = 0x0）の場合は Clean を返す
+        let status = Status::CURRENT;
+        assert_eq!(
+            GitChecker::convert_status(status),
+            FileStatus::Clean,
+            "Status::CURRENT は Clean として扱うべき"
+        );
+    }
+
+    #[test]
+    fn test_check_path_file_vs_directory() {
+        // check_path がファイルとディレクトリを正しく振り分けることを確認
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // ファイルを作成してコミット
+        let file = repo_path.join("file.txt");
+        commit_file(&repo_path, "file.txt", "content");
+
+        // ディレクトリを作成してファイルをコミット
+        let dir = repo_path.join("subdir");
+        fs::create_dir_all(&dir).unwrap();
+        commit_file(&repo_path, "subdir/sub.txt", "sub content");
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+
+        // ファイル — Clean で成功
+        assert!(checker.check_path(&file).is_ok());
+        // ディレクトリ — 全ファイルが Clean で成功
+        assert!(checker.check_path(&dir).is_ok());
+    }
+
+    #[test]
+    fn test_get_all_statuses_includes_ignored() {
+        // get_all_statuses が Ignored ファイルも含むことを確認
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // .gitignore でパターンを設定
+        commit_file(&repo_path, ".gitignore", "*.log\n");
+
+        // 無視対象ファイルを作成
+        fs::write(repo_path.join("debug.log"), "log data").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let statuses = checker.get_all_statuses();
+
+        assert_eq!(
+            statuses.get("debug.log"),
+            Some(&FileStatus::Ignored),
+            "get_all_statuses は Ignored ファイルを含むべき"
+        );
+    }
+
+    #[test]
+    fn test_check_directory_empty_dir() {
+        // 空のディレクトリに対する check_directory は成功すべき
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // 初期コミットを作成
+        commit_file(&repo_path, "init.txt", "init");
+
+        let empty_dir = repo_path.join("empty");
+        fs::create_dir_all(&empty_dir).unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        assert!(
+            checker.check_directory(&empty_dir).is_ok(),
+            "空ディレクトリの削除は許可されるべき"
+        );
+    }
+
+    #[test]
+    fn test_check_directory_recursive_with_mixed_status() {
+        // ネストしたディレクトリ内に dirty ファイルがある場合のチェック
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let nested = repo_path.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+
+        // clean ファイル
+        commit_file(&repo_path, "a/b/clean.txt", "clean");
+
+        // 未追跡ファイルを追加
+        fs::write(nested.join("untracked.txt"), "new").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let result = checker.check_directory(&repo_path.join("a"));
+        assert!(
+            result.is_err(),
+            "未追跡ファイルを含むディレクトリの削除はブロックされるべき"
+        );
+    }
+
+    #[test]
+    fn test_is_real_directory_returns_false_for_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("file.txt");
+        fs::write(&file, "content").unwrap();
+
+        assert!(
+            !GitChecker::is_real_directory(&file),
+            "通常ファイルに対して false を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_is_real_directory_returns_false_for_nonexistent() {
+        assert!(
+            !GitChecker::is_real_directory(Path::new("/nonexistent/path")),
+            "存在しないパスに対して false を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_to_git_relative_key_nested_path() {
+        // ネストしたパスがスラッシュ区切りに正しく変換されることを確認
+        let path = Path::new("src").join("components").join("App.tsx");
+        let key = GitChecker::to_git_relative_key(&path);
+        assert_eq!(key, "src/components/App.tsx");
+    }
 }
