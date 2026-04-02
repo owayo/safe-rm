@@ -2210,3 +2210,124 @@ mod special_filename_tests {
         );
     }
 }
+
+// =============================================================================
+// 厳格モードでのネストされた未追跡ファイルのテスト
+// =============================================================================
+
+mod strict_mode_nested_tests {
+    use super::*;
+
+    /// allow_project_deletion = false の設定ファイルを作成
+    fn create_strict_config() -> tempfile::NamedTempFile {
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+        config
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_directory_with_nested_untracked_file() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // 2階層深いディレクトリにコミット済みファイルを作成
+        commit_file(&repo_path, "parent/child/committed.txt", "committed");
+
+        // 2階層深い場所に未追跡ファイルを追加
+        fs::write(
+            repo_path.join("parent/child/untracked_nested.txt"),
+            "untracked nested content",
+        )
+        .unwrap();
+
+        // 親ディレクトリの再帰削除を試みる → 未追跡ファイルがあるためブロックされるべき
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "parent"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "Directory with nested untracked file should be blocked. stderr: {}",
+            stderr
+        );
+        assert!(!stderr.is_empty(), "エラーメッセージが出力されるべき");
+        assert!(
+            repo_path.join("parent").exists(),
+            "ディレクトリは削除されていないべき"
+        );
+        assert!(
+            repo_path.join("parent/child/untracked_nested.txt").exists(),
+            "ネストされた未追跡ファイルは残っているべき"
+        );
+    }
+}
+
+// =============================================================================
+// -f フラグのテスト
+// =============================================================================
+
+mod force_flag_tests {
+    use super::*;
+
+    /// allow_project_deletion = false の設定ファイルを作成
+    fn create_strict_config() -> tempfile::NamedTempFile {
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+        config
+    }
+
+    #[test]
+    fn test_force_flag_ignores_nonexistent_multiple_files() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // 初期コミット（空リポジトリ回避）
+        commit_file(&repo_path, "init.txt", "init");
+
+        // 複数の存在しないファイルに -f フラグ → すべて無視されて正常終了すべき
+        let (exit_code, _, stderr) = run_safe_rm(
+            &[
+                "-f",
+                "nonexistent1.txt",
+                "nonexistent2.txt",
+                "nonexistent3.txt",
+            ],
+            &repo_path,
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "-f フラグで複数の存在しないファイルは無視されるべき. stderr: {}",
+            stderr
+        );
+    }
+
+    #[test]
+    fn test_force_flag_mixed_nonexistent_and_dirty() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // ファイルをコミット後に変更（dirty状態にする）
+        commit_file(&repo_path, "dirty.txt", "original");
+        fs::write(repo_path.join("dirty.txt"), "modified content").unwrap();
+
+        // -f で存在しないファイルとdirtyファイルを混在させる
+        // → 存在しないファイルは無視されるが、dirtyファイルはブロックされるべき
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["-f", "nonexistent.txt", "dirty.txt"],
+            &repo_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 2,
+            "-f フラグでもdirtyファイルはブロックされるべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("dirty.txt").exists(),
+            "dirtyファイルは削除されていないべき"
+        );
+    }
+}

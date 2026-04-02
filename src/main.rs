@@ -327,4 +327,42 @@ mod tests {
         let result = super::delete_path_with_metadata(&dir, false, &metadata);
         assert!(result.is_err(), "非空ディレクトリの非再帰削除は失敗すべき");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_delete_path_with_metadata_symlink_file() {
+        // シンボリックリンク自体が削除され、リンク先は残ることを検証
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let target = tmp_dir.path().join("target.txt");
+        std::fs::write(&target, "content").unwrap();
+
+        let link = tmp_dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            metadata.file_type().is_symlink(),
+            "シンボリックリンクであるべき"
+        );
+
+        let result = super::delete_path_with_metadata(&link, false, &metadata);
+        assert!(result.is_ok(), "シンボリックリンクの削除は成功すべき");
+        assert!(!link.exists(), "シンボリックリンク自体が削除されているべき");
+        assert!(target.exists(), "リンク先のファイルは残っているべき");
+    }
+
+    #[test]
+    fn test_delete_path_with_metadata_io_error() {
+        // 存在しないパスの削除は IoError を返すことを検証
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let nonexistent = tmp_dir.path().join("nonexistent.txt");
+
+        // 存在するファイルのメタデータを借用して、存在しないパスに適用
+        let dummy_file = tmp_dir.path().join("dummy.txt");
+        std::fs::write(&dummy_file, "dummy").unwrap();
+        let metadata = std::fs::symlink_metadata(&dummy_file).unwrap();
+
+        let result = super::delete_path_with_metadata(&nonexistent, false, &metadata);
+        assert!(result.is_err(), "存在しないパスの削除は失敗すべき");
+    }
 }

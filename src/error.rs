@@ -470,4 +470,21 @@ mod tests {
         assert!(msg.contains("Untracked"));
         assert!(msg.contains("git commit"));
     }
+
+    #[test]
+    fn test_file_status_not_in_repo_display() {
+        // NotInRepo の Display 表示が正しいことを検証
+        let status = FileStatus::NotInRepo;
+        assert_eq!(format!("{}", status), "NotInRepo");
+    }
+
+    #[test]
+    fn test_exit_code_partial_failure_returns_1() {
+        // PartialFailure の終了コードが 1 であることを検証
+        let err = SafeRmError::PartialFailure {
+            success: 5,
+            failed: 3,
+        };
+        assert_eq!(err.exit_code(), 1);
+    }
 }
