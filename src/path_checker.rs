@@ -462,6 +462,66 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_containment_root_with_trailing_slash() {
+        // project_root に末尾スラッシュがある場合でも正しく動作すること
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+
+        // 末尾スラッシュ付きのパスを作成
+        let root_with_slash = PathBuf::from(format!("{}/", project_root.display()));
+
+        // テスト用ファイルを作成
+        let file = project_root.join("file.txt");
+        fs::write(&file, "content").unwrap();
+
+        // 末尾スラッシュ付きルートでも包含チェックが通る
+        let result = PathChecker::verify_containment(&root_with_slash, &file);
+        assert!(
+            result.is_ok(),
+            "末尾スラッシュ付きの project_root でも包含チェックは成功すべき"
+        );
+
+        // プロジェクト外のパスは依然としてブロックされる
+        let outside = PathChecker::verify_containment(&root_with_slash, Path::new("/etc/passwd"));
+        assert!(
+            outside.is_err(),
+            "末尾スラッシュ付きでもプロジェクト外のパスはブロックすべき"
+        );
+    }
+
+    #[test]
+    fn test_is_contained_prefix_attack() {
+        // "/project-evil" が "/project" の中に含まれないことを確認
+        // starts_with はコンポーネント単位で比較するが、明示的にテスト
+        let root = Path::new("/project");
+        let evil_path = Path::new("/project-evil/file.txt");
+        assert!(
+            !PathChecker::is_contained(root, evil_path),
+            "プレフィックス一致だがコンポーネントが異なるパスは含まれないべき"
+        );
+
+        // 類似のバリエーションも確認
+        let evil_path2 = Path::new("/projectX/file.txt");
+        assert!(
+            !PathChecker::is_contained(root, evil_path2),
+            "/projectX は /project の子ではない"
+        );
+
+        let evil_path3 = Path::new("/project.bak/file.txt");
+        assert!(
+            !PathChecker::is_contained(root, evil_path3),
+            "/project.bak は /project の子ではない"
+        );
+
+        // 正当な子パスは通る
+        let valid_child = Path::new("/project/src/main.rs");
+        assert!(
+            PathChecker::is_contained(root, valid_child),
+            "/project/src/main.rs は /project の子である"
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn test_verify_containment_with_base_nonexistent_absolute_path_via_symlink_alias() {
         let temp_dir = TempDir::new().unwrap();

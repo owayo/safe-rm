@@ -377,7 +377,7 @@ mod tests {
             "ディレクトリへのシンボリックリンクの削除は成功すべき"
         );
         assert!(
-            !link.symlink_metadata().is_ok(),
+            link.symlink_metadata().is_err(),
             "シンボリックリンク自体が削除されているべき"
         );
         assert!(target_dir.exists(), "リンク先ディレクトリは残っているべき");

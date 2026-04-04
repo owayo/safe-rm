@@ -943,4 +943,38 @@ recursive = true
             result.ends_with("nonexistent/deep.txt") || result.ends_with("nonexistent\\deep.txt")
         );
     }
+
+    #[test]
+    fn test_is_path_allowed_empty_resolved_paths() {
+        // allowed_paths_resolved が空の場合、常に false を返す
+        let config = Config {
+            allowed_paths: Vec::new(),
+            ..Default::default()
+        };
+        // resolve_allowed_paths を呼ばなくても allowed_paths_resolved は空のまま
+        assert!(!config.is_path_allowed(Path::new("/tmp/any/file.txt")));
+        assert!(!config.is_path_allowed(Path::new("/usr/local/bin/tool")));
+        assert!(!config.is_path_allowed(Path::new("relative/path.rs")));
+    }
+
+    #[test]
+    fn test_expand_tilde_only_home() {
+        // "~" のみの展開がホームディレクトリになることを確認（正常系）
+        let expanded = Config::expand_tilde("~");
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expanded, home);
+        // ホームディレクトリは絶対パスである
+        assert!(expanded.is_absolute());
+        // "~/" 付きの展開結果と整合性がある
+        let expanded_with_slash = Config::expand_tilde("~/");
+        assert_eq!(expanded_with_slash, home.join(""));
+    }
+
+    #[test]
+    fn test_try_canonicalize_all_missing_segments() {
+        // 全セグメントが存在しない場合、元のパスがそのまま返される
+        let path = Path::new("/nonexistent_root_xyz/a/b");
+        let result = Config::try_canonicalize(path);
+        assert_eq!(result, path.to_path_buf());
+    }
 }
