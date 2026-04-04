@@ -351,6 +351,73 @@ mod tests {
         assert!(target.exists(), "リンク先のファイルは残っているべき");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_delete_path_with_metadata_symlink_dir() {
+        // シンボリックリンク先がディレクトリの場合、リンク自体が削除されリンク先ディレクトリは残ることを検証
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let target_dir = tmp_dir.path().join("target_dir");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("inner.txt"), "content").unwrap();
+
+        let link = tmp_dir.path().join("link_to_dir");
+        std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            metadata.file_type().is_symlink(),
+            "シンボリックリンクであるべき"
+        );
+
+        // symlink_metadata で is_dir() は false（リンク自体はディレクトリではない）ため
+        // remove_file パスで処理される
+        let result = super::delete_path_with_metadata(&link, false, &metadata);
+        assert!(
+            result.is_ok(),
+            "ディレクトリへのシンボリックリンクの削除は成功すべき"
+        );
+        assert!(
+            !link.symlink_metadata().is_ok(),
+            "シンボリックリンク自体が削除されているべき"
+        );
+        assert!(target_dir.exists(), "リンク先ディレクトリは残っているべき");
+        assert!(
+            target_dir.join("inner.txt").exists(),
+            "リンク先ディレクトリ内のファイルも残っているべき"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_delete_path_with_metadata_recursive_dir_with_symlinks() {
+        // recursive=true のときディレクトリ内のシンボリックリンクも含めて全削除されることを検証
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        // 削除対象ディレクトリの構築
+        let dir = tmp_dir.path().join("parent");
+        std::fs::create_dir_all(dir.join("child")).unwrap();
+        std::fs::write(dir.join("child").join("file.txt"), "content").unwrap();
+
+        // ディレクトリ外のリンク先（削除されないことを確認するため）
+        let external_target = tmp_dir.path().join("external.txt");
+        std::fs::write(&external_target, "external").unwrap();
+
+        // ディレクトリ内にシンボリックリンクを作成
+        let link_in_dir = dir.join("link_to_external.txt");
+        std::os::unix::fs::symlink(&external_target, &link_in_dir).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&dir).unwrap();
+        assert!(metadata.is_dir(), "ディレクトリであるべき");
+
+        let result = super::delete_path_with_metadata(&dir, true, &metadata);
+        assert!(result.is_ok(), "再帰削除は成功すべき");
+        assert!(!dir.exists(), "ディレクトリ全体が削除されているべき");
+        assert!(
+            external_target.exists(),
+            "シンボリックリンク先の外部ファイルは残っているべき"
+        );
+    }
+
     #[test]
     fn test_delete_path_with_metadata_io_error() {
         // 存在しないパスの削除は IoError を返すことを検証
