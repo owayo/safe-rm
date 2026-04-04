@@ -830,6 +830,22 @@ mod edge_case_tests {
             "Version should show program name"
         );
     }
+
+    #[test]
+    fn test_no_arguments_returns_error() {
+        // 引数なしで実行した場合、clap が required=true のためエラー終了すること
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = temp_dir.path();
+
+        let (exit_code, _, stderr) = run_safe_rm(&[], project_path);
+
+        assert_ne!(exit_code, 0, "引数なしの実行はエラーで終了すべき");
+        assert!(
+            !stderr.is_empty(),
+            "エラーメッセージが出力されるべき: {}",
+            stderr
+        );
+    }
 }
 
 // =============================================================================
@@ -1887,6 +1903,64 @@ mod symlink_tests {
             "Dirty target file should remain"
         );
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_strict_mode_symlink_to_clean_directory_with_recursive() {
+        // strict モードで、clean なディレクトリを指すシンボリックリンクを
+        // -r フラグ付きで削除した場合、リンク自体が削除されること
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // strict モード設定
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        // ターゲットディレクトリとその中のファイルを作成してコミット
+        commit_file(&repo_path, "target_dir/file1.txt", "content1");
+        commit_file(&repo_path, "target_dir/file2.txt", "content2");
+
+        // ディレクトリを指すシンボリックリンクを作成してコミット
+        let link_path = repo_path.join("dir_link");
+        std::os::unix::fs::symlink("target_dir", &link_path).unwrap();
+        Command::new("git")
+            .args(["add", "dir_link"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add directory symlink"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // -r フラグ付きでシンボリックリンクを削除
+        let (exit_code, stdout, stderr) =
+            run_safe_rm_with_config(&["-r", "dir_link"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "clean なディレクトリを指す symlink は -r 付きで削除可能であるべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            stdout.contains("removed:"),
+            "削除メッセージが出力されるべき"
+        );
+        assert!(
+            !link_path.exists(),
+            "シンボリックリンク自体が削除されるべき"
+        );
+        // ターゲットディレクトリは残っていること
+        assert!(
+            repo_path.join("target_dir").exists(),
+            "ターゲットディレクトリは残っているべき"
+        );
+        assert!(
+            repo_path.join("target_dir/file1.txt").exists(),
+            "ターゲット内のファイルは残っているべき"
+        );
+    }
 }
 
 // =============================================================================
@@ -1992,6 +2066,96 @@ mod batch_tests {
         assert!(
             stdout.contains("clean1.txt"),
             "Should mention clean1.txt removed"
+        );
+    }
+
+    #[test]
+    fn test_batch_partial_success_with_strict_mode() {
+        // allow_project_deletion=false で複数パスをバッチ処理した際、
+        // clean ファイルは削除され、dirty ファイルはブロックされること。
+        // dirty ファイルのブロックはセキュリティエラー（exit code 2）となるため、
+        // 最終的な exit code は 2 が返る（セキュリティブロック優先）。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // clean ファイルを3つ作成
+        commit_file(&repo_path, "ok1.txt", "ok1");
+        commit_file(&repo_path, "ok2.txt", "ok2");
+        commit_file(&repo_path, "ok3.txt", "ok3");
+
+        // dirty ファイルを2つ作成（1つは modified、1つは untracked）
+        commit_file(&repo_path, "modified.txt", "original");
+        fs::write(repo_path.join("modified.txt"), "changed").unwrap();
+        fs::write(repo_path.join("untracked.txt"), "new file").unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &[
+                "ok1.txt",
+                "modified.txt",
+                "ok2.txt",
+                "untracked.txt",
+                "ok3.txt",
+            ],
+            &repo_path,
+            Some(config.path()),
+        );
+
+        // dirty ファイルがあるためセキュリティブロック（exit code 2）
+        assert_eq!(
+            exit_code, 2,
+            "dirty ファイルを含むバッチはセキュリティブロック（exit 2）で終了すべき. stderr: {}",
+            stderr
+        );
+
+        // clean ファイルは削除されていること
+        assert!(
+            !repo_path.join("ok1.txt").exists(),
+            "ok1.txt は削除されるべき"
+        );
+        assert!(
+            !repo_path.join("ok2.txt").exists(),
+            "ok2.txt は削除されるべき"
+        );
+        assert!(
+            !repo_path.join("ok3.txt").exists(),
+            "ok3.txt は削除されるべき"
+        );
+
+        // dirty ファイルはブロックされて残っていること
+        assert!(
+            repo_path.join("modified.txt").exists(),
+            "modified.txt はブロックされて残るべき"
+        );
+        assert!(
+            repo_path.join("untracked.txt").exists(),
+            "untracked.txt はブロックされて残るべき"
+        );
+
+        // stderr に dirty ファイルのエラーが出力されていること
+        assert!(
+            stderr.contains("modified.txt"),
+            "stderr に modified.txt のエラーが含まれるべき: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("untracked.txt"),
+            "stderr に untracked.txt のエラーが含まれるべき: {}",
+            stderr
+        );
+
+        // stdout に clean ファイルの削除メッセージが出力されていること
+        assert!(
+            stdout.contains("ok1.txt"),
+            "stdout に ok1.txt の削除メッセージが含まれるべき"
+        );
+        assert!(
+            stdout.contains("ok2.txt"),
+            "stdout に ok2.txt の削除メッセージが含まれるべき"
+        );
+        assert!(
+            stdout.contains("ok3.txt"),
+            "stdout に ok3.txt の削除メッセージが含まれるべき"
         );
     }
 }
