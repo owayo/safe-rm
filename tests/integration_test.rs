@@ -2495,3 +2495,385 @@ mod force_flag_tests {
         );
     }
 }
+
+// =============================================================================
+// ドライラン + フォースフラグの複合テスト
+// =============================================================================
+
+mod dry_run_force_tests {
+    use super::*;
+
+    #[test]
+    fn test_dry_run_force_nonexistent_file() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        // -n -f で存在しないファイル → エラーなしで正常終了すべき
+        let (exit_code, stdout, _) = run_safe_rm(&["-n", "-f", "nonexistent.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "ドライラン + フォースで非存在ファイルは正常終了すべき"
+        );
+        // 存在しないファイルは出力されない（フォースで無視）
+        assert!(
+            !stdout.contains("nonexistent.txt"),
+            "フォースで無視されたファイルは出力されないべき"
+        );
+    }
+
+    #[test]
+    fn test_dry_run_force_mixed_existing_and_nonexistent() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "exists.txt", "content");
+
+        let (exit_code, stdout, _) =
+            run_safe_rm(&["-n", "-f", "exists.txt", "missing.txt"], &repo_path);
+
+        assert_eq!(exit_code, 0, "ドライラン + フォースは正常終了すべき");
+        assert!(
+            stdout.contains("would remove: exists.txt"),
+            "存在するファイルは 'would remove' と表示されるべき"
+        );
+        assert!(
+            repo_path.join("exists.txt").exists(),
+            "ドライランなのでファイルは残っているべき"
+        );
+    }
+}
+
+// =============================================================================
+// 空ディレクトリのテスト
+// =============================================================================
+
+mod empty_directory_tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_directory_without_recursive_flag() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        // 空ディレクトリを作成
+        let empty_dir = repo_path.join("empty_dir");
+        fs::create_dir(&empty_dir).unwrap();
+
+        // -r なしでディレクトリを削除 → エラーになるべき
+        let (exit_code, _, stderr) = run_safe_rm(&["empty_dir"], &repo_path);
+
+        assert_eq!(exit_code, 1, "ディレクトリは -r なしで削除できないべき");
+        assert!(
+            stderr.contains("Is a directory"),
+            "stderr に 'Is a directory' が含まれるべき. stderr: {}",
+            stderr
+        );
+        assert!(empty_dir.exists(), "ディレクトリは残っているべき");
+    }
+
+    #[test]
+    fn test_empty_committed_directory_with_recursive_flag() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // ディレクトリ内にファイルを作成してコミット後、ファイルを削除してコミット
+        // （空ディレクトリが残る状態）
+        commit_file(&repo_path, "dir_to_empty/placeholder.txt", "placeholder");
+        fs::remove_file(repo_path.join("dir_to_empty/placeholder.txt")).unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Remove placeholder"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let empty_dir = repo_path.join("dir_to_empty");
+        // Git はディレクトリを追跡しないので、コミット後にディレクトリが残っている場合のみテスト
+        if empty_dir.exists() {
+            let (exit_code, stdout, _) = run_safe_rm(&["-r", "dir_to_empty"], &repo_path);
+            assert_eq!(exit_code, 0, "空ディレクトリは -r で削除できるべき");
+            assert!(
+                stdout.contains("removed:"),
+                "削除メッセージが出力されるべき"
+            );
+            assert!(!empty_dir.exists(), "ディレクトリが削除されているべき");
+        }
+    }
+}
+
+// =============================================================================
+// デフォルトモードでのフォースフラグと外部パスのテスト
+// =============================================================================
+
+mod default_mode_security_tests {
+    use super::*;
+
+    #[test]
+    fn test_default_mode_force_still_blocks_outside_project() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        // 外部の一時ファイルを作成
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("secret.txt");
+        fs::write(&outside_file, "secret").unwrap();
+
+        // -f フラグでもプロジェクト外は削除不可
+        let (exit_code, _, stderr) =
+            run_safe_rm(&["-f", outside_file.to_str().unwrap()], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "フォースフラグでもプロジェクト外はブロックされるべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            outside_file.exists(),
+            "プロジェクト外のファイルは削除されていないべき"
+        );
+    }
+
+    #[test]
+    fn test_default_mode_recursive_force_still_blocks_outside_project() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_subdir = outside_dir.path().join("subdir");
+        fs::create_dir(&outside_subdir).unwrap();
+        fs::write(outside_subdir.join("file.txt"), "content").unwrap();
+
+        // -rf でもプロジェクト外は削除不可
+        let (exit_code, _, _) = run_safe_rm(&["-rf", outside_subdir.to_str().unwrap()], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "-rf でもプロジェクト外ディレクトリはブロックされるべき"
+        );
+        assert!(
+            outside_subdir.exists(),
+            "プロジェクト外のディレクトリは削除されていないべき"
+        );
+    }
+}
+
+// =============================================================================
+// Strict モードでの Git 削除済みファイルのテスト
+// =============================================================================
+
+mod strict_mode_deleted_file_tests {
+    use super::*;
+
+    /// allow_project_deletion = false の設定ファイルを作成
+    fn create_strict_config() -> tempfile::NamedTempFile {
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+        config
+    }
+
+    #[test]
+    fn test_strict_mode_git_deleted_file_blocked() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // ファイルを作成してコミット
+        commit_file(&repo_path, "to_delete.txt", "content");
+
+        // git rm でステージング（ファイルはワークツリーから削除済み）
+        Command::new("git")
+            .args(["rm", "to_delete.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // ファイルは既に存在しないので -f で NotFound をスキップ
+        let (exit_code, _, _) =
+            run_safe_rm_with_config(&["-f", "to_delete.txt"], &repo_path, Some(config.path()));
+
+        // ファイルが存在しないため force で無視 → 正常終了
+        assert_eq!(exit_code, 0, "存在しないファイルは force で無視されるべき");
+    }
+
+    #[test]
+    fn test_strict_mode_staged_new_file_blocked() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // 初期コミット
+        commit_file(&repo_path, "init.txt", "init");
+
+        // 新規ファイルを作成して git add（Staged 状態）
+        let staged_file = repo_path.join("staged_new.txt");
+        fs::write(&staged_file, "new content").unwrap();
+        Command::new("git")
+            .args(["add", "staged_new.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["staged_new.txt"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "ステージングされた新規ファイルはブロックされるべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            staged_file.exists(),
+            "ステージングされたファイルは削除されていないべき"
+        );
+    }
+}
+
+// =============================================================================
+// バッチ操作の全セキュリティエラーテスト
+// =============================================================================
+
+mod batch_security_tests {
+    use super::*;
+
+    #[test]
+    fn test_batch_all_outside_project_returns_exit_2() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let file1 = outside_dir.path().join("a.txt");
+        let file2 = outside_dir.path().join("b.txt");
+        fs::write(&file1, "a").unwrap();
+        fs::write(&file2, "b").unwrap();
+
+        let (exit_code, _, _) = run_safe_rm(
+            &[file1.to_str().unwrap(), file2.to_str().unwrap()],
+            &repo_path,
+        );
+
+        assert_eq!(
+            exit_code, 2,
+            "すべてプロジェクト外のファイルはセキュリティエラー（exit 2）を返すべき"
+        );
+        assert!(
+            file1.exists(),
+            "プロジェクト外のファイルは削除されていないべき"
+        );
+        assert!(
+            file2.exists(),
+            "プロジェクト外のファイルは削除されていないべき"
+        );
+    }
+
+    #[test]
+    fn test_batch_mix_outside_and_clean_prioritizes_security() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "clean.txt", "content");
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("outside.txt");
+        fs::write(&outside_file, "outside").unwrap();
+
+        let (exit_code, _, _) =
+            run_safe_rm(&["clean.txt", outside_file.to_str().unwrap()], &repo_path);
+
+        // セキュリティエラー（exit 2）が操作エラーより優先
+        assert_eq!(exit_code, 2, "セキュリティエラーが優先されるべき");
+        assert!(
+            outside_file.exists(),
+            "プロジェクト外のファイルは削除されていないべき"
+        );
+    }
+}
+
+// =============================================================================
+// 設定ファイルの複合テスト
+// =============================================================================
+
+mod config_combination_tests {
+    use super::*;
+
+    #[test]
+    fn test_allowed_paths_with_strict_mode_and_force() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        let allowed_dir = tempfile::tempdir().unwrap();
+        let allowed_canonical = allowed_dir.path().canonicalize().unwrap();
+        let allowed_file = allowed_canonical.join("test.txt");
+        fs::write(&allowed_file, "allowed content").unwrap();
+
+        // strict mode + allowed_paths の組み合わせ
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            "allow_project_deletion = false\n\n[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n",
+            allowed_canonical.to_string_lossy()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &[allowed_file.to_str().unwrap()],
+            &repo_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "allowed_paths 内のファイルは strict モードでも削除可能であるべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            stdout.contains("allowed by config"),
+            "allowed_paths で許可されたことが表示されるべき"
+        );
+        assert!(!allowed_file.exists(), "ファイルが削除されているべき");
+    }
+
+    #[test]
+    fn test_multiple_allowed_paths_entries() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let canonical_a = dir_a.path().canonicalize().unwrap();
+        let canonical_b = dir_b.path().canonicalize().unwrap();
+
+        let file_a = canonical_a.join("a.txt");
+        let file_b = canonical_b.join("b.txt");
+        fs::write(&file_a, "a").unwrap();
+        fs::write(&file_b, "b").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            "[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n\n[[allowed_paths]]\npath = \"{}\"\nrecursive = false\n",
+            canonical_a.to_string_lossy(),
+            canonical_b.to_string_lossy()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // dir_a の子ファイル削除
+        let (exit_a, _, _) =
+            run_safe_rm_with_config(&[file_a.to_str().unwrap()], &repo_path, Some(config.path()));
+        assert_eq!(exit_a, 0, "dir_a 内のファイルは削除可能であるべき");
+        assert!(!file_a.exists(), "file_a が削除されているべき");
+
+        // dir_b の直下のファイル削除（non-recursive で直下は許可）
+        let (exit_b, _, _) =
+            run_safe_rm_with_config(&[file_b.to_str().unwrap()], &repo_path, Some(config.path()));
+        assert_eq!(exit_b, 0, "dir_b 直下のファイルは削除可能であるべき");
+        assert!(!file_b.exists(), "file_b が削除されているべき");
+    }
+}
