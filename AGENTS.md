@@ -63,7 +63,7 @@ CLI引数パース → Config読込 → Git repo検出 → [Git status一括取�
 ### テスト構成
 
 - **ユニットテスト**: 各モジュール内の `#[cfg(test)]` ブロック（パス検証、Git状態、Config解析、symlink削除、I/Oエラー等）
-- **統合テスト**: `tests/integration_test.rs` - 実際のGitリポジトリを tempfile で作成してE2Eテスト。repo symlink 別名の cwd からの相対実行、単一失敗時の stderr 非重複、force フラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト（strict mode + allowed_paths、複数 allowed_paths エントリ）も含めて検証
+- **統合テスト**: `tests/integration_test.rs` - 実際のGitリポジトリを tempfile で作成してE2Eテスト。repo symlink 別名の cwd からの相対実行、単一失敗時の stderr 非重複、force フラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト（strict mode + allowed_paths、複数 allowed_paths エントリ）、strict mode + force フラグの複合テスト、相対パスの `..` コンポーネント検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証も含めて検証
 
 ### バージョン体系
 

@@ -2877,3 +2877,269 @@ mod config_combination_tests {
         assert!(!file_b.exists(), "file_b が削除されているべき");
     }
 }
+
+// =============================================================================
+// strict mode + force フラグの複合テスト
+// =============================================================================
+
+mod strict_force_tests {
+    use super::*;
+
+    /// force フラグはダーティファイルの Git チェックをバイパスしないことを検証
+    #[test]
+    fn test_strict_mode_force_still_blocks_dirty_file() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "file.txt", "original");
+
+        // ファイルを変更してダーティにする
+        fs::write(repo_path.join("file.txt"), "modified").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        // -f フラグをつけてもダーティファイルはブロックされるべき
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-f", "file.txt"], &repo_path, Some(config.path()));
+        assert_eq!(
+            exit_code, 2,
+            "force フラグでもダーティファイルはブロックされるべき"
+        );
+        assert!(
+            stderr.contains("Modified") || stderr.contains("未コミット"),
+            "ダーティステータスが報告されるべき: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("file.txt").exists(),
+            "ファイルが残っているべき"
+        );
+    }
+
+    /// force フラグ + strict mode で存在しないファイルは無視されることを検証
+    #[test]
+    fn test_strict_mode_force_nonexistent_is_silent() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        let (exit_code, _, _) =
+            run_safe_rm_with_config(&["-f", "nonexistent.txt"], &repo_path, Some(config.path()));
+        assert_eq!(exit_code, 0, "force + 存在しないファイルは成功すべき");
+    }
+
+    /// force + recursive + strict mode でダーティなディレクトリ内容がブロックされることを検証
+    #[test]
+    fn test_strict_mode_force_recursive_blocks_dirty_directory() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "dir/clean.txt", "clean");
+
+        // ディレクトリ内に未追跡ファイルを追加
+        fs::write(repo_path.join("dir").join("untracked.txt"), "new").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        let (exit_code, _, _) =
+            run_safe_rm_with_config(&["-rf", "dir"], &repo_path, Some(config.path()));
+        assert_eq!(
+            exit_code, 2,
+            "force + recursive でもダーティなディレクトリはブロックされるべき"
+        );
+        assert!(
+            repo_path.join("dir").exists(),
+            "ディレクトリが残っているべき"
+        );
+    }
+}
+
+// =============================================================================
+// 相対パスの .. コンポーネントを含む統合テスト
+// =============================================================================
+
+mod relative_path_tests {
+    use super::*;
+
+    /// 相対パスに .. を含むがプロジェクト内に解決されるケース
+    #[test]
+    fn test_dotdot_resolves_inside_project() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "sub/file.txt", "content");
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        // sub/ ディレクトリから ../sub/file.txt を指定（プロジェクト内に解決される）
+        let sub_dir = repo_path.join("sub");
+        let (exit_code, stdout, _) =
+            run_safe_rm_with_config(&["../sub/file.txt"], &sub_dir, Some(config.path()));
+        assert_eq!(
+            exit_code, 0,
+            "../sub/file.txt はプロジェクト内に解決されるべき"
+        );
+        assert!(
+            stdout.contains("removed"),
+            "削除完了メッセージが表示されるべき"
+        );
+        assert!(
+            !repo_path.join("sub").join("file.txt").exists(),
+            "ファイルが削除されているべき"
+        );
+    }
+
+    /// 相対パスに .. を含みプロジェクト外に出るケース
+    #[test]
+    fn test_dotdot_resolves_outside_project_blocked() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        // リポジトリルートから ../../etc/passwd を指定
+        let (exit_code, _, _) =
+            run_safe_rm_with_config(&["../../etc/passwd"], &repo_path, Some(config.path()));
+        assert_eq!(exit_code, 2, "プロジェクト外へのパスはブロックされるべき");
+    }
+}
+
+// =============================================================================
+// strict mode でバッチ全ダーティのテスト
+// =============================================================================
+
+mod batch_all_dirty_tests {
+    use super::*;
+
+    /// バッチ内の全ファイルがダーティな場合に終了コード 2 が返ることを検証
+    #[test]
+    fn test_batch_all_dirty_returns_exit_2() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "a.txt", "a");
+        commit_file(&repo_path, "b.txt", "b");
+
+        // 両方のファイルを変更
+        fs::write(repo_path.join("a.txt"), "modified_a").unwrap();
+        fs::write(repo_path.join("b.txt"), "modified_b").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["a.txt", "b.txt"], &repo_path, Some(config.path()));
+        assert_eq!(exit_code, 2, "全ダーティの場合は終了コード 2 であるべき");
+        assert!(
+            stderr.contains("a.txt") && stderr.contains("b.txt"),
+            "両方のエラーが報告されるべき: {}",
+            stderr
+        );
+    }
+
+    /// バッチ内に未追跡ファイルと変更ファイルが混在する場合
+    #[test]
+    fn test_batch_mixed_dirty_types() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "content");
+
+        // tracked.txt を変更、untracked.txt を新規作成
+        fs::write(repo_path.join("tracked.txt"), "modified").unwrap();
+        fs::write(repo_path.join("untracked.txt"), "new").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["tracked.txt", "untracked.txt"],
+            &repo_path,
+            Some(config.path()),
+        );
+        assert_eq!(exit_code, 2, "ダーティファイルが含まれる場合は終了コード 2");
+        assert!(
+            stderr.contains("tracked.txt"),
+            "Modified ファイルのエラーが報告されるべき: {}",
+            stderr
+        );
+    }
+}
+
+// =============================================================================
+// allowed_paths でディレクトリ自体の操作テスト
+// =============================================================================
+
+mod allowed_paths_directory_self_tests {
+    use super::*;
+
+    /// recursive allowed_paths で許可ディレクトリ自体を -r で削除できることを検証
+    #[test]
+    fn test_recursive_allowed_path_directory_itself_deletable() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        let allowed_dir = tempfile::tempdir().unwrap();
+        let canonical_allowed = allowed_dir.path().canonicalize().unwrap();
+        fs::write(canonical_allowed.join("file.txt"), "data").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            "allow_project_deletion = false\n\n[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n",
+            canonical_allowed.to_string_lossy()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        let (exit_code, stdout, _) = run_safe_rm_with_config(
+            &["-r", canonical_allowed.to_str().unwrap()],
+            &repo_path,
+            Some(config.path()),
+        );
+        assert_eq!(
+            exit_code, 0,
+            "recursive 許可パスのディレクトリ自体は削除可能であるべき"
+        );
+        assert!(
+            stdout.contains("allowed by config"),
+            "設定による許可メッセージが表示されるべき"
+        );
+        assert!(
+            !canonical_allowed.exists(),
+            "ディレクトリが削除されているべき"
+        );
+    }
+
+    /// non-recursive allowed_paths で許可ディレクトリ自体は削除不可であることを検証
+    #[test]
+    fn test_non_recursive_allowed_path_directory_itself_blocked() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        let allowed_dir = tempfile::tempdir().unwrap();
+        let canonical_allowed = allowed_dir.path().canonicalize().unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            "allow_project_deletion = false\n\n[[allowed_paths]]\npath = \"{}\"\nrecursive = false\n",
+            canonical_allowed.to_string_lossy()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // non-recursive ではディレクトリ自体は直接の子ではないため allowed にマッチしない
+        let (exit_code, _, _) = run_safe_rm_with_config(
+            &["-r", canonical_allowed.to_str().unwrap()],
+            &repo_path,
+            Some(config.path()),
+        );
+        assert_eq!(
+            exit_code, 2,
+            "non-recursive 許可パスではディレクトリ自体の削除はブロックされるべき"
+        );
+        assert!(canonical_allowed.exists(), "ディレクトリが残っているべき");
+    }
+}
