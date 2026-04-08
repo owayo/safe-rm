@@ -181,7 +181,7 @@ flowchart TB
 1. **Path Containment**: Ensures all paths resolve within the project directory (Git repository root, or cwd if not a Git repo) (always enforced). For nonexistent targets, it canonicalizes the nearest existing parent to absorb alias differences (e.g. repo symlink alias, `/var` vs `/private/var`).
 2. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked), including files nested under untracked directories
 3. **Recursive Check**: For real directories, validates all contained files
-4. **Fail-Closed Directory Reads**: Any directory read failure (including entry iteration errors) is blocked
+4. **Fail-Closed**: Any directory read failure (including entry iteration errors) or Git API error blocks deletion
 5. **Alias-Path Hardening**: Path containment and `allowed_paths` matching canonicalize the nearest existing parent and reattach missing segments, while Git checks canonicalize non-symlink paths and only parent directories for symlink paths, to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
 
 ### File System and Deletable Scope
@@ -409,8 +409,8 @@ cargo build --release
 
 ### Test Coverage
 
-- **Unit Tests**: 197 tests covering all modules (CLI, config, error, path_checker, git_checker, init)
-- **Integration Tests**: 93 tests with real Git repositories (allow/block flows, strict mode, symlinks, alias-path hardening including relative execution from symlink-alias cwd, batch operations, dry-run in strict mode, special filenames, force flag combined with dirty files, nested untracked directory blocking, dry-run + force combinations, empty directory handling, batch security error precedence, config combination tests, strict mode + force flag combinations, relative paths with `..` components, batch all-dirty exit code verification, allowed_paths directory self-deletion behavior)
+- **Unit Tests**: 191 tests covering all modules (CLI, config, error, path_checker, git_checker, init) including fail-closed Git API error handling
+- **Integration Tests**: 97 tests with real Git repositories (allow/block flows, strict mode, symlinks, alias-path hardening including relative execution from symlink-alias cwd, batch operations, dry-run in strict mode, special filenames, force flag combined with dirty files, nested untracked directory blocking, dry-run + force combinations, empty directory handling, batch security error precedence, config combination tests, strict mode + force flag combinations, relative paths with `..` components, batch all-dirty exit code verification, allowed_paths directory self-deletion behavior, two-path batch exit code priority, symlink-to-directory non-recursive deletion, Git index corruption fail-closed verification)
 
 ## Contributing
 

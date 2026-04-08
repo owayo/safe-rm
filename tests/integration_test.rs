@@ -3143,3 +3143,159 @@ mod allowed_paths_directory_self_tests {
         assert!(canonical_allowed.exists(), "ディレクトリが残っているべき");
     }
 }
+
+// =============================================================================
+// 2パスバッチの終了コード優先度テスト
+// =============================================================================
+
+mod batch_two_paths_tests {
+    use super::*;
+
+    #[test]
+    fn test_batch_two_paths_exit1_and_exit2_returns_exit2() {
+        // 2パスバッチ: NotFound (exit 1) と OutsideProject (exit 2) の組み合わせ
+        // セキュリティエラーが優先されて exit 2 を返すべき
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "dummy.txt", "content");
+
+        // -f で NotFound をサイレントにしないため force なしで実行
+        // パス1: 存在しないファイル (exit 1)
+        // パス2: プロジェクト外 (exit 2)
+        let (exit_code, _, _) = run_safe_rm(&["nonexistent.txt", "/etc/passwd"], &repo_path);
+        assert_eq!(
+            exit_code, 2,
+            "セキュリティエラー (exit 2) が操作エラー (exit 1) より優先されるべき"
+        );
+    }
+
+    #[test]
+    fn test_batch_two_paths_both_exit2_returns_exit2() {
+        // 2パスバッチ: 両方プロジェクト外 (exit 2)
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "dummy.txt", "content");
+
+        let (exit_code, _, _) = run_safe_rm(&["/etc/passwd", "/etc/hosts"], &repo_path);
+        assert_eq!(
+            exit_code, 2,
+            "両方セキュリティエラーの場合は exit 2 を返すべき"
+        );
+    }
+}
+
+// =============================================================================
+// シンボリックリンク先がディレクトリの場合の非再帰削除テスト
+// =============================================================================
+
+#[cfg(unix)]
+mod symlink_to_directory_no_recursive_tests {
+    use super::*;
+
+    #[test]
+    fn test_symlink_to_directory_without_recursive_is_removed() {
+        // ディレクトリへのシンボリックリンクは -r なしでも削除可能
+        // (symlink_metadata().is_dir() は false なので -r チェックをパスする)
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "dummy.txt", "content");
+
+        // ターゲットディレクトリとシンボリックリンクを作成
+        let target_dir = repo_path.join("target_dir");
+        fs::create_dir(&target_dir).unwrap();
+        fs::write(target_dir.join("inner.txt"), "content").unwrap();
+
+        // ターゲットディレクトリをコミット
+        std::process::Command::new("git")
+            .args(["add", "target_dir/inner.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "Add target_dir"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // シンボリックリンクを作成してコミット
+        let link_path = repo_path.join("link_to_dir");
+        std::os::unix::fs::symlink(&target_dir, &link_path).unwrap();
+        std::process::Command::new("git")
+            .args(["add", "link_to_dir"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "Add symlink"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // -r なしでシンボリックリンクを削除
+        let (exit_code, stdout, _) = run_safe_rm(&["link_to_dir"], &repo_path);
+        assert_eq!(
+            exit_code, 0,
+            "ディレクトリへのシンボリックリンクは -r なしで削除可能であるべき"
+        );
+        assert!(
+            stdout.contains("removed"),
+            "削除成功メッセージが出力されるべき"
+        );
+        assert!(
+            link_path.symlink_metadata().is_err(),
+            "シンボリックリンク自体が削除されているべき"
+        );
+        assert!(target_dir.exists(), "リンク先ディレクトリは残っているべき");
+        assert!(
+            target_dir.join("inner.txt").exists(),
+            "リンク先ディレクトリ内のファイルも残っているべき"
+        );
+    }
+}
+
+// =============================================================================
+// Git ステータス取得エラー時の fail-closed テスト
+// =============================================================================
+
+mod git_error_fail_closed_tests {
+    use super::*;
+
+    #[test]
+    fn test_strict_mode_git_index_corruption_blocks_deletion() {
+        // Git index ファイルを破損させて status API エラーを誘発し、
+        // fail-closed で削除がブロックされることを確認
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "clean.txt", "content");
+
+        // strict モードの設定を作成
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+
+        // .git/index を破損させて Git API エラーを誘発
+        let index_path = repo_path.join(".git").join("index");
+        fs::write(&index_path, b"CORRUPTED_INDEX_DATA").unwrap();
+
+        // Clean ファイルの削除を試みる — Git エラーでブロックされるべき
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["clean.txt"], &repo_path, Some(config.path()));
+
+        assert_ne!(
+            exit_code, 0,
+            "Git index 破損時は削除がブロックされるべき (fail-closed)"
+        );
+        assert!(
+            repo_path.join("clean.txt").exists(),
+            "Git エラー時はファイルが残っているべき"
+        );
+        assert!(
+            stderr.contains("Git error") || stderr.contains("error"),
+            "Git エラーメッセージが表示されるべき: stderr='{}'",
+            stderr
+        );
+    }
+}
