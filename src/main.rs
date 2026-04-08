@@ -66,11 +66,12 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
 
     // Git ステータスを必要時のみ一括事前取得（パフォーマンス最適化）
     // allow_project_deletion 有効時はスキップ
+    // Git API エラー時は fail-closed でエラーを返す
     let status_cache: HashMap<String, FileStatus> = if !config.allow_project_deletion {
-        git_checker
-            .as_ref()
-            .map(|checker| checker.get_all_statuses())
-            .unwrap_or_default()
+        match git_checker.as_ref() {
+            Some(checker) => checker.get_all_statuses()?,
+            None => HashMap::new(),
+        }
     } else {
         HashMap::new()
     };

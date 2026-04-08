@@ -68,10 +68,12 @@ impl GitChecker {
     ///
     /// 一度の Git API 呼び出しで全ステータスを取得し、HashMap として返す。
     /// これにより、多数のファイルを処理する際の API 呼び出し回数を削減。
+    /// Git API エラー時は fail-closed でエラーを返す。
     ///
     /// # 戻り値
-    /// * `HashMap<String, FileStatus>` - 相対パス → ステータスのマップ
-    pub fn get_all_statuses(&self) -> HashMap<String, FileStatus> {
+    /// * `Ok(HashMap<String, FileStatus>)` - 相対パス → ステータスのマップ
+    /// * `Err(SafeRmError)` - Git API エラー（ステータス取得不可時は削除をブロック）
+    pub fn get_all_statuses(&self) -> Result<HashMap<String, FileStatus>, SafeRmError> {
         let mut status_map = HashMap::new();
 
         let mut opts = StatusOptions::new();
@@ -79,16 +81,15 @@ impl GitChecker {
         opts.include_ignored(true);
         opts.recurse_untracked_dirs(true);
 
-        if let Ok(statuses) = self.repo.statuses(Some(&mut opts)) {
-            for entry in statuses.iter() {
-                if let Some(path) = entry.path() {
-                    let status = Self::convert_status(entry.status());
-                    status_map.insert(path.to_string(), status);
-                }
+        let statuses = self.repo.statuses(Some(&mut opts))?;
+        for entry in statuses.iter() {
+            if let Some(path) = entry.path() {
+                let status = Self::convert_status(entry.status());
+                status_map.insert(path.to_string(), status);
             }
         }
 
-        status_map
+        Ok(status_map)
     }
 
     /// キャッシュからファイルステータスを取得
@@ -142,7 +143,8 @@ impl GitChecker {
             Err(e) if e.code() == git2::ErrorCode::NotFound => self
                 .lookup_status_in_listing(relative_path)
                 .unwrap_or(FileStatus::NotInRepo),
-            Err(_) => FileStatus::NotInRepo,
+            // fail-closed: 予期しない Git エラー時は削除をブロック
+            Err(_) => FileStatus::Modified,
         }
     }
 
@@ -907,7 +909,7 @@ mod tests {
         fs::write(repo_path.join("debug.log"), "log").unwrap();
 
         let checker = GitChecker::open(&repo_path).unwrap();
-        let statuses = checker.get_all_statuses();
+        let statuses = checker.get_all_statuses().unwrap();
 
         // Modified, Untracked, Ignored は status に含まれる
         assert!(statuses.contains_key("modified.txt"));
@@ -926,7 +928,7 @@ mod tests {
         commit_file(&repo_path, "cached_clean.txt", "content");
 
         let checker = GitChecker::open(&repo_path).unwrap();
-        let cache = checker.get_all_statuses();
+        let cache = checker.get_all_statuses().unwrap();
         let file_path = repo_path.join("cached_clean.txt");
         let result = checker.check_file_with_cache(&file_path, &cache);
 
@@ -942,7 +944,7 @@ mod tests {
         fs::write(repo_path.join("cached_mod.txt"), "changed").unwrap();
 
         let checker = GitChecker::open(&repo_path).unwrap();
-        let cache = checker.get_all_statuses();
+        let cache = checker.get_all_statuses().unwrap();
         let file_path = repo_path.join("cached_mod.txt");
         let result = checker.check_file_with_cache(&file_path, &cache);
 
@@ -960,7 +962,7 @@ mod tests {
         commit_file(&repo_path, "cachedir/file2.txt", "content2");
 
         let checker = GitChecker::open(&repo_path).unwrap();
-        let cache = checker.get_all_statuses();
+        let cache = checker.get_all_statuses().unwrap();
         let result = checker.check_path_with_cache(&subdir, &cache);
 
         assert!(
@@ -982,7 +984,7 @@ mod tests {
         fs::write(subdir.join("untracked.txt"), "untracked").unwrap();
 
         let checker = GitChecker::open(&repo_path).unwrap();
-        let cache = checker.get_all_statuses();
+        let cache = checker.get_all_statuses().unwrap();
         let result = checker.check_directory_with_cache(&subdir, &cache);
 
         assert!(
@@ -1012,7 +1014,7 @@ mod tests {
         commit_file(&repo_path, "dummy.txt", "dummy");
 
         let checker = GitChecker::open(&repo_path).unwrap();
-        let cache = checker.get_all_statuses();
+        let cache = checker.get_all_statuses().unwrap();
 
         // リポジトリ外のパスに対して NotInRepo が返ることを確認
         let outside_path = std::path::Path::new("/tmp/nonexistent_path.txt");
@@ -1188,7 +1190,7 @@ mod tests {
         fs::create_dir(&empty_dir).unwrap();
 
         let checker = GitChecker::open(&repo_path).unwrap();
-        let cache = checker.get_all_statuses();
+        let cache = checker.get_all_statuses().unwrap();
         let result = checker.check_directory_with_cache(&empty_dir, &cache);
         assert!(
             result.is_ok(),
@@ -1253,7 +1255,7 @@ mod tests {
         fs::write(repo_path.join("target_dir").join("untracked.txt"), "dirty").unwrap();
 
         let checker = GitChecker::open(&repo_path).unwrap();
-        let cache = checker.get_all_statuses();
+        let cache = checker.get_all_statuses().unwrap();
         let result = checker.check_path_with_cache(&link_path, &cache);
         assert!(
             result.is_ok(),
@@ -1386,7 +1388,7 @@ mod tests {
         std::os::unix::fs::symlink(&repo_path, &alias_repo).unwrap();
 
         let checker = GitChecker::open(&alias_repo).unwrap();
-        let cache = checker.get_all_statuses();
+        let cache = checker.get_all_statuses().unwrap();
 
         // canonical path で clean ファイルを問い合わせ
         let clean_status = checker.get_file_status_from_cache(&repo_path.join("clean.txt"), &cache);
@@ -1419,7 +1421,7 @@ mod tests {
         std::os::unix::fs::symlink(&repo_path, &alias_repo).unwrap();
 
         let checker = GitChecker::open(&alias_repo).unwrap();
-        let cache = checker.get_all_statuses();
+        let cache = checker.get_all_statuses().unwrap();
 
         // canonical path でチェック → Modified でブロックされるべき
         let result = checker.check_file_with_cache(&repo_path.join("file.txt"), &cache);
@@ -1536,7 +1538,7 @@ mod tests {
         fs::write(repo_path.join("debug.log"), "log data").unwrap();
 
         let checker = GitChecker::open(&repo_path).unwrap();
-        let statuses = checker.get_all_statuses();
+        let statuses = checker.get_all_statuses().unwrap();
 
         assert_eq!(
             statuses.get("debug.log"),
@@ -1660,7 +1662,7 @@ mod tests {
         fs::write(repo_path.join("dirty_file.txt"), "changed").unwrap();
 
         let checker = GitChecker::open(&repo_path).unwrap();
-        let cache = checker.get_all_statuses();
+        let cache = checker.get_all_statuses().unwrap();
 
         // Clean ファイルは成功
         let clean_result =
@@ -1718,7 +1720,7 @@ mod tests {
         commit_file(&repo_path, "tracked_clean.txt", "content");
 
         let checker = GitChecker::open(&repo_path).unwrap();
-        let cache = checker.get_all_statuses();
+        let cache = checker.get_all_statuses().unwrap();
 
         // Clean ファイルはキャッシュに含まれないため、フォールバックで Clean が返る
         let file_path = repo_path.join("tracked_clean.txt");
