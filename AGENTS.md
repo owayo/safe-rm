@@ -40,7 +40,7 @@ CLI引数パース → Config読込 → Git repo検出 → [Git status一括取�
 | `config.rs` | `~/.config/safe-rm/config.toml` の読込。`allowed_paths` と `allow_project_deletion` の管理 |
 | `error.rs` | `SafeRmError` enum（終了コード: 0=成功, 1=操作エラー, 2=セキュリティブロック）、`FileStatus` enum（`is_deletable()` メソッド付き） |
 | `path_checker.rs` | パス正規化、プロジェクトルート内包含検証、シンボリックリンク解決、非存在パスでも既存親を canonicalize して別名パス差異を吸収、ディレクトリトラバーサル防止 |
-| `git_checker.rs` | Git リポジトリ検出、ファイルステータス判定 (Clean/Modified/Staged/Untracked/Ignored/NotInRepo)、ディレクトリ再帰チェック（symlink非追従）。ワークディレクトリは構造体に canonicalize 済みでキャッシュし、`to_workdir_relative()` で canonical/未解決両方のパスに対応。`status_file()` が未追跡ディレクトリを畳み込むケースでは、再帰付き status 一覧で再確認してネストした未追跡ファイルを取りこぼさない。Git API エラー時は fail-closed で削除をブロック（`get_all_statuses` は `Result` を返し、`resolve_status_from_relative_path` は予期しないエラーで `Modified` を返す） |
+| `git_checker.rs` | Git リポジトリ検出、ファイルステータス判定 (Clean/Modified/Staged/Untracked/Ignored/NotInRepo)、ディレクトリ再帰チェック（symlink非追従）。ワークディレクトリは構造体に canonicalize 済みでキャッシュし、`to_workdir_relative()` で canonical/未解決両方のパスに対応。`status_file()` が未追跡ディレクトリを畳み込むケースでは、再帰付き status 一覧で再確認してネストした未追跡ファイルを取りこぼさない。Git API エラー時は fail-closed で削除をブロック（`get_all_statuses` は `Result` を返し、`resolve_status_from_relative_path` は予期しないエラーで `Modified` を返し、`lookup_status_in_listing` も `statuses()` 失敗時に `Modified` を返す） |
 | `init.rs` | `safe-rm init` によるデフォルト設定ファイル生成 |
 
 ### セキュリティモデル

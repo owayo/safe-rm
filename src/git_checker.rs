@@ -149,6 +149,8 @@ impl GitChecker {
     }
 
     /// status 一覧から相対パスに対応するステータスを検索
+    ///
+    /// Git API エラー時は fail-closed で Modified を返し、削除をブロックする。
     fn lookup_status_in_listing(&self, relative_path: &Path) -> Option<FileStatus> {
         let mut opts = StatusOptions::new();
         opts.include_untracked(true);
@@ -156,14 +158,18 @@ impl GitChecker {
         opts.include_ignored(true);
 
         let relative_path_key = Self::to_git_relative_key(relative_path);
-        if let Ok(statuses) = self.repo.statuses(Some(&mut opts)) {
-            for entry in statuses.iter() {
-                if let Some(entry_path) = entry.path() {
-                    if entry_path == relative_path_key {
-                        return Some(Self::convert_status(entry.status()));
+        match self.repo.statuses(Some(&mut opts)) {
+            Ok(statuses) => {
+                for entry in statuses.iter() {
+                    if let Some(entry_path) = entry.path() {
+                        if entry_path == relative_path_key {
+                            return Some(Self::convert_status(entry.status()));
+                        }
                     }
                 }
             }
+            // fail-closed: Git API エラー時は削除をブロック
+            Err(_) => return Some(FileStatus::Modified),
         }
 
         if self
