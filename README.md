@@ -409,8 +409,8 @@ cargo build --release
 
 ### Test Coverage
 
-- **Unit Tests**: 191 tests covering all modules (CLI, config, error, path_checker, git_checker, init) including fail-closed Git API error handling
-- **Integration Tests**: 97 tests with real Git repositories (allow/block flows, strict mode, symlinks, alias-path hardening including relative execution from symlink-alias cwd, batch operations, dry-run in strict mode, special filenames, force flag combined with dirty files, nested untracked directory blocking, dry-run + force combinations, empty directory handling, batch security error precedence, config combination tests, strict mode + force flag combinations, relative paths with `..` components, batch all-dirty exit code verification, allowed_paths directory self-deletion behavior, two-path batch exit code priority, symlink-to-directory non-recursive deletion, Git index corruption fail-closed verification)
+- **Unit Tests**: 198 tests covering all modules (CLI, config, error, path_checker, git_checker, init) including fail-closed Git API error handling, `FileStatus::is_deletable()` validation, config forward-compatibility, cache fallback behavior
+- **Integration Tests**: 103 tests with real Git repositories (allow/block flows, strict mode, symlinks, alias-path hardening including relative execution from symlink-alias cwd, batch operations, dry-run in strict mode, special filenames, force flag combined with dirty files, nested untracked directory blocking, dry-run + force combinations, empty directory handling, batch security error precedence, config combination tests, strict mode + force flag combinations, relative paths with `..` components, batch all-dirty exit code verification, allowed_paths directory self-deletion behavior, two-path batch exit code priority, symlink-to-directory non-recursive deletion, Git index corruption fail-closed verification, three-path batch exit code priority, dry-run filesystem non-modification guarantee, config edge cases)
 
 ## Contributing
 

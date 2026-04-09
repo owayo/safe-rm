@@ -3299,3 +3299,171 @@ mod git_error_fail_closed_tests {
         );
     }
 }
+
+// =============================================================================
+// バッチ処理の終了コード優先度テスト
+// =============================================================================
+
+mod batch_exit_code_priority_tests {
+    use super::*;
+
+    #[test]
+    fn test_batch_three_paths_security_error_takes_highest_priority() {
+        // 3パスバッチ: NotFound(1) + DirtyFiles(2) + Clean(0) → exit 2
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "clean.txt", "clean content");
+        fs::write(repo_path.join("dirty.txt"), "untracked content").unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        fs::write(&config_path, "allow_project_deletion = false\n").unwrap();
+
+        let (exit_code, stdout, _stderr) = run_safe_rm_with_config(
+            &["clean.txt", "dirty.txt", "nonexistent.txt"],
+            &repo_path,
+            Some(&config_path),
+        );
+
+        assert_eq!(
+            exit_code, 2,
+            "セキュリティエラー（exit 2）が最優先されるべき"
+        );
+        // clean.txt は削除されている
+        assert!(
+            stdout.contains("removed: clean.txt"),
+            "クリーンファイルは削除されるべき"
+        );
+    }
+
+    #[test]
+    fn test_batch_all_success_returns_zero() {
+        // 全パスが成功する場合は exit 0
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "file1.txt", "content1");
+        commit_file(&repo_path, "file2.txt", "content2");
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&["file1.txt", "file2.txt"], &repo_path);
+
+        assert_eq!(exit_code, 0, "全ファイル削除成功時は exit 0");
+        assert!(stdout.contains("removed: file1.txt"));
+        assert!(stdout.contains("removed: file2.txt"));
+        assert!(stderr.is_empty(), "エラー出力はない��き");
+    }
+}
+
+// =============================================================================
+// ドライランの詳細テスト
+// =============================================================================
+
+mod dry_run_detail_tests {
+    use super::*;
+
+    #[test]
+    fn test_dry_run_does_not_modify_filesystem() {
+        // ドライランでファイルが実際に削除されないことの厳密な検証
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "important.txt", "important data");
+        let file_path = repo_path.join("important.txt");
+        assert!(file_path.exists(), "テスト前提: ファイルが存在する");
+
+        let (exit_code, stdout, _) = run_safe_rm(&["-n", "important.txt"], &repo_path);
+
+        assert_eq!(exit_code, 0);
+        assert!(stdout.contains("would remove"));
+        assert!(file_path.exists(), "ドライラン後もファイルが残っているべき");
+        // ファイル内容も変更されていない
+        let content = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, "important data", "ファイル内容が変更されていない");
+    }
+
+    #[test]
+    fn test_dry_run_batch_shows_all_results() {
+        // バッチドライランで全パスの結果が表示される
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "a.txt", "a");
+        commit_file(&repo_path, "b.txt", "b");
+        commit_file(&repo_path, "c.txt", "c");
+
+        let (exit_code, stdout, _) = run_safe_rm(&["-n", "a.txt", "b.txt", "c.txt"], &repo_path);
+
+        assert_eq!(exit_code, 0);
+        assert!(stdout.contains("would remove: a.txt"));
+        assert!(stdout.contains("would remove: b.txt"));
+        assert!(stdout.contains("would remove: c.txt"));
+        // 全ファイルが残っている
+        assert!(repo_path.join("a.txt").exists());
+        assert!(repo_path.join("b.txt").exists());
+        assert!(repo_path.join("c.txt").exists());
+    }
+}
+
+// =============================================================================
+// 設定ファイルのエッジケーステスト
+// =============================================================================
+
+mod config_edge_case_tests {
+    use super::*;
+
+    #[test]
+    fn test_config_with_empty_allowed_paths_array() {
+        // allowed_paths が空配列の設定でも正常に動作
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "test.txt", "content");
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "allow_project_deletion = false\nallowed_paths = []\n",
+        )
+        .unwrap();
+
+        let (exit_code, stdout, _) =
+            run_safe_rm_with_config(&["test.txt"], &repo_path, Some(&config_path));
+
+        assert_eq!(exit_code, 0);
+        assert!(stdout.contains("removed: test.txt"));
+    }
+
+    #[test]
+    fn test_config_with_nonexistent_allowed_path_does_not_crash() {
+        // 存在しないディレクトリを allowed_paths に設定してもクラッシュしない
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "test.txt", "content");
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+allow_project_deletion = false
+
+[[allowed_paths]]
+path = "/nonexistent/path/that/does/not/exist"
+recursive = true
+"#,
+        )
+        .unwrap();
+
+        let (exit_code, _, _) =
+            run_safe_rm_with_config(&["test.txt"], &repo_path, Some(&config_path));
+
+        // test.txt はクリーンなので削除可能
+        assert_eq!(
+            exit_code, 0,
+            "存在しない allowed_paths でもクラッシュしない"
+        );
+    }
+}

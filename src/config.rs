@@ -977,4 +977,57 @@ recursive = true
         let result = Config::try_canonicalize(path);
         assert_eq!(result, path.to_path_buf());
     }
+
+    #[test]
+    fn test_parse_unknown_fields_are_ignored() {
+        // 将来の設定フィールド追加に対する前方互換性を検証
+        let toml_content = r#"
+allow_project_deletion = false
+unknown_future_field = "should be ignored"
+another_unknown = 42
+
+[[allowed_paths]]
+path = "/tmp/test"
+recursive = true
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(!config.allow_project_deletion);
+        assert_eq!(config.allowed_paths.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_strict_mode_only() {
+        // allow_project_deletion = false のみで allowed_paths なしの設定
+        let toml_content = "allow_project_deletion = false\n";
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(!config.allow_project_deletion);
+        assert!(config.allowed_paths.is_empty());
+    }
+
+    #[test]
+    fn test_is_path_allowed_no_match_among_entries() {
+        // 複数エントリがあるが、いずれにもマッチしないパスは拒否される
+        let tmp1 = tempfile::TempDir::new().unwrap();
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let canonical1 = tmp1.path().canonicalize().unwrap();
+        let canonical2 = tmp2.path().canonicalize().unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![
+                AllowedPathEntry {
+                    path: canonical1.to_string_lossy().to_string(),
+                    recursive: true,
+                },
+                AllowedPathEntry {
+                    path: canonical2.to_string_lossy().to_string(),
+                    recursive: false,
+                },
+            ],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        // どのエントリにもマッチしないパス
+        assert!(!config.is_path_allowed(Path::new("/completely/unrelated/path")));
+    }
 }

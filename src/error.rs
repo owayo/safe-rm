@@ -22,6 +22,16 @@ pub enum FileStatus {
     NotInRepo,
 }
 
+impl FileStatus {
+    /// ステータスが削除許可かどうかを判定
+    ///
+    /// Clean / Ignored / NotInRepo は安全に削除可能。
+    /// Modified / Staged / Untracked は未コミットの変更があるため削除不可。
+    pub fn is_deletable(self) -> bool {
+        matches!(self, Self::Clean | Self::Ignored | Self::NotInRepo)
+    }
+}
+
 impl fmt::Display for FileStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -285,14 +295,14 @@ mod tests {
     #[test]
     fn test_file_status_is_deletable() {
         // Clean / Ignored / NotInRepo は削除可能
-        assert!(matches!(FileStatus::Clean, FileStatus::Clean));
-        assert!(matches!(FileStatus::Ignored, FileStatus::Ignored));
-        assert!(matches!(FileStatus::NotInRepo, FileStatus::NotInRepo));
+        assert!(FileStatus::Clean.is_deletable());
+        assert!(FileStatus::Ignored.is_deletable());
+        assert!(FileStatus::NotInRepo.is_deletable());
 
         // Modified / Staged / Untracked は削除不可
-        assert!(!matches!(FileStatus::Modified, FileStatus::Clean));
-        assert!(!matches!(FileStatus::Staged, FileStatus::Clean));
-        assert!(!matches!(FileStatus::Untracked, FileStatus::Clean));
+        assert!(!FileStatus::Modified.is_deletable());
+        assert!(!FileStatus::Staged.is_deletable());
+        assert!(!FileStatus::Untracked.is_deletable());
     }
 
     // セキュリティ関連エラーのテスト

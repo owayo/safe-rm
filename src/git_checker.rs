@@ -213,10 +213,7 @@ impl GitChecker {
 
     /// ステータスが削除許可かどうかを判定
     pub fn is_deletable(status: FileStatus) -> bool {
-        matches!(
-            status,
-            FileStatus::Clean | FileStatus::Ignored | FileStatus::NotInRepo
-        )
+        status.is_deletable()
     }
 
     /// ファイルまたはディレクトリをチェック
@@ -1829,5 +1826,124 @@ mod tests {
         } else {
             panic!("DirtyFiles エラーが期待されたが異なるエラーが返された");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_path_symlink_to_file_treated_as_file() {
+        // ファイルへの symlink は is_real_directory() が false を返すので
+        // check_file パスで処理されることを検証
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "target.txt", "target content");
+        let link_path = repo_path.join("link_to_file.txt");
+        std::os::unix::fs::symlink(repo_path.join("target.txt"), &link_path).unwrap();
+
+        Command::new("git")
+            .args(["add", "link_to_file.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add symlink"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+
+        // symlink-to-file は check_file 経由で処理される
+        assert!(!GitChecker::is_real_directory(&link_path));
+        let result = checker.check_path(&link_path);
+        assert!(result.is_ok(), "コミット済み symlink は削除可能であるべき");
+    }
+
+    #[test]
+    fn test_check_directory_with_only_ignored_files() {
+        // .gitignore 対象ファイルのみ含むディレクトリは削除可能
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // .gitignore を設定
+        fs::write(repo_path.join(".gitignore"), "build/\n").unwrap();
+        Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add .gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // build/ ディレクトリにファイルを作成
+        let build_dir = repo_path.join("build");
+        fs::create_dir_all(&build_dir).unwrap();
+        fs::write(build_dir.join("output.bin"), "binary content").unwrap();
+        fs::write(build_dir.join("log.txt"), "build log").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let result = checker.check_directory(&build_dir);
+        assert!(
+            result.is_ok(),
+            "ignored ファイルのみ含むディレクトリは削除可能であるべき"
+        );
+    }
+
+    #[test]
+    fn test_get_file_status_from_cache_falls_back_correctly() {
+        // キャッシュにないファイルで、is_ignored_path の判定にフォールバックすることを検証
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // .gitignore を設定してコミット
+        fs::write(repo_path.join(".gitignore"), "*.log\n").unwrap();
+        Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add .gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // ignored ファイルを作成
+        fs::write(repo_path.join("debug.log"), "log data").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+
+        // 空のキャッシュで問い合わせ → フォールバックで正しくステータスを取得
+        let empty_cache = HashMap::new();
+        let status = checker.get_file_status_from_cache(&repo_path.join("debug.log"), &empty_cache);
+        assert_eq!(
+            status,
+            FileStatus::Ignored,
+            "空キャッシュでも ignored ファイルは正しく判定されるべき"
+        );
+    }
+
+    #[test]
+    fn test_check_file_with_cache_not_in_repo() {
+        // ワークディレクトリ外のパスを check_file_with_cache に渡すと DirtyFiles
+        // （NotInRepo は is_deletable なので Ok が返る）
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses().unwrap();
+
+        // リポジトリ外のパス
+        let outside_path = Path::new("/tmp/nonexistent_safe_rm_test_xyz");
+        let result = checker.check_file_with_cache(outside_path, &cache);
+        // NotInRepo は is_deletable = true なので Ok
+        assert!(
+            result.is_ok(),
+            "NotInRepo ステータスは削除可能として扱われるべき"
+        );
     }
 }
