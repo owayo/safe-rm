@@ -98,7 +98,7 @@ safe-rm -rf build/
 
 ## Configuration
 
-`safe-rm` supports an optional configuration file at `~/.config/safe-rm/config.toml`. You can also specify a custom config path via the `SAFE_RM_CONFIG` environment variable.
+`safe-rm` supports an optional configuration file at `~/.config/safe-rm/config.toml`. You can also specify a custom config path via the `SAFE_RM_CONFIG` environment variable. On Unix, the environment variable is read as a raw OS path so non-UTF-8 paths are preserved.
 
 ### Setup
 
@@ -409,7 +409,7 @@ cargo build --release
 
 ### Test Coverage
 
-- **Unit Tests**: 207 tests covering all modules (CLI, config, error, path_checker, git_checker, init) including fail-closed Git API error handling, `FileStatus::is_deletable()` validation, config forward-compatibility, cache fallback behavior, empty repository handling, broken symlink detection, multiple status type batch retrieval, cached ignored subdirectory checks
+- **Unit Tests**: 208 tests covering all modules (CLI, config, error, path_checker, git_checker, init) including fail-closed Git API error handling, `FileStatus::is_deletable()` validation, config forward-compatibility, `SAFE_RM_CONFIG` non-UTF-8 path handling on Unix, cache fallback behavior, empty repository handling, broken symlink detection, multiple status type batch retrieval, cached ignored subdirectory checks
 - **Integration Tests**: 110 tests with real Git repositories (allow/block flows, strict mode, symlinks, alias-path hardening including relative execution from symlink-alias cwd, batch operations, dry-run in strict mode, special filenames, force flag combined with dirty files, nested untracked directory blocking, dry-run + force combinations, empty directory handling, batch security error precedence, config combination tests, strict mode + force flag combinations, relative paths with `..` components, batch all-dirty exit code verification, allowed_paths directory self-deletion behavior, two-path batch exit code priority, symlink-to-directory non-recursive deletion, Git index corruption fail-closed verification, three-path batch exit code priority, dry-run filesystem non-modification guarantee, config edge cases, broken symlink handling in default/strict modes, empty repository strict mode, batch force flag combinations, allowed_paths dry-run annotations)
 
 ## Contributing

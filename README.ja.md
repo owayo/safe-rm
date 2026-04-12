@@ -98,7 +98,7 @@ safe-rm -rf build/
 
 ## 設定
 
-`safe-rm` は `~/.config/safe-rm/config.toml` にオプションの設定ファイルをサポートしています。`SAFE_RM_CONFIG` 環境変数でカスタムパスを指定することもできます。
+`safe-rm` は `~/.config/safe-rm/config.toml` にオプションの設定ファイルをサポートしています。`SAFE_RM_CONFIG` 環境変数でカスタムパスを指定することもできます。Unix ではこの環境変数を生の OS パスとして読み取るため、非 UTF-8 パスも保持されます。
 
 ### セットアップ
 
@@ -409,7 +409,7 @@ cargo build --release
 
 ### テストカバレッジ
 
-- **ユニットテスト**: 全モジュールをカバーする207件のテスト（CLI、config、error、path_checker、git_checker、init）。Git API エラー時の fail-closed 検証、`FileStatus::is_deletable()` 検証、設定の前方互換性、キャッシュフォールバック動作、空リポジトリ対応、壊れた symlink 検出、複数ステータスの一括取得、キャッシュ使用時の ignored サブディレクトリチェックを含む
+- **ユニットテスト**: 全モジュールをカバーする208件のテスト（CLI、config、error、path_checker、git_checker、init）。Git API エラー時の fail-closed 検証、`FileStatus::is_deletable()` 検証、設定の前方互換性、Unix における `SAFE_RM_CONFIG` の非 UTF-8 パス対応、キャッシュフォールバック動作、空リポジトリ対応、壊れた symlink 検出、複数ステータスの一括取得、キャッシュ使用時の ignored サブディレクトリチェックを含む
 - **統合テスト**: 実際のGitリポジトリを使用した110件のテスト（許可/ブロックフロー、厳格モード、シンボリックリンク、repo symlink 別名の cwd からの相対実行を含むエイリアスパス対策、バッチ処理、ドライラン厳格モード、特殊ファイル名、forceフラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト、strict mode + force フラグの複合テスト、`..` コンポーネントを含む相対パス検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース、壊れた symlink のデフォルト/厳格モード対応、空リポジトリ厳格モード、バッチ force フラグ複合、allowed_paths ドライラン注釈）
 
 ## コントリビューション

@@ -81,8 +81,9 @@ impl Config {
     /// XDG スタイルパス (~/.config/) を使用。
     ///
     /// SAFE_RM_CONFIG 環境変数が設定されている場合はそのパスを使用。
+    /// Unix では非 UTF-8 の値もあり得るため、OsString として受け取る。
     pub fn config_path() -> Option<PathBuf> {
-        if let Ok(path) = std::env::var("SAFE_RM_CONFIG") {
+        if let Some(path) = std::env::var_os("SAFE_RM_CONFIG") {
             return Some(PathBuf::from(path));
         }
         dirs::home_dir().map(|d| d.join(".config").join("safe-rm").join("config.toml"))
@@ -694,6 +695,20 @@ recursive = true
 
         let path = Config::config_path();
         assert_eq!(path, Some(PathBuf::from("/custom/path/config.toml")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_config_path_uses_non_utf8_env_var() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _env_lock = SAFE_RM_CONFIG_ENV_LOCK.lock().unwrap();
+        let raw_path = OsString::from_vec(b"/tmp/safe-rm-\xFF-config.toml".to_vec());
+        let expected = PathBuf::from(&raw_path);
+        let _env_guard = SafeRmConfigEnvGuard::set(&raw_path);
+
+        let path = Config::config_path();
+        assert_eq!(path, Some(expected));
     }
 
     #[test]
