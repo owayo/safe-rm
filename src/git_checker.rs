@@ -1952,4 +1952,196 @@ mod tests {
             "NotInRepo ステータスは削除可能として扱われるべき"
         );
     }
+
+    #[test]
+    fn test_get_all_statuses_empty_repo() {
+        // 初期コミットなしの空リポジトリでも get_all_statuses が正常動作する
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let statuses = checker.get_all_statuses().unwrap();
+
+        // 空リポジトリではファイルがないのでマップも空
+        assert!(
+            statuses.is_empty(),
+            "空リポジトリの get_all_statuses は空マップを返すべき"
+        );
+    }
+
+    #[test]
+    fn test_get_all_statuses_empty_repo_with_untracked() {
+        // 初期コミットなしの空リポジトリで未追跡ファイルがある場合
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        fs::write(repo_path.join("new_file.txt"), "content").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let statuses = checker.get_all_statuses().unwrap();
+
+        assert_eq!(
+            statuses.get("new_file.txt"),
+            Some(&FileStatus::Untracked),
+            "空リポジトリの未追跡ファイルも取得されるべき"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_get_file_status_broken_symlink() {
+        // リンク先が存在しない壊れた symlink のステータス
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        // 存在しないターゲットへの symlink を作成
+        let broken_link = repo_path.join("broken_link.txt");
+        std::os::unix::fs::symlink("/nonexistent/target", &broken_link).unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let status = checker.get_file_status(&broken_link);
+
+        // 壊れた symlink は未追跡ファイルとして扱われる
+        assert_eq!(
+            status,
+            FileStatus::Untracked,
+            "壊れた symlink は Untracked として扱われるべき"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_check_path_with_cache_broken_symlink() {
+        // 壊れた symlink のキャッシュベースチェック
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        let broken_link = repo_path.join("broken.txt");
+        std::os::unix::fs::symlink("/nonexistent", &broken_link).unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses().unwrap();
+
+        // 壊れた symlink は Untracked なので is_deletable = false
+        let result = checker.check_path_with_cache(&broken_link, &cache);
+        assert!(
+            result.is_err(),
+            "壊れた symlink（未追跡）は削除がブロックされるべき"
+        );
+    }
+
+    #[test]
+    fn test_get_file_status_from_cache_staged_file() {
+        // キャッシュ経由で Staged ファイルが正しく取得される
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        // 新規ファイルを作成して git add
+        let staged_file = repo_path.join("staged.txt");
+        fs::write(&staged_file, "staged content").unwrap();
+        Command::new("git")
+            .args(["add", "staged.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses().unwrap();
+
+        let status = checker.get_file_status_from_cache(&staged_file, &cache);
+        assert_eq!(
+            status,
+            FileStatus::Staged,
+            "キャッシュ経由でも Staged ファイルは正しく判定されるべき"
+        );
+    }
+
+    #[test]
+    fn test_check_directory_with_cache_ignored_subdir() {
+        // キャッシュ使用時に .gitignore 対象のサブディレクトリが早期許可される
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, ".gitignore", "build/\n");
+
+        let build_dir = repo_path.join("build");
+        fs::create_dir_all(&build_dir).unwrap();
+        fs::write(build_dir.join("output.bin"), "binary").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses().unwrap();
+        let result = checker.check_directory_with_cache(&build_dir, &cache);
+
+        assert!(
+            result.is_ok(),
+            "キャッシュ使用時も Ignored ディレクトリは削除可能であるべき"
+        );
+    }
+
+    #[test]
+    fn test_get_all_statuses_multiple_status_types() {
+        // 複数の異なるステータスが同時に正しく取得される
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, ".gitignore", "*.log\n");
+
+        // Clean ファイル（ステータスリストに含まれない）
+        commit_file(&repo_path, "clean.txt", "clean");
+
+        // Modified ファイル
+        commit_file(&repo_path, "modified.txt", "original");
+        fs::write(repo_path.join("modified.txt"), "changed").unwrap();
+
+        // Staged ファイル
+        let staged = repo_path.join("staged.txt");
+        fs::write(&staged, "staged").unwrap();
+        Command::new("git")
+            .args(["add", "staged.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // Untracked ファイル
+        fs::write(repo_path.join("new.txt"), "new").unwrap();
+
+        // Ignored ファイル
+        fs::write(repo_path.join("debug.log"), "log").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let statuses = checker.get_all_statuses().unwrap();
+
+        assert_eq!(statuses.get("modified.txt"), Some(&FileStatus::Modified));
+        assert_eq!(statuses.get("staged.txt"), Some(&FileStatus::Staged));
+        assert_eq!(statuses.get("new.txt"), Some(&FileStatus::Untracked));
+        assert_eq!(statuses.get("debug.log"), Some(&FileStatus::Ignored));
+        // Clean ファイルはステータスリストに含まれない
+        assert!(!statuses.contains_key("clean.txt"));
+    }
+
+    #[test]
+    fn test_is_real_directory_returns_true_for_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().join("subdir");
+        fs::create_dir(&dir).unwrap();
+
+        assert!(
+            GitChecker::is_real_directory(&dir),
+            "実ディレクトリに対して true を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_to_git_relative_key_empty_path() {
+        // 空パスの変換
+        let path = Path::new("");
+        let key = GitChecker::to_git_relative_key(path);
+        assert_eq!(key, "");
+    }
 }

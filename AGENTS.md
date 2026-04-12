@@ -62,8 +62,8 @@ CLI引数パース → Config読込 → Git repo検出 → [Git status一括取�
 
 ### テスト構成
 
-- **ユニットテスト**: 各モジュール内の `#[cfg(test)]` ブロック（パス検証、Git状態、Config解析、symlink削除、I/Oエラー、Git API エラー時の fail-closed 検証等）
-- **統合テスト**: `tests/integration_test.rs` - 実際のGitリポジトリを tempfile で作成してE2Eテスト。repo symlink 別名の cwd からの相対実行、単一失敗時の stderr 非重複、force フラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト（strict mode + allowed_paths、複数 allowed_paths エントリ）、strict mode + force フラグの複合テスト、相対パスの `..` コンポーネント検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース（空 allowed_paths 配列、存在しない allowed_paths ディレクトリ）も含めて検証
+- **ユニットテスト**: 各モジュール内の `#[cfg(test)]` ブロック（パス検証、Git状態、Config解析、symlink削除、I/Oエラー、Git API エラー時の fail-closed 検証、空リポジトリ対応、壊れた symlink 検出、複数ステータスの一括取得検証、キャッシュ使用時の ignored サブディレクトリチェック等）
+- **統合テスト**: `tests/integration_test.rs` - 実際のGitリポジトリを tempfile で作成してE2Eテスト。repo symlink 別名の cwd からの相対実行、単一失敗時の stderr 非重複、force フラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト（strict mode + allowed_paths、複数 allowed_paths エントリ）、strict mode + force フラグの複合テスト、相対パスの `..` コンポーネント検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース（空 allowed_paths 配列、存在しない allowed_paths ディレクトリ）、壊れた symlink のデフォルト/厳格モード対応、空リポジトリ厳格モード、バッチ force フラグ複合、allowed_paths ドライラン注釈も含めて検証
 
 ### バージョン体系
 

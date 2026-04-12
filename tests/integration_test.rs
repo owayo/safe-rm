@@ -3409,6 +3409,224 @@ mod dry_run_detail_tests {
 // 設定ファイルのエッジケーステスト
 // =============================================================================
 
+// =============================================================================
+// 壊れたシンボリックリンクのテスト
+// =============================================================================
+
+#[cfg(unix)]
+mod broken_symlink_tests {
+    use super::*;
+
+    #[test]
+    fn test_default_mode_broken_symlink_deletable() {
+        // デフォルトモード（allow_project_deletion=true）では壊れた symlink も削除可能
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        let broken_link = repo_path.join("broken_link.txt");
+        std::os::unix::fs::symlink("/nonexistent/target", &broken_link).unwrap();
+
+        let (exit_code, stdout, _) = run_safe_rm(&["broken_link.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "デフォルトモードでは壊れた symlink も削除可能"
+        );
+        assert!(stdout.contains("removed: broken_link.txt"));
+        assert!(
+            broken_link.symlink_metadata().is_err(),
+            "壊れた symlink が削除されているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_broken_symlink_blocked() {
+        // strict モード（allow_project_deletion=false）では壊れた symlink（未追跡）は削除不可
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        let broken_link = repo_path.join("broken_link.txt");
+        std::os::unix::fs::symlink("/nonexistent/target", &broken_link).unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        fs::write(&config_path, "allow_project_deletion = false\n").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["broken_link.txt"], &repo_path, Some(&config_path));
+
+        assert_eq!(
+            exit_code, 2,
+            "strict モードでは壊れた symlink（未追跡）の削除はブロックされるべき"
+        );
+        assert!(
+            stderr.contains("Untracked"),
+            "エラーメッセージに Untracked が含まれるべき"
+        );
+    }
+
+    #[test]
+    fn test_committed_broken_symlink_deletable_in_strict_mode() {
+        // strict モードでもコミット済みの壊れた symlink は削除可能
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        // 壊れた symlink を作成してコミット
+        let broken_link = repo_path.join("committed_broken.txt");
+        std::os::unix::fs::symlink("/nonexistent/target", &broken_link).unwrap();
+        std::process::Command::new("git")
+            .args(["add", "committed_broken.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "Add broken symlink"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        fs::write(&config_path, "allow_project_deletion = false\n").unwrap();
+
+        let (exit_code, stdout, _) =
+            run_safe_rm_with_config(&["committed_broken.txt"], &repo_path, Some(&config_path));
+
+        assert_eq!(
+            exit_code, 0,
+            "コミット済みの壊れた symlink は strict モードでも削除可能"
+        );
+        assert!(stdout.contains("removed: committed_broken.txt"));
+    }
+}
+
+// =============================================================================
+// allowed_paths のドライランテスト
+// =============================================================================
+
+mod allowed_paths_dry_run_tests {
+    use super::*;
+
+    #[test]
+    fn test_dry_run_with_allowed_paths_shows_config_message() {
+        // allowed_paths 経由のドライランで "(allowed by config)" が表示される
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        let allowed_dir = repo_path.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+        fs::write(allowed_dir.join("file.txt"), "content").unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"allow_project_deletion = false
+
+[[allowed_paths]]
+path = "{}"
+recursive = true
+"#,
+                allowed_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let (exit_code, stdout, _) = run_safe_rm_with_config(
+            &["-n", &format!("{}", allowed_dir.join("file.txt").display())],
+            &repo_path,
+            Some(&config_path),
+        );
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            stdout.contains("allowed by config"),
+            "allowed_paths 経由のドライランは '(allowed by config)' を表示すべき"
+        );
+    }
+}
+
+// =============================================================================
+// 空リポジトリの strict モードテスト
+// =============================================================================
+
+mod empty_repo_tests {
+    use super::*;
+
+    #[test]
+    fn test_strict_mode_empty_repo_untracked_file_blocked() {
+        // 初期コミットなしの空リポジトリで、strict モードの未追跡ファイル削除がブロックされる
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // コミットなしで直接ファイルを作成
+        fs::write(repo_path.join("new_file.txt"), "content").unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        fs::write(&config_path, "allow_project_deletion = false\n").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["new_file.txt"], &repo_path, Some(&config_path));
+
+        assert_eq!(
+            exit_code, 2,
+            "空リポジトリの strict モードでも未追跡ファイルはブロックされるべき"
+        );
+        assert!(stderr.contains("Untracked"));
+    }
+}
+
+// =============================================================================
+// バッチ処理の force フラグ複合テスト
+// =============================================================================
+
+mod batch_force_tests {
+    use super::*;
+
+    #[test]
+    fn test_batch_force_all_nonexistent_returns_zero() {
+        // --force で全ファイルが存在しない場合、成功（exit 0）
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        let (exit_code, stdout, stderr) = run_safe_rm(
+            &["-f", "missing1.txt", "missing2.txt", "missing3.txt"],
+            &repo_path,
+        );
+
+        assert_eq!(exit_code, 0, "全ファイル存在せず --force なら exit 0");
+        assert!(stdout.is_empty(), "存在しないファイルの出力はないべき");
+        assert!(stderr.is_empty(), "エラー出力もないべき");
+    }
+
+    #[test]
+    fn test_batch_force_mix_existing_and_nonexistent() {
+        // --force でexisting + nonexistent の混在
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "exists.txt", "content");
+
+        let (exit_code, stdout, _) = run_safe_rm(&["-f", "exists.txt", "missing.txt"], &repo_path);
+
+        assert_eq!(exit_code, 0, "混在しても --force で成功すべき");
+        assert!(stdout.contains("removed: exists.txt"));
+        assert!(!repo_path.join("exists.txt").exists());
+    }
+}
+
 mod config_edge_case_tests {
     use super::*;
 
