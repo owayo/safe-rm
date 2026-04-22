@@ -63,6 +63,8 @@ pub enum SafeRmError {
     DangerousOption { option: String },
     /// ディレクトリ読み取り失敗（fail-closed）
     DirectoryReadError { path: PathBuf },
+    /// Git 管理メタデータへのアクセス
+    ProtectedGitPath { path: PathBuf },
     /// プロジェクト外へのアクセス
     OutsideProject {
         path: PathBuf,
@@ -86,6 +88,7 @@ impl SafeRmError {
             Self::ShellExpansionDetected { .. }
             | Self::DangerousOption { .. }
             | Self::DirectoryReadError { .. }
+            | Self::ProtectedGitPath { .. }
             | Self::OutsideProject { .. }
             | Self::DirtyFiles { .. } => 2,
             // ファイル操作エラー
@@ -128,6 +131,12 @@ impl SafeRmError {
             Self::DirectoryReadError { path } => {
                 format!(
                     "ディレクトリの読み取りに失敗しました（安全のため削除をブロック）。\nPath: {}",
+                    path.display()
+                )
+            }
+            Self::ProtectedGitPath { path } => {
+                format!(
+                    "Git 管理メタデータは削除できません。\nPath: {}\n作業ツリーのファイルだけを指定してください。",
                     path.display()
                 )
             }
@@ -198,6 +207,13 @@ mod tests {
             SafeRmError::DirtyFiles {
                 path: PathBuf::from("./file.txt"),
                 status: FileStatus::Modified
+            }
+            .exit_code(),
+            2
+        );
+        assert_eq!(
+            SafeRmError::ProtectedGitPath {
+                path: PathBuf::from(".git")
             }
             .exit_code(),
             2
@@ -371,6 +387,16 @@ mod tests {
         let msg = err.user_message();
         assert!(msg.contains("/tmp/unreadable"));
         assert!(msg.contains("ディレクトリの読み取り"));
+    }
+
+    #[test]
+    fn test_user_message_protected_git_path() {
+        let err = SafeRmError::ProtectedGitPath {
+            path: PathBuf::from(".git"),
+        };
+        let msg = err.user_message();
+        assert!(msg.contains(".git"));
+        assert!(msg.contains("Git 管理メタデータ"));
     }
 
     // --- IoError / GitError 周りのテスト ---

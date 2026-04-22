@@ -149,6 +149,16 @@ fn process_path(
     } else {
         cwd.join(path)
     };
+    let normalized_path = abs_path.clean();
+
+    // Git 管理メタデータは設定より優先して常時ブロックする。
+    if let Some(checker) = git_checker {
+        if checker.is_git_metadata_path(&normalized_path) {
+            return Err(SafeRmError::ProtectedGitPath {
+                path: path.to_path_buf(),
+            });
+        }
+    }
 
     // allowed_paths 内のパスか確認（包含検証と Git チェックをバイパス）
     if config.is_path_allowed(&abs_path) {
@@ -185,7 +195,6 @@ fn process_path(
         // パスがプロジェクト内にあることを最初に検証（セキュリティチェック優先）
         // プロジェクト外のファイル存在情報の漏洩を防止
         let canonical_path = PathChecker::verify_containment_with_base(project_root, cwd, path)?;
-        let normalized_path = abs_path.clean();
 
         // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
         let metadata = match std::fs::symlink_metadata(&abs_path) {

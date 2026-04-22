@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-safe-rm は AI エージェント（Claude Code等）向けの安全なファイル削除プロキシ。Git状態を確認し、未コミットのファイル削除をブロックする Rust CLI ツール。
+safe-rm は AI エージェント（Claude Code等）向けの安全なファイル削除プロキシ。常時プロジェクト境界と Git 管理メタデータ（`.git` 等）を保護し、`allow_project_deletion = false` の厳格モードでは未コミットのファイル削除もブロックする Rust CLI ツール。
 
 ## Commands
 
@@ -28,7 +28,7 @@ cargo test --test integration_test <test_name>
 ### 実行フロー
 
 ```
-CLI引数パース → Config読込 → Git repo検出 → [Git status一括取得] → パス毎に処理 → 削除/ブロック
+CLI引数パース → Config読込 → Git repo検出 → [Git status一括取得] → [Git管理メタデータ保護] → パス毎に処理 → 削除/ブロック
 ```
 
 ### モジュール構成
@@ -45,12 +45,13 @@ CLI引数パース → Config読込 → Git repo検出 → [Git status一括取�
 
 ### セキュリティモデル
 
-1. **パス包含検証** (常時有効): プロジェクトルート外への削除をブロック
-2. **Git保護** (`allow_project_deletion = false` 時): Modified/Staged/Untracked ファイルの削除をブロック
-3. **allowed_paths**: 設定ファイルで指定したパスは全チェックをバイパス
-4. **Fail-Closed**: ディレクトリ読取エラーおよび Git API エラー時は削除をブロック（無視しない）
-5. **Symlink安全性**: Gitチェック時のディレクトリ判定は `symlink_metadata()` ベースで、ディレクトリsymlinkを辿らずリンク自体を評価
-6. **エイリアスパス耐性**: パス包含検証と `allowed_paths` 判定では、非存在パスでも既存親ディレクトリまで canonicalize して未作成部分を再結合し、repo symlink 別名や `/var` と `/private/var` 差異を吸収。Gitチェックでは非symlinkパスを canonicalize して比較し、symlink パスは「親ディレクトリのみ canonicalize + リンク名維持」で照合することでバイパスを防止（repo symlink 別名を cwd にした場合も含む）
+1. **Git管理メタデータ保護** (常時有効): `.git`、gitdir 参照ファイル、bare リポジトリ管理パスの削除をブロック
+2. **パス包含検証** (常時有効): プロジェクトルート外への削除をブロック
+3. **Git保護** (`allow_project_deletion = false` 時): Modified/Staged/Untracked ファイルの削除をブロック
+4. **allowed_paths**: 設定ファイルで指定したパスは包含チェックと Git ステータスチェックをバイパスするが、Git管理メタデータ保護はバイパスしない
+5. **Fail-Closed**: ディレクトリ読取エラーおよび Git API エラー時は削除をブロック（無視しない）
+6. **Symlink安全性**: Gitチェック時のディレクトリ判定は `symlink_metadata()` ベースで、ディレクトリsymlinkを辿らずリンク自体を評価
+7. **エイリアスパス耐性**: パス包含検証と `allowed_paths` 判定では、非存在パスでも既存親ディレクトリまで canonicalize して未作成部分を再結合し、repo symlink 別名や `/var` と `/private/var` 差異を吸収。Git管理メタデータ保護と Gitチェックでは非symlinkパスを canonicalize して比較し、symlink パスは「親ディレクトリのみ canonicalize + リンク名維持」で照合することでバイパスを防止（repo symlink 別名を cwd にした場合も含む）
 
 ### パフォーマンス最適化
 
@@ -62,8 +63,8 @@ CLI引数パース → Config読込 → Git repo検出 → [Git status一括取�
 
 ### テスト構成
 
-- **ユニットテスト**: 各モジュール内の `#[cfg(test)]` ブロック（パス検証、Git状態、Config解析、`SAFE_RM_CONFIG` の非 UTF-8 パス対応、symlink削除、I/Oエラー、Git API エラー時の fail-closed 検証、空リポジトリ対応、壊れた symlink 検出、複数ステータスの一括取得検証、キャッシュ使用時の ignored サブディレクトリチェック等）
-- **統合テスト**: `tests/integration_test.rs` - 実際のGitリポジトリを tempfile で作成してE2Eテスト。repo symlink 別名の cwd からの相対実行、単一失敗時の stderr 非重複、force フラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト（strict mode + allowed_paths、複数 allowed_paths エントリ）、strict mode + force フラグの複合テスト、相対パスの `..` コンポーネント検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース（空 allowed_paths 配列、存在しない allowed_paths ディレクトリ）、壊れた symlink のデフォルト/厳格モード対応、空リポジトリ厳格モード、バッチ force フラグ複合、allowed_paths ドライラン注釈も含めて検証
+- **ユニットテスト**: 各モジュール内の `#[cfg(test)]` ブロック（パス検証、Git状態、Config解析、`SAFE_RM_CONFIG` の非 UTF-8 パス対応、symlink削除、I/Oエラー、Git API エラー時の fail-closed 検証、Git管理メタデータ判定、空リポジトリ対応、壊れた symlink 検出、複数ステータスの一括取得検証、キャッシュ使用時の ignored サブディレクトリチェック等）
+- **統合テスト**: `tests/integration_test.rs` - 実際のGitリポジトリを tempfile で作成してE2Eテスト。repo symlink 別名の cwd からの相対実行、単一失敗時の stderr 非重複、force フラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト（strict mode + allowed_paths、複数 allowed_paths エントリ）、strict mode + force フラグの複合テスト、相対パスの `..` コンポーネント検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、Git管理メタデータの常時ブロック、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース（空 allowed_paths 配列、存在しない allowed_paths ディレクトリ）、壊れた symlink のデフォルト/厳格モード対応、空リポジトリ厳格モード、バッチ force フラグ複合、allowed_paths ドライラン注釈も含めて検証
 
 ### バージョン体系
 

@@ -44,6 +44,18 @@ impl GitChecker {
         self.workdir_canonical.clone()
     }
 
+    /// Git 管理メタデータ（`.git` や bare リポジトリ本体）へのパスか判定する。
+    ///
+    /// 通常のリポジトリでは `.git` ディレクトリとその配下を保護し、
+    /// bare リポジトリではリポジトリ全体を保護対象にする。
+    /// `.git` が gitdir ファイルの環境でも、そのファイル自体を削除できないようにする。
+    pub fn is_git_metadata_path(&self, path: &Path) -> bool {
+        let target = Self::try_canonicalize_existing_parent(path);
+        self.protected_git_roots()
+            .iter()
+            .any(|root| target.starts_with(root))
+    }
+
     /// 絶対パスからワークディレクトリ相対パスを取得
     ///
     /// canonicalize 済みパスと未解決パスの両方に対応し、
@@ -62,6 +74,50 @@ impl GitChecker {
             }
         }
         None
+    }
+
+    /// 削除を常時ブロックすべき Git 管理ディレクトリ/ファイルの一覧を返す。
+    fn protected_git_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![Self::try_canonicalize_existing_parent(self.repo.path())];
+
+        if let Some(workdir) = &self.workdir_canonical {
+            let displayed_git_entry = Self::try_canonicalize_existing_parent(&workdir.join(".git"));
+            if !roots.contains(&displayed_git_entry) {
+                roots.push(displayed_git_entry);
+            }
+        }
+
+        roots
+    }
+
+    /// 可能であれば canonicalize する。
+    /// 末尾が未作成で失敗した場合は、既存の親ディレクトリまで canonicalize してから
+    /// 未作成部分を再結合する。
+    fn try_canonicalize_existing_parent(path: &Path) -> PathBuf {
+        if let Ok(canonical) = path.canonicalize() {
+            return canonical;
+        }
+
+        let mut current = path;
+        let mut missing_segments = Vec::new();
+
+        while let Some(parent) = current.parent() {
+            if let Some(name) = current.file_name() {
+                missing_segments.push(name.to_os_string());
+            }
+
+            if let Ok(canonical_parent) = parent.canonicalize() {
+                let mut rebuilt = canonical_parent;
+                for segment in missing_segments.iter().rev() {
+                    rebuilt.push(segment);
+                }
+                return rebuilt;
+            }
+
+            current = parent;
+        }
+
+        path.to_path_buf()
     }
 
     /// 全ファイルのステータスを一括取得（バッチ処理用）
@@ -506,6 +562,36 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let checker = GitChecker::open(temp_dir.path());
         assert!(checker.is_none());
+    }
+
+    #[test]
+    fn test_is_git_metadata_path_blocks_dot_git_directory() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+
+        assert!(checker.is_git_metadata_path(&repo_path.join(".git")));
+        assert!(checker.is_git_metadata_path(&repo_path.join(".git").join("config")));
+        assert!(!checker.is_git_metadata_path(&repo_path.join("tracked.txt")));
+    }
+
+    #[test]
+    fn test_is_git_metadata_path_blocks_bare_repo_contents() {
+        let temp_dir = TempDir::new().unwrap();
+        let bare_repo_path = temp_dir.path().join("repo.git");
+
+        Command::new("git")
+            .args(["init", "--bare", bare_repo_path.to_str().unwrap()])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+
+        let checker = GitChecker::open(&bare_repo_path).unwrap();
+
+        assert!(checker.is_git_metadata_path(&bare_repo_path.join("HEAD")));
+        assert!(checker.is_git_metadata_path(&bare_repo_path.join("objects")));
     }
 
     // ファイルステータス判定のテスト

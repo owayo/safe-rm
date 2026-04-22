@@ -25,12 +25,13 @@
 
 ## Overview
 
-`safe-rm` is a CLI tool that prevents AI agents from accidentally deleting uncommitted work or files outside the project. It enforces **Git-aware access control** — only clean or ignored files within the project directory (Git repository root) can be deleted.
+`safe-rm` is a CLI tool that prevents AI agents from accidentally deleting files outside the project or critical Git metadata. By default it enforces project containment and blocks Git administrative paths such as `.git`. In **strict mode** (`allow_project_deletion = false`), it also enforces Git-aware access control and blocks deletion of modified, staged, or untracked files.
 
 ## Features
 
 - **Path Containment**: Block deletion of files outside project directory
-- **Git Status Protection**: Prevent deletion of modified, staged, or untracked files
+- **Strict-Mode Git Status Protection**: When `allow_project_deletion = false`, prevent deletion of modified, staged, or untracked files
+- **Git Metadata Protection**: Always block `.git`, gitdir indirection files, and bare-repository administrative paths
 - **Nested Untracked Protection**: Strict-mode checks also catch files inside untracked directories instead of treating them as outside Git
 - **Directory Traversal Prevention**: Block `../` escape attempts
 - **Ignored File Passthrough**: Allow deletion of `.gitignore`d files (build artifacts, etc.)
@@ -138,9 +139,9 @@ recursive = false
 
 ### Behavior
 
-- **`allow_project_deletion = true` (default)**: All files inside the project can be deleted without Git status checks. This is suitable for AI agents that need to freely delete files within their working project.
-- **`allow_project_deletion = false`**: Only clean (committed) or ignored files can be deleted. Uncommitted changes are protected.
-- Paths matching `allowed_paths` bypass both project containment and Git status checks. For nonexistent targets, the nearest existing parent is canonicalized so alias-path differences are still absorbed
+- **`allow_project_deletion = true` (default)**: Worktree files inside the project can be deleted without Git status checks. Git administrative paths such as `.git` are still blocked.
+- **`allow_project_deletion = false`**: Only clean (committed) or ignored worktree files can be deleted. Uncommitted changes are protected, and Git administrative paths are still blocked.
+- Paths matching `allowed_paths` bypass project containment and Git status checks, but they do **not** bypass Git metadata protection. For nonexistent targets, the nearest existing parent is canonicalized so alias-path differences are still absorbed
 - The `recursive` flag controls whether subdirectories are included:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` is allowed
   - `recursive = false`: Only `/path/to/dir/file.txt` is allowed (direct children)
@@ -164,7 +165,9 @@ safe-rm -r ~/.claude/skills/old-skill/
 
 ```mermaid
 flowchart TB
-    CLI[CLI Arguments] --> ConfigCheck{In allowed_paths?}
+    CLI[CLI Arguments] --> GitMetaCheck{Git metadata path?}
+    GitMetaCheck -->|Yes| Exit2[Exit 2 + stderr]
+    GitMetaCheck -->|No| ConfigCheck{In allowed_paths?}
     ConfigCheck -->|Yes| Delete[Delete File]
     ConfigCheck -->|No| PathCheck[Path Checker]
     PathCheck --> ProjectCheck{allow_project_deletion?}
@@ -172,17 +175,18 @@ flowchart TB
     ProjectCheck -->|false| GitCheck[Git Checker]
     GitCheck --> Result{Clean or Ignored?}
     Result -->|Yes| Delete
-    Result -->|No| Exit2[Exit 2 + stderr]
+    Result -->|No| Exit2
     Delete --> Exit0[Exit 0]
 ```
 
 ### Safety Layers
 
-1. **Path Containment**: Ensures all paths resolve within the project directory (Git repository root, or cwd if not a Git repo) (always enforced). For nonexistent targets, it canonicalizes the nearest existing parent to absorb alias differences (e.g. repo symlink alias, `/var` vs `/private/var`).
-2. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked), including files nested under untracked directories
-3. **Recursive Check**: For real directories, validates all contained files
-4. **Fail-Closed**: Any directory read failure (including entry iteration errors) or Git API error blocks deletion
-5. **Alias-Path Hardening**: Path containment and `allowed_paths` matching canonicalize the nearest existing parent and reattach missing segments, while Git checks canonicalize non-symlink paths and only parent directories for symlink paths, to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
+1. **Git Metadata Protection**: Always blocks `.git`, gitdir indirection files, and bare-repository administrative paths, even if config would otherwise allow deletion.
+2. **Path Containment**: Ensures all paths resolve within the project directory (Git repository root, or cwd if not a Git repo) (always enforced). For nonexistent targets, it canonicalizes the nearest existing parent to absorb alias differences (e.g. repo symlink alias, `/var` vs `/private/var`).
+3. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked), including files nested under untracked directories
+4. **Recursive Check**: For real directories, validates all contained files
+5. **Fail-Closed**: Any directory read failure (including entry iteration errors) or Git API error blocks deletion
+6. **Alias-Path Hardening**: Path containment and `allowed_paths` matching canonicalize the nearest existing parent and reattach missing segments, while Git checks canonicalize non-symlink paths and only parent directories for symlink paths, to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
 
 ### File System and Deletable Scope
 
@@ -201,7 +205,7 @@ flowchart TB
         skills["~/.claude/skills/**<br/>(allowed by config)"]
     end
 
-    subgraph project["Project Directory (git root) ✅ ALL DELETABLE"]
+    subgraph project["Project Directory (git root) ✅ Worktree files deletable"]
         modified["main.rs (modified)"]
         staged["new_feature.rs (staged)"]
         untracked["temp.txt (untracked)"]
@@ -221,6 +225,7 @@ flowchart TB
 | `main.rs` (modified) | ✅ Yes | Inside project (allow_project_deletion=true) |
 | `temp.txt` (untracked) | ✅ Yes | Inside project (allow_project_deletion=true) |
 | `~/.claude/skills/foo` | ✅ Yes | Allowed by config (recursive) |
+| `.git/` | ❌ No | Git administrative metadata is always protected |
 | `/etc/passwd` | ❌ No | Outside project directory |
 | `../other-project/` | ❌ No | Path traversal blocked |
 
@@ -265,6 +270,7 @@ flowchart TB
 | `target/` (ignored) | ✅ Yes | In `.gitignore`, build artifacts |
 | `node_modules/` (ignored) | ✅ Yes | In `.gitignore`, dependencies |
 | `~/.claude/skills/foo` | ✅ Yes | Allowed by config (recursive) |
+| `.git/` | ❌ No | Git administrative metadata is always protected |
 | `main.rs` (modified) | ❌ No | Uncommitted changes would be lost |
 | `new_feature.rs` (staged) | ❌ No | Pending commit would be lost |
 | `temp.txt` (untracked) | ❌ No | Not in Git history, unrecoverable |
@@ -273,9 +279,10 @@ flowchart TB
 
 **Key Points**:
 - Files outside the project are **always blocked**, regardless of settings
-- **Default mode (`allow_project_deletion = true`)**: All files inside the project can be deleted (ideal for AI agents)
-- **Strict mode (`allow_project_deletion = false`)**: Only clean (committed) or ignored files can be deleted
-- **Config allowed paths** bypass both containment and Git checks (supports `~` expansion)
+- Git administrative metadata such as `.git` is **always blocked**, regardless of settings
+- **Default mode (`allow_project_deletion = true`)**: Worktree files inside the project can be deleted (ideal for AI agents)
+- **Strict mode (`allow_project_deletion = false`)**: Only clean (committed) or ignored worktree files can be deleted
+- **Config allowed paths** bypass containment and Git-status checks, but not Git metadata protection (supports `~` expansion)
 
 ## Exit Codes
 

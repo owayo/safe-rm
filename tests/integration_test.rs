@@ -509,6 +509,28 @@ mod block_flow_tests {
     }
 
     #[test]
+    fn test_git_metadata_directory_blocked_in_strict_mode() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", ".git"], &repo_path, Some(config.path()));
+
+        assert_eq!(exit_code, 2, ".git の削除は常にブロックされるべき");
+        assert!(
+            stderr.contains("Git 管理メタデータ"),
+            "Git 管理メタデータの保護エラーが必要: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join(".git").exists(),
+            ".git ディレクトリは削除されてはならない"
+        );
+    }
+
+    #[test]
     fn test_outside_project_blocked() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
@@ -2661,6 +2683,29 @@ mod default_mode_security_tests {
         assert!(
             outside_subdir.exists(),
             "プロジェクト外のディレクトリは削除されていないべき"
+        );
+    }
+
+    #[test]
+    fn test_default_mode_still_blocks_git_metadata_directory() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let (exit_code, _, stderr) = run_safe_rm(&["-r", ".git"], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "デフォルトモードでも .git の削除はブロックされるべき"
+        );
+        assert!(
+            stderr.contains("Git 管理メタデータ"),
+            "Git 管理メタデータの保護エラーが必要: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join(".git").exists(),
+            ".git ディレクトリは削除されてはならない"
         );
     }
 }

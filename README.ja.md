@@ -25,12 +25,13 @@
 
 ## 概要
 
-`safe-rm` は、AIエージェントがコミットされていない作業やプロジェクト外のファイルを誤って削除することを防ぐCLIツールです。**Git対応のアクセス制御**を実施し、プロジェクトディレクトリ（Gitリポジトリルート）内のクリーンまたは無視されたファイルのみ削除を許可します。
+`safe-rm` は、AIエージェントがプロジェクト外のファイルや重要な Git 管理メタデータを誤って削除することを防ぐ CLI ツールです。デフォルトではプロジェクト境界を強制し、`.git` などの Git 管理パスをブロックします。**厳格モード**（`allow_project_deletion = false`）ではさらに Git 対応のアクセス制御を有効にし、変更済み・ステージング済み・未追跡ファイルの削除も防止します。
 
 ## 機能
 
 - **パス境界チェック**: プロジェクトディレクトリ外のファイル削除をブロック
-- **Gitステータス保護**: 変更済み、ステージング済み、未追跡ファイルの削除を防止
+- **厳格モードの Git ステータス保護**: `allow_project_deletion = false` のとき、変更済み・ステージング済み・未追跡ファイルの削除を防止
+- **Git 管理メタデータ保護**: `.git`、gitdir 参照ファイル、bare リポジトリの管理パスを常時ブロック
 - **ネストした未追跡ディレクトリ保護**: 厳格モードでは未追跡ディレクトリ配下のファイルも Git 管理外扱いにせず、正しく未追跡としてブロック
 - **ディレクトリトラバーサル防止**: `../` によるエスケープ試行をブロック
 - **無視ファイルの許可**: `.gitignore` で指定されたファイル（ビルド成果物など）の削除を許可
@@ -138,9 +139,9 @@ recursive = false
 
 ### 動作
 
-- **`allow_project_deletion = true`（デフォルト）**: プロジェクト内のすべてのファイルをGitステータスチェックなしで削除可能。作業プロジェクト内でファイルを自由に削除する必要があるAIエージェントに最適。
-- **`allow_project_deletion = false`**: クリーン（コミット済み）または無視されたファイルのみ削除可能。未コミットの変更は保護。
-- `allowed_paths` にマッチするパスは、プロジェクト境界チェックとGitステータスチェックの両方をバイパス。未作成パスでも既存親ディレクトリまで canonicalize して別名パス差異を吸収
+- **`allow_project_deletion = true`（デフォルト）**: プロジェクト内の作業ツリーファイルは Git ステータスチェックなしで削除可能。`.git` などの Git 管理パスは引き続きブロック。
+- **`allow_project_deletion = false`**: クリーン（コミット済み）または無視された作業ツリーファイルのみ削除可能。未コミットの変更は保護され、Git 管理パスも引き続きブロック。
+- `allowed_paths` にマッチするパスは、プロジェクト境界チェックと Git ステータスチェックをバイパスするが、Git 管理メタデータ保護はバイパスできない。未作成パスでも既存親ディレクトリまで canonicalize して別名パス差異を吸収
 - `recursive` フラグでサブディレクトリの扱いを制御:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可
   - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可
@@ -164,7 +165,9 @@ safe-rm -r ~/.claude/skills/old-skill/
 
 ```mermaid
 flowchart TB
-    CLI[CLI引数] --> ConfigCheck{allowed_paths内?}
+    CLI[CLI引数] --> GitMetaCheck{Git 管理パス?}
+    GitMetaCheck -->|Yes| Exit2[Exit 2 + stderr]
+    GitMetaCheck -->|No| ConfigCheck{allowed_paths内?}
     ConfigCheck -->|Yes| Delete[ファイル削除]
     ConfigCheck -->|No| PathCheck[パスチェッカー]
     PathCheck --> ProjectCheck{allow_project_deletion?}
@@ -172,17 +175,18 @@ flowchart TB
     ProjectCheck -->|false| GitCheck[Gitチェッカー]
     GitCheck --> Result{クリーンまたは無視?}
     Result -->|Yes| Delete
-    Result -->|No| Exit2[Exit 2 + stderr]
+    Result -->|No| Exit2
     Delete --> Exit0[Exit 0]
 ```
 
 ### 安全レイヤー
 
-1. **パス境界チェック**: すべてのパスがプロジェクトディレクトリ（Gitリポジトリルート、Git外の場合はcwd）内に解決されることを確認（常に有効）。存在しない削除対象でも、既存の親ディレクトリまで canonicalize して別名パス差異（repo symlink 別名、`/var` と `/private/var` など）を吸収。
-2. **Git保護**: `allow_project_deletion = false` の場合、ダーティファイル（変更済み/ステージング済み/未追跡）の削除をブロック。未追跡ディレクトリの深い階層にあるファイルも対象
-3. **再帰チェック**: 実ディレクトリの場合、含まれるすべてのファイルを検証
-4. **Fail-Closed**: ディレクトリ走査中のエラー（エントリ列挙エラーを含む）および Git API エラー時は削除をブロック
-5. **エイリアスパス対策**: 包含検証と `allowed_paths` 判定では既存親ディレクトリまで canonicalize して未作成部分を再結合し、Gitチェックでは非symlinkパスを canonicalize 比較し、symlink パスは「親ディレクトリのみ canonicalize + リンク自体を判定」することで、repo symlink 別名や `/var` と `/private/var` の差異による回避を防止
+1. **Git 管理メタデータ保護**: `.git`、gitdir 参照ファイル、bare リポジトリの管理パスは、設定に関係なく常に削除をブロック。
+2. **パス境界チェック**: すべてのパスがプロジェクトディレクトリ（Gitリポジトリルート、Git外の場合はcwd）内に解決されることを確認（常に有効）。存在しない削除対象でも、既存の親ディレクトリまで canonicalize して別名パス差異（repo symlink 別名、`/var` と `/private/var` など）を吸収。
+3. **Git保護**: `allow_project_deletion = false` の場合、ダーティファイル（変更済み/ステージング済み/未追跡）の削除をブロック。未追跡ディレクトリの深い階層にあるファイルも対象
+4. **再帰チェック**: 実ディレクトリの場合、含まれるすべてのファイルを検証
+5. **Fail-Closed**: ディレクトリ走査中のエラー（エントリ列挙エラーを含む）および Git API エラー時は削除をブロック
+6. **エイリアスパス対策**: 包含検証と `allowed_paths` 判定では既存親ディレクトリまで canonicalize して未作成部分を再結合し、Gitチェックでは非symlinkパスを canonicalize 比較し、symlink パスは「親ディレクトリのみ canonicalize + リンク自体を判定」することで、repo symlink 別名や `/var` と `/private/var` の差異による回避を防止
 
 ### ファイルシステムと削除可能スコープ
 
@@ -201,7 +205,7 @@ flowchart TB
         skills["~/.claude/skills/**<br/>(設定により許可)"]
     end
 
-    subgraph project["プロジェクトディレクトリ (git root) ✅ すべて削除可能"]
+    subgraph project["プロジェクトディレクトリ (git root) ✅ 作業ツリーファイルは削除可能"]
         modified["main.rs (変更済み)"]
         staged["new_feature.rs (ステージング済み)"]
         untracked["temp.txt (未追跡)"]
@@ -221,6 +225,7 @@ flowchart TB
 | `main.rs` (変更済み) | ✅ はい | プロジェクト内 (allow_project_deletion=true) |
 | `temp.txt` (未追跡) | ✅ はい | プロジェクト内 (allow_project_deletion=true) |
 | `~/.claude/skills/foo` | ✅ はい | 設定により許可（recursive） |
+| `.git/` | ❌ いいえ | Git 管理メタデータは常時保護 |
 | `/etc/passwd` | ❌ いいえ | プロジェクトディレクトリ外 |
 | `../other-project/` | ❌ いいえ | パストラバーサルをブロック |
 
@@ -265,6 +270,7 @@ flowchart TB
 | `target/` (無視) | ✅ はい | `.gitignore` に記載、ビルド成果物 |
 | `node_modules/` (無視) | ✅ はい | `.gitignore` に記載、依存関係 |
 | `~/.claude/skills/foo` | ✅ はい | 設定により許可（recursive） |
+| `.git/` | ❌ いいえ | Git 管理メタデータは常時保護 |
 | `main.rs` (変更済み) | ❌ いいえ | 未コミットの変更が失われる |
 | `new_feature.rs` (ステージング済み) | ❌ いいえ | コミット待ちの内容が失われる |
 | `temp.txt` (未追跡) | ❌ いいえ | Git履歴になく、復元不可能 |
@@ -273,9 +279,10 @@ flowchart TB
 
 **重要ポイント**:
 - プロジェクト外のファイルは**常にブロック**（設定に関係なく）
-- **デフォルトモード (`allow_project_deletion = true`)**: プロジェクト内のすべてのファイルが削除可能（AIエージェントに最適）
-- **厳格モード (`allow_project_deletion = false`)**: クリーン（コミット済み）または無視されたファイルのみ削除可能
-- **設定で許可されたパス**は境界チェックとGitチェックの両方をバイパス（`~` 展開対応）
+- `.git` などの Git 管理メタデータは**常にブロック**（設定に関係なく）
+- **デフォルトモード (`allow_project_deletion = true`)**: プロジェクト内の作業ツリーファイルは削除可能（AIエージェントに最適）
+- **厳格モード (`allow_project_deletion = false`)**: クリーン（コミット済み）または無視された作業ツリーファイルのみ削除可能
+- **設定で許可されたパス**は境界チェックと Git ステータスチェックをバイパスするが、Git 管理メタデータ保護はバイパスしない（`~` 展開対応）
 
 ## 終了コード
 
