@@ -152,8 +152,9 @@ fn process_path(
     let normalized_path = abs_path.clean();
 
     // Git 管理メタデータは設定より優先して常時ブロックする。
+    // リポジトリルートなど、配下に `.git` を含む再帰削除もここで拒否する。
     if let Some(checker) = git_checker {
-        if checker.is_git_metadata_path(&normalized_path) {
+        if checker.touches_git_metadata_path(&normalized_path) {
             return Err(SafeRmError::ProtectedGitPath {
                 path: path.to_path_buf(),
             });

@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_try_canonicalize_nonexistent_path() {
-        // 存在しないパスでも fallback でパスが返る
+        // 存在しないパスでもフォールバックでパスが返る
         let path = Path::new("/nonexistent/path/to/file.txt");
         let result = PathChecker::try_canonicalize(path);
         assert_eq!(result, path.to_path_buf());

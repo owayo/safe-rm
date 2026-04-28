@@ -56,6 +56,17 @@ impl GitChecker {
             .any(|root| target.starts_with(root))
     }
 
+    /// 指定パス自体または配下が Git 管理メタデータに触れるか判定する。
+    ///
+    /// `safe-rm -r .` のようにリポジトリルートを再帰削除すると、直接 `.git` を
+    /// 指定していなくても Git 管理メタデータが削除対象に含まれるためブロックする。
+    pub fn touches_git_metadata_path(&self, path: &Path) -> bool {
+        let target = Self::try_canonicalize_existing_parent(path);
+        self.protected_git_roots()
+            .iter()
+            .any(|root| target.starts_with(root) || root.starts_with(&target))
+    }
+
     /// 絶対パスからワークディレクトリ相対パスを取得
     ///
     /// canonicalize 済みパスと未解決パスの両方に対応し、
@@ -327,8 +338,15 @@ impl GitChecker {
             None => return FileStatus::NotInRepo,
         };
 
+        // ディレクトリ自体が .gitignore にマッチするかを直接チェックする。
+        // 配下の ignored ファイルだけでディレクトリ全体を ignored 扱いにしない。
+        if self.is_ignored_path(dir) {
+            return FileStatus::Ignored;
+        }
+
         // ディレクトリパスの末尾にスラッシュを追加して gitignore マッチング
-        let dir_pattern = format!("{}/", Self::to_git_relative_key(&relative_path));
+        let dir_key = Self::to_git_relative_key(&relative_path);
+        let dir_pattern = format!("{dir_key}/");
 
         let mut opts = StatusOptions::new();
         opts.pathspec(&dir_pattern);
@@ -336,15 +354,14 @@ impl GitChecker {
 
         if let Ok(statuses) = self.repo.statuses(Some(&mut opts)) {
             for entry in statuses.iter() {
-                if entry.status().contains(Status::IGNORED) {
+                let Some(entry_path) = entry.path() else {
+                    continue;
+                };
+                let entry_key = entry_path.trim_end_matches('/');
+                if entry_key == dir_key && entry.status().contains(Status::IGNORED) {
                     return FileStatus::Ignored;
                 }
             }
-        }
-
-        // ディレクトリが .gitignore にマッチするかを直接チェック
-        if self.is_ignored_path(dir) {
-            return FileStatus::Ignored;
         }
 
         FileStatus::Clean
@@ -575,6 +592,20 @@ mod tests {
         assert!(checker.is_git_metadata_path(&repo_path.join(".git")));
         assert!(checker.is_git_metadata_path(&repo_path.join(".git").join("config")));
         assert!(!checker.is_git_metadata_path(&repo_path.join("tracked.txt")));
+    }
+
+    #[test]
+    fn test_touches_git_metadata_path_blocks_repo_root() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+
+        assert!(checker.touches_git_metadata_path(&repo_path));
+        assert!(checker.touches_git_metadata_path(&repo_path.join(".git")));
+        assert!(checker.touches_git_metadata_path(&repo_path.join(".git").join("config")));
+        assert!(!checker.touches_git_metadata_path(&repo_path.join("tracked.txt")));
     }
 
     #[test]
@@ -1800,6 +1831,40 @@ mod tests {
     }
 
     #[test]
+    fn test_check_directory_with_ignored_and_untracked_file_blocks() {
+        // ignored ファイルが混在しても、ディレクトリ自体が ignored でなければ
+        // 未追跡ファイルを見落とさずブロックすることを確認
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, ".gitignore", "*.log\n");
+
+        let subdir = repo_path.join("logs");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::write(subdir.join("app.log"), "ignored log").unwrap();
+        fs::write(subdir.join("untracked.txt"), "new data").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let result = checker.check_directory(&subdir);
+        assert!(
+            result.is_err(),
+            "ignored ファイルと未追跡ファイルが混在するディレクトリはブロックされるべき"
+        );
+        if let Err(SafeRmError::DirtyFiles { status, .. }) = result {
+            assert_eq!(status, FileStatus::Untracked);
+        } else {
+            panic!("DirtyFiles エラーが期待されたが異なるエラーが返された");
+        }
+
+        let cache = checker.get_all_statuses().unwrap();
+        let cached_result = checker.check_directory_with_cache(&subdir, &cache);
+        assert!(
+            cached_result.is_err(),
+            "キャッシュ使用時も未追跡ファイルを見落としてはならない"
+        );
+    }
+
+    #[test]
     fn test_get_file_status_from_cache_returns_clean_for_tracked_file() {
         // キャッシュに含まれない追跡済みファイルは Clean を返すことを確認
         let temp_dir = create_test_repo();
@@ -1896,8 +1961,8 @@ mod tests {
 
     #[test]
     fn test_batch_exit_code_two_paths_mixed_errors() {
-        // 2パスのバッチで exit code 1 と exit code 2 が混在する場合のテスト
-        // check_file は DirtyFiles (exit 2) を返す
+        // 2パスのバッチで終了コード 1 と終了コード 2 が混在する場合のテスト
+        // check_file は DirtyFiles（終了コード 2）を返す
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
 

@@ -509,6 +509,37 @@ mod block_flow_tests {
     }
 
     #[test]
+    fn test_directory_with_ignored_and_untracked_file_blocked() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        commit_file(&repo_path, ".gitignore", "*.log\n");
+
+        let subdir = repo_path.join("logs");
+        fs::create_dir(&subdir).unwrap();
+        fs::write(subdir.join("app.log"), "ignored").unwrap();
+        fs::write(subdir.join("untracked.txt"), "untracked").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "logs"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "ignored ファイルが混在しても未追跡ファイルを含むディレクトリはブロックされるべき"
+        );
+        assert!(
+            stderr.contains("Untracked") || stderr.contains("未追跡"),
+            "未追跡ステータスのエラーが必要: {}",
+            stderr
+        );
+        assert!(
+            subdir.exists(),
+            "未追跡ファイルを含むディレクトリは削除されてはならない"
+        );
+    }
+
+    #[test]
     fn test_git_metadata_directory_blocked_in_strict_mode() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
@@ -1414,7 +1445,7 @@ mod allowed_paths_non_recursive_tests {
         let direct_file = allowed_path.join("direct.txt");
         fs::write(&direct_file, "direct child").unwrap();
 
-        // non-recursive 設定
+        // 非再帰設定
         let config = tempfile::NamedTempFile::new().unwrap();
         let config_content = format!(
             r#"
@@ -1459,7 +1490,7 @@ recursive = false
         let nested_file = nested_dir.join("nested.txt");
         fs::write(&nested_file, "nested child").unwrap();
 
-        // non-recursive 設定
+        // 非再帰設定
         let config = tempfile::NamedTempFile::new().unwrap();
         let config_content = format!(
             r#"
@@ -2065,7 +2096,7 @@ mod batch_tests {
             Some(config.path()),
         );
 
-        // exit code 2 を返す（セキュリティブロックを優先）
+        // 終了コード 2 を返す（セキュリティブロックを優先）
         assert_eq!(exit_code, 2, "Should exit with 2 due to dirty file");
         // clean ファイルは削除済みであるべき
         assert!(
@@ -2095,8 +2126,8 @@ mod batch_tests {
     fn test_batch_partial_success_with_strict_mode() {
         // allow_project_deletion=false で複数パスをバッチ処理した際、
         // clean ファイルは削除され、dirty ファイルはブロックされること。
-        // dirty ファイルのブロックはセキュリティエラー（exit code 2）となるため、
-        // 最終的な exit code は 2 が返る（セキュリティブロック優先）。
+        // dirty ファイルのブロックはセキュリティエラー（終了コード 2）となるため、
+        // 最終的な終了コードは 2 が返る（セキュリティブロック優先）。
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
         let config = create_strict_config();
@@ -2123,7 +2154,7 @@ mod batch_tests {
             Some(config.path()),
         );
 
-        // dirty ファイルがあるためセキュリティブロック（exit code 2）
+        // dirty ファイルがあるためセキュリティブロック（終了コード 2）
         assert_eq!(
             exit_code, 2,
             "dirty ファイルを含むバッチはセキュリティブロック（exit 2）で終了すべき. stderr: {}",
@@ -2708,6 +2739,34 @@ mod default_mode_security_tests {
             ".git ディレクトリは削除されてはならない"
         );
     }
+
+    #[test]
+    fn test_default_mode_blocks_project_root_recursive_deletion() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let (exit_code, _, stderr) = run_safe_rm(&["-r", "."], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "リポジトリルートの再帰削除は .git を含むためブロックされるべき"
+        );
+        assert!(
+            stderr.contains("Git 管理メタデータ"),
+            "Git 管理メタデータの保護エラーが必要: {}",
+            stderr
+        );
+        assert!(repo_path.exists(), "リポジトリルートは残っているべき");
+        assert!(
+            repo_path.join(".git").exists(),
+            ".git ディレクトリは削除されてはならない"
+        );
+        assert!(
+            repo_path.join("tracked.txt").exists(),
+            "作業ツリーファイルも削除されてはならない"
+        );
+    }
 }
 
 // =============================================================================
@@ -2859,7 +2918,7 @@ mod config_combination_tests {
         let allowed_file = allowed_canonical.join("test.txt");
         fs::write(&allowed_file, "allowed content").unwrap();
 
-        // strict mode + allowed_paths の組み合わせ
+        // 厳格モード + allowed_paths の組み合わせ
         let config = tempfile::NamedTempFile::new().unwrap();
         let config_content = format!(
             "allow_project_deletion = false\n\n[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n",
@@ -2915,7 +2974,7 @@ mod config_combination_tests {
         assert_eq!(exit_a, 0, "dir_a 内のファイルは削除可能であるべき");
         assert!(!file_a.exists(), "file_a が削除されているべき");
 
-        // dir_b の直下のファイル削除（non-recursive で直下は許可）
+        // dir_b の直下のファイル削除（非再帰で直下は許可）
         let (exit_b, _, _) =
             run_safe_rm_with_config(&[file_b.to_str().unwrap()], &repo_path, Some(config.path()));
         assert_eq!(exit_b, 0, "dir_b 直下のファイルは削除可能であるべき");
@@ -2924,7 +2983,7 @@ mod config_combination_tests {
 }
 
 // =============================================================================
-// strict mode + force フラグの複合テスト
+// 厳格モード + force フラグの複合テスト
 // =============================================================================
 
 mod strict_force_tests {
@@ -2961,7 +3020,7 @@ mod strict_force_tests {
         );
     }
 
-    /// force フラグ + strict mode で存在しないファイルは無視されることを検証
+    /// force フラグ + 厳格モードで存在しないファイルは無視されることを検証
     #[test]
     fn test_strict_mode_force_nonexistent_is_silent() {
         let temp_dir = create_test_repo();
@@ -2976,7 +3035,7 @@ mod strict_force_tests {
         assert_eq!(exit_code, 0, "force + 存在しないファイルは成功すべき");
     }
 
-    /// force + recursive + strict mode でダーティなディレクトリ内容がブロックされることを検証
+    /// force + recursive + 厳格モードでダーティなディレクトリ内容がブロックされることを検証
     #[test]
     fn test_strict_mode_force_recursive_blocks_dirty_directory() {
         let temp_dir = create_test_repo();
@@ -3055,7 +3114,7 @@ mod relative_path_tests {
 }
 
 // =============================================================================
-// strict mode でバッチ全ダーティのテスト
+// 厳格モードでバッチ全ダーティのテスト
 // =============================================================================
 
 mod batch_all_dirty_tests {
@@ -3158,7 +3217,39 @@ mod allowed_paths_directory_self_tests {
         );
     }
 
-    /// non-recursive allowed_paths で許可ディレクトリ自体は削除不可であることを検証
+    #[test]
+    fn test_allowed_paths_cannot_bypass_project_git_metadata_directory() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            "allow_project_deletion = false\n\n[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n",
+            repo_path.to_string_lossy()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "."], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "allowed_paths でも Git 管理メタデータを含む削除はブロックされるべき"
+        );
+        assert!(
+            stderr.contains("Git 管理メタデータ"),
+            "Git 管理メタデータの保護エラーが必要: {}",
+            stderr
+        );
+        assert!(repo_path.join(".git").exists(), ".git は残っているべき");
+        assert!(
+            repo_path.join("tracked.txt").exists(),
+            "作業ツリーファイルも削除されてはならない"
+        );
+    }
+
+    /// 非再帰 allowed_paths で許可ディレクトリ自体は削除不可であることを検証
     #[test]
     fn test_non_recursive_allowed_path_directory_itself_blocked() {
         let temp_dir = create_test_repo();
@@ -3175,7 +3266,7 @@ mod allowed_paths_directory_self_tests {
         );
         fs::write(config.path(), config_content).unwrap();
 
-        // non-recursive ではディレクトリ自体は直接の子ではないため allowed にマッチしない
+        // 非再帰ではディレクトリ自体は直接の子ではないため allowed にマッチしない
         let (exit_code, _, _) = run_safe_rm_with_config(
             &["-r", canonical_allowed.to_str().unwrap()],
             &repo_path,

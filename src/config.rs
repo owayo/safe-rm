@@ -567,19 +567,19 @@ path = "/tmp/dir"
             allowed_paths: vec![
                 AllowedPathEntry {
                     path: dir_a.to_string_lossy().to_string(),
-                    recursive: false, // only direct children
+                    recursive: false, // 直下の子のみ
                 },
                 AllowedPathEntry {
                     path: dir_b.to_string_lossy().to_string(),
-                    recursive: true, // all nested
+                    recursive: true, // ネストした子も含める
                 },
             ],
             ..Default::default()
         };
         config.resolve_allowed_paths();
 
-        assert!(config.is_path_allowed(&file_a)); // direct child of dir_a
-        assert!(config.is_path_allowed(&nested_b)); // nested in dir_b (recursive)
+        assert!(config.is_path_allowed(&file_a)); // dir_a の直下の子
+        assert!(config.is_path_allowed(&nested_b)); // dir_b 配下のネストした子（recursive）
         assert!(!config.is_path_allowed(&tmp_dir.path().join("dir-c").join("file.txt")));
     }
 
@@ -848,7 +848,7 @@ recursive = true
         };
         config.resolve_allowed_paths();
 
-        // non-recursive ではディレクトリ自体は parent チェックで一致しない
+        // 非再帰ではディレクトリ自体は parent チェックで一致しない
         assert!(
             !config.is_path_allowed(&allowed_dir),
             "許可ディレクトリ自体は recursive=false の場合に許可されないべき"
