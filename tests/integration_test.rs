@@ -2247,6 +2247,36 @@ mod partial_failure_tests {
     }
 
     #[test]
+    fn test_partial_failure_dry_run_uses_would_be_removed_phrase() {
+        // ドライランの部分失敗時、サマリーは「removed」ではなく
+        // 「would be removed」と表示する（実際には削除していないため）
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "exists.txt", "content");
+
+        let (exit_code, _stdout, stderr) =
+            run_safe_rm(&["-n", "exists.txt", "missing.txt"], &repo_path);
+
+        assert_eq!(exit_code, 1, "dry-run の部分失敗は exit 1");
+        assert!(
+            stderr.contains("would be removed"),
+            "ドライランは would be removed を含むべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            !stderr.contains("file(s) removed,"),
+            "ドライランは removed メッセージを使わないべき。stderr: {}",
+            stderr
+        );
+        // ドライランなのでファイルは残っているべき
+        assert!(
+            repo_path.join("exists.txt").exists(),
+            "ドライランでは実際の削除をしないべき"
+        );
+    }
+
+    #[test]
     fn test_partial_failure_mix_success_and_not_found() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
@@ -3760,6 +3790,178 @@ mod batch_force_tests {
         assert_eq!(exit_code, 0, "混在しても --force で成功すべき");
         assert!(stdout.contains("removed: exists.txt"));
         assert!(!repo_path.join("exists.txt").exists());
+    }
+}
+
+// =============================================================================
+// シンボリックリンクと `..` を組み合わせた脱出攻撃のテスト
+// =============================================================================
+//
+// `link/../victim.txt` のように、シンボリックリンク経由で `..` を辿ると
+// OS は path resolution の途中でリンク先に飛ぶため、
+// 字句的 clean ベースのプロジェクト境界判定をすり抜ける可能性がある。
+// 削除対象パスは正規化済み（cleaned）パスを使う必要がある。
+mod symlink_dotdot_traversal_tests {
+    use super::*;
+
+    #[test]
+    fn test_symlink_dotdot_traversal_blocked() {
+        // repo 内の symlink (ディレクトリ) を経由して `..` で
+        // プロジェクト外のファイルを削除しようとするケースをブロックする
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        // プロジェクト外ディレクトリと、その中に被害者ファイル
+        let outside_dir = TempDir::new().unwrap();
+        let outside_canonical = outside_dir.path().canonicalize().unwrap();
+        let outside_sub = outside_canonical.join("sub");
+        fs::create_dir_all(&outside_sub).unwrap();
+        let victim = outside_canonical.join("victim.txt");
+        fs::write(&victim, "do not delete").unwrap();
+
+        // repo 内に outside_sub への symlink を作成
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_sub, repo_path.join("link")).unwrap();
+        #[cfg(not(unix))]
+        return; // Unix のみ対応
+
+        // `link/../victim.txt` を削除しようとする
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["link/../victim.txt"], &repo_path);
+
+        // 包含チェックの仕様としては「字句的 clean → repo/victim.txt」となり、
+        // repo/victim.txt は存在しないため NotFound (exit 1) になる、もしくは
+        // 包含検証で OutsideProject (exit 2) になるべき。
+        // どちらにしても、プロジェクト外の victim.txt を削除してはならない。
+        assert_ne!(
+            exit_code, 0,
+            "symlink/.. による脱出は許してはならない: stderr 不要"
+        );
+        assert!(
+            victim.exists(),
+            "プロジェクト外の victim.txt を削除してはならない"
+        );
+    }
+
+    #[test]
+    fn test_symlink_dotdot_traversal_with_force_blocked() {
+        // --force でも symlink/.. による脱出は許可されない
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let outside_dir = TempDir::new().unwrap();
+        let outside_canonical = outside_dir.path().canonicalize().unwrap();
+        let outside_sub = outside_canonical.join("sub");
+        fs::create_dir_all(&outside_sub).unwrap();
+        let victim = outside_canonical.join("victim.txt");
+        fs::write(&victim, "do not delete").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_sub, repo_path.join("link")).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        // --force を付けても削除されてはならない
+        let (_exit_code, _stdout, _stderr) = run_safe_rm(&["-f", "link/../victim.txt"], &repo_path);
+
+        assert!(
+            victim.exists(),
+            "--force でも symlink/.. による脱出を許してはならない"
+        );
+    }
+}
+
+// =============================================================================
+// ネストした Git リポジトリのメタデータ保護テスト
+// =============================================================================
+//
+// 親（外側）の Git リポジトリから内側の `.git` を削除したり、
+// 非 Git ディレクトリ配下のリポジトリの `.git` を削除する操作はブロックされるべき。
+mod nested_git_metadata_tests {
+    use super::*;
+
+    /// `git init` で簡易リポジトリを初期化
+    fn init_repo(path: &std::path::Path) {
+        Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_non_git_parent_blocks_child_repo_dot_git_deletion() {
+        // 非 Git ディレクトリ直下のリポジトリの `.git` を直接削除しようとする
+        let parent = TempDir::new().unwrap();
+        let parent_canonical = parent.path().canonicalize().unwrap();
+        let child_repo = parent_canonical.join("repo");
+        fs::create_dir_all(&child_repo).unwrap();
+        init_repo(&child_repo);
+
+        // 非 Git の parent から `repo/.git` を再帰削除
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["-r", "repo/.git"], &parent_canonical);
+
+        // .git の削除は常に拒否されるべき
+        assert_ne!(
+            exit_code, 0,
+            "非 Git 親からでも子リポジトリの .git 削除は拒否されるべき"
+        );
+        assert!(
+            child_repo.join(".git").exists(),
+            ".git ディレクトリは保持されるべき"
+        );
+    }
+
+    #[test]
+    fn test_nested_repo_recursive_delete_blocked_by_inner_git() {
+        // 外側 repo から内側 repo を再帰削除すると、内側 .git も削除対象になる
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        commit_file(&outer_path, "outer.txt", "outer");
+
+        let nested = outer_path.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        init_repo(&nested);
+
+        // 外側 repo から `nested` を再帰削除
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["-r", "nested"], &outer_path);
+
+        assert_ne!(
+            exit_code, 0,
+            "ネストした repo の再帰削除は配下の .git のため拒否されるべき"
+        );
+        assert!(nested.join(".git").exists(), "内側の .git は保護されるべき");
+    }
+
+    #[test]
+    fn test_nested_repo_dot_git_direct_delete_blocked() {
+        // 外側 repo から内側 .git を直接指定して削除しようとする
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        commit_file(&outer_path, "outer.txt", "outer");
+
+        let nested = outer_path.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        init_repo(&nested);
+
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["-r", "nested/.git"], &outer_path);
+
+        assert_ne!(
+            exit_code, 0,
+            "外側 repo からでも内側 .git の削除は拒否されるべき"
+        );
+        assert!(nested.join(".git").exists(), "内側の .git は保護されるべき");
     }
 }
 

@@ -126,6 +126,7 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
             Err(SafeRmError::PartialFailure {
                 success: success_count,
                 failed: error_count,
+                dry_run: args.dry_run,
             })
         }
     } else {
@@ -149,10 +150,22 @@ fn process_path(
     } else {
         cwd.join(path)
     };
+    // 字句的に `..` を解決した正規化パス。
+    // OS の path resolution は symlink を辿った後で `..` を解決するため、
+    // ユーザー入力をそのまま OS に渡すと `link/../victim` のような形で
+    // プロジェクト境界を脱出される恐れがある。
+    // 以降のメタデータ取得・削除・許可判定はすべて clean 済みパスで行う。
     let normalized_path = abs_path.clean();
 
     // Git 管理メタデータは設定より優先して常時ブロックする。
-    // リポジトリルートなど、配下に `.git` を含む再帰削除もここで拒否する。
+    // (1) 任意階層の `.git` ファイル/ディレクトリ自身、および再帰削除時に
+    //     その配下に存在する `.git` を保護する（ネストしたリポジトリ対応）。
+    if GitChecker::path_targets_or_contains_git_metadata(&normalized_path, args.recursive) {
+        return Err(SafeRmError::ProtectedGitPath {
+            path: path.to_path_buf(),
+        });
+    }
+    // (2) 現在のリポジトリの Git 管理メタデータも保護する。
     if let Some(checker) = git_checker {
         if checker.touches_git_metadata_path(&normalized_path) {
             return Err(SafeRmError::ProtectedGitPath {
@@ -162,15 +175,15 @@ fn process_path(
     }
 
     // allowed_paths 内のパスか確認（包含検証と Git チェックをバイパス）
-    if config.is_path_allowed(&abs_path) {
+    if config.is_path_allowed(&normalized_path) {
         // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
-        let metadata = match std::fs::symlink_metadata(&abs_path) {
+        let metadata = match std::fs::symlink_metadata(&normalized_path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if args.force {
                     return Ok(false);
                 } else {
-                    return Err(SafeRmError::NotFound(abs_path));
+                    return Err(SafeRmError::NotFound(normalized_path));
                 }
             }
             Err(e) => return Err(SafeRmError::IoError(e)),
@@ -178,7 +191,7 @@ fn process_path(
 
         // ディレクトリに -r フラグがない場合はエラー
         if metadata.is_dir() && !args.recursive {
-            return Err(SafeRmError::IsDirectory(abs_path));
+            return Err(SafeRmError::IsDirectory(normalized_path));
         }
 
         // 削除実行（またはドライラン）— 包含検証と Git チェックをスキップ
@@ -186,7 +199,7 @@ fn process_path(
             println!("would remove: {} (allowed by config)", path.display());
             Ok(true)
         } else {
-            delete_path_with_metadata(&abs_path, args.recursive, &metadata)?;
+            delete_path_with_metadata(&normalized_path, args.recursive, &metadata)?;
             println!("removed: {} (allowed by config)", path.display());
             Ok(true)
         }
@@ -198,13 +211,13 @@ fn process_path(
         let canonical_path = PathChecker::verify_containment_with_base(project_root, cwd, path)?;
 
         // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
-        let metadata = match std::fs::symlink_metadata(&abs_path) {
+        let metadata = match std::fs::symlink_metadata(&normalized_path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if args.force {
                     return Ok(false);
                 } else {
-                    return Err(SafeRmError::NotFound(abs_path));
+                    return Err(SafeRmError::NotFound(normalized_path));
                 }
             }
             Err(e) => return Err(SafeRmError::IoError(e)),
@@ -212,7 +225,7 @@ fn process_path(
 
         // ディレクトリに -r フラグがない場合はエラー
         if metadata.is_dir() && !args.recursive {
-            return Err(SafeRmError::IsDirectory(abs_path));
+            return Err(SafeRmError::IsDirectory(normalized_path));
         }
 
         // 事前取得キャッシュを使用して Git ステータスをチェック（バッチ最適化）
@@ -248,7 +261,7 @@ fn process_path(
             println!("would remove: {}", path.display());
             Ok(true)
         } else {
-            delete_path_with_metadata(&abs_path, args.recursive, &metadata)?;
+            delete_path_with_metadata(&normalized_path, args.recursive, &metadata)?;
             println!("removed: {}", path.display());
             Ok(true)
         }

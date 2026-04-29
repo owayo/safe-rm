@@ -53,8 +53,12 @@ pub enum SafeRmError {
     NotFound(PathBuf),
     /// ディレクトリに -r フラグなし
     IsDirectory(PathBuf),
-    /// 部分的な失敗
-    PartialFailure { success: usize, failed: usize },
+    /// 部分的な失敗（dry_run=true の場合は実削除ではないため表示文言を変える）
+    PartialFailure {
+        success: usize,
+        failed: usize,
+        dry_run: bool,
+    },
 
     // ブロックエラー（Exit 2）
     /// シェル展開を含むパス（セキュリティリスク）
@@ -113,8 +117,17 @@ impl SafeRmError {
                     path.display()
                 )
             }
-            Self::PartialFailure { success, failed } => {
-                format!("{} file(s) removed, {} failed", success, failed)
+            Self::PartialFailure {
+                success,
+                failed,
+                dry_run,
+            } => {
+                let verb = if *dry_run {
+                    "would be removed"
+                } else {
+                    "removed"
+                };
+                format!("{} file(s) {}, {} failed", success, verb, failed)
             }
             Self::ShellExpansionDetected { path, pattern } => {
                 format!(
@@ -233,7 +246,8 @@ mod tests {
         assert_eq!(
             SafeRmError::PartialFailure {
                 success: 2,
-                failed: 1
+                failed: 1,
+                dry_run: false,
             }
             .exit_code(),
             1
@@ -262,6 +276,7 @@ mod tests {
         let err = SafeRmError::PartialFailure {
             success: 3,
             failed: 2,
+            dry_run: false,
         };
         let msg = err.user_message();
         assert!(msg.contains("3 file(s) removed"));
@@ -515,11 +530,33 @@ mod tests {
     }
 
     #[test]
+    fn test_user_message_partial_failure_dry_run() {
+        // dry_run=true の場合は "would be removed" 表記になること
+        let err = SafeRmError::PartialFailure {
+            success: 2,
+            failed: 1,
+            dry_run: true,
+        };
+        let msg = err.user_message();
+        assert!(
+            msg.contains("would be removed"),
+            "ドライラン時は would be removed 表記にすべき: {}",
+            msg
+        );
+        assert!(
+            !msg.contains(", removed"),
+            "removed は使わないべき: {}",
+            msg
+        );
+    }
+
+    #[test]
     fn test_exit_code_partial_failure_returns_1() {
         // PartialFailure の終了コードが 1 であることを検証
         let err = SafeRmError::PartialFailure {
             success: 5,
             failed: 3,
+            dry_run: false,
         };
         assert_eq!(err.exit_code(), 1);
     }

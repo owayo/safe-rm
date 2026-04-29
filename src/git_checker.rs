@@ -67,6 +67,66 @@ impl GitChecker {
             .any(|root| target.starts_with(root) || root.starts_with(&target))
     }
 
+    /// 削除対象パス自体、または再帰削除時にその配下に `.git` が含まれるかを判定する。
+    ///
+    /// safe-rm を実行している現在のリポジトリと無関係でも、任意階層の Git 管理
+    /// メタデータの削除を常に拒否する。シンボリックリンクは辿らず、リンク自身を
+    /// 評価することで、リンク経由の脱出も防ぐ。
+    /// I/O エラー時は fail-open（保護対象外）として扱い、後段の包含検証や
+    /// Git ステータスチェックに判断を委ねる。
+    pub fn path_targets_or_contains_git_metadata(path: &Path, recursive: bool) -> bool {
+        let dot_git = std::ffi::OsStr::new(".git");
+
+        // 末尾コンポーネントが `.git` の場合は常時ブロック（ファイル/ディレクトリ問わず）
+        if path.file_name() == Some(dot_git) {
+            return true;
+        }
+
+        if !recursive {
+            return false;
+        }
+
+        // 再帰削除でも、対象が通常ディレクトリでなければ配下に `.git` は存在しない
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return false;
+        }
+
+        Self::contains_dot_git_recursive(path)
+    }
+
+    /// 指定ディレクトリ配下に `.git` ファイル/ディレクトリが存在するかを再帰的に確認する。
+    ///
+    /// `fs::remove_dir_all` と同様にシンボリックリンクは辿らない。
+    fn contains_dot_git_recursive(dir: &Path) -> bool {
+        let dot_git = std::ffi::OsStr::new(".git");
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+
+        for entry in entries.flatten() {
+            if entry.file_name() == dot_git {
+                return true;
+            }
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() && !file_type.is_symlink() {
+                let entry_path = entry.path();
+                if Self::contains_dot_git_recursive(&entry_path) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// 絶対パスからワークディレクトリ相対パスを取得
     ///
     /// canonicalize 済みパスと未解決パスの両方に対応し、
@@ -606,6 +666,141 @@ mod tests {
         assert!(checker.touches_git_metadata_path(&repo_path.join(".git")));
         assert!(checker.touches_git_metadata_path(&repo_path.join(".git").join("config")));
         assert!(!checker.touches_git_metadata_path(&repo_path.join("tracked.txt")));
+    }
+
+    // path_targets_or_contains_git_metadata のテスト
+
+    #[test]
+    fn test_path_targets_dot_git_directly() {
+        // `.git` ファイル/ディレクトリ自身は recursive フラグに関わらず常時ブロック
+        let temp_dir = TempDir::new().unwrap();
+        let dot_git = temp_dir.path().join(".git");
+        fs::create_dir_all(&dot_git).unwrap();
+
+        assert!(GitChecker::path_targets_or_contains_git_metadata(
+            &dot_git, false
+        ));
+        assert!(GitChecker::path_targets_or_contains_git_metadata(
+            &dot_git, true
+        ));
+    }
+
+    #[test]
+    fn test_path_targets_dot_git_file() {
+        // `.git` という名前のファイル（gitlink 等）も保護対象
+        let temp_dir = TempDir::new().unwrap();
+        let dot_git_file = temp_dir.path().join(".git");
+        fs::write(&dot_git_file, "gitdir: /tmp/elsewhere").unwrap();
+
+        assert!(GitChecker::path_targets_or_contains_git_metadata(
+            &dot_git_file,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_path_targets_non_git_path_not_recursive() {
+        // 通常のファイルは保護対象外
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("regular.txt");
+        fs::write(&file, "content").unwrap();
+
+        assert!(!GitChecker::path_targets_or_contains_git_metadata(
+            &file, false
+        ));
+    }
+
+    #[test]
+    fn test_path_targets_dir_with_dot_git_recursive() {
+        // 配下に `.git` を含むディレクトリは recursive=true 時のみブロック
+        let temp_dir = TempDir::new().unwrap();
+        let nested = temp_dir.path().join("nested");
+        let dot_git = nested.join(".git");
+        fs::create_dir_all(&dot_git).unwrap();
+
+        assert!(GitChecker::path_targets_or_contains_git_metadata(
+            &nested, true
+        ));
+        // recursive=false なら配下は探索しない
+        assert!(!GitChecker::path_targets_or_contains_git_metadata(
+            &nested, false
+        ));
+    }
+
+    #[test]
+    fn test_path_targets_deeply_nested_dot_git() {
+        // 深くネストされた `.git` も recursive=true で検出
+        let temp_dir = TempDir::new().unwrap();
+        let deep = temp_dir.path().join("a").join("b").join("c");
+        let dot_git = deep.join(".git");
+        fs::create_dir_all(&dot_git).unwrap();
+
+        assert!(GitChecker::path_targets_or_contains_git_metadata(
+            temp_dir.path(),
+            true
+        ));
+    }
+
+    #[test]
+    fn test_path_targets_dir_without_dot_git() {
+        // 配下に `.git` がないディレクトリは保護対象外
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().join("no_git_here");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("regular.txt"), "content").unwrap();
+
+        assert!(!GitChecker::path_targets_or_contains_git_metadata(
+            &dir, true
+        ));
+    }
+
+    #[test]
+    fn test_path_targets_nonexistent_path() {
+        // 存在しないパスは fail-open で false（後段の包含検証等に判断を委ねる）
+        let temp_dir = TempDir::new().unwrap();
+        let nonexistent = temp_dir.path().join("missing");
+
+        assert!(!GitChecker::path_targets_or_contains_git_metadata(
+            &nonexistent,
+            true
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_targets_does_not_follow_symlink_to_dir_with_dot_git() {
+        // ディレクトリへのシンボリックリンクは辿らない（リンク自身を評価）
+        let temp_dir = TempDir::new().unwrap();
+        let real_repo = temp_dir.path().join("real_repo");
+        fs::create_dir_all(real_repo.join(".git")).unwrap();
+
+        let link = temp_dir.path().join("link_to_repo");
+        std::os::unix::fs::symlink(&real_repo, &link).unwrap();
+
+        // link 自身は `.git` ではないし、シンボリックリンクなので配下も探索しない
+        assert!(!GitChecker::path_targets_or_contains_git_metadata(
+            &link, true
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_targets_does_not_descend_into_symlink_subdir() {
+        // 配下にシンボリックリンクで `.git` を持つディレクトリがあっても、
+        // シンボリックリンクは辿らないので保護対象外（実体の `.git` は別経路で守る）
+        let temp_dir = TempDir::new().unwrap();
+        let real_repo = temp_dir.path().join("real_repo");
+        fs::create_dir_all(real_repo.join(".git")).unwrap();
+
+        let parent = temp_dir.path().join("parent");
+        fs::create_dir_all(&parent).unwrap();
+        let link_inside = parent.join("link_to_repo");
+        std::os::unix::fs::symlink(&real_repo, &link_inside).unwrap();
+
+        // parent 配下に直接の `.git` はない（リンクは辿らない）
+        assert!(!GitChecker::path_targets_or_contains_git_metadata(
+            &parent, true
+        ));
     }
 
     #[test]
