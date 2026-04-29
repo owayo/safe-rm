@@ -3963,6 +3963,50 @@ mod nested_git_metadata_tests {
         );
         assert!(nested.join(".git").exists(), "内側の .git は保護されるべき");
     }
+
+    #[test]
+    fn test_nested_dot_git_inner_file_delete_blocked() {
+        // `nested/.git/config` のように `.git` が中間コンポーネントになる削除も拒否
+        let parent = TempDir::new().unwrap();
+        let parent_canonical = parent.path().canonicalize().unwrap();
+        let nested = parent_canonical.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        init_repo(&nested);
+
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["nested/.git/config"], &parent_canonical);
+
+        assert_ne!(
+            exit_code, 0,
+            "中間コンポーネント `.git` 経由のメタデータ削除は拒否されるべき"
+        );
+        assert!(
+            nested.join(".git").join("config").exists(),
+            ".git/config は保護されるべき"
+        );
+    }
+
+    #[test]
+    fn test_nested_dot_git_uppercase_component_blocked() {
+        // macOS APFS のような case-insensitive ファイルシステムで `.GIT` 経由の
+        // バイパスを防ぐため、ASCII 大文字小文字を区別しない比較で保護する。
+        let parent = TempDir::new().unwrap();
+        let parent_canonical = parent.path().canonicalize().unwrap();
+        let nested = parent_canonical.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        init_repo(&nested);
+
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["nested/.GIT/config"], &parent_canonical);
+
+        assert_ne!(
+            exit_code, 0,
+            "`.GIT` (大文字バリアント) も保護対象として拒否されるべき"
+        );
+        // case-insensitive FS では実体は `.git/config` なので、これが残っているべき
+        assert!(
+            nested.join(".git").join("config").exists(),
+            ".git/config は保護されるべき"
+        );
+    }
 }
 
 mod config_edge_case_tests {

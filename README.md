@@ -31,7 +31,7 @@
 
 - **Path Containment**: Block deletion of files outside project directory
 - **Strict-Mode Git Status Protection**: When `allow_project_deletion = false`, prevent deletion of modified, staged, or untracked files
-- **Git Metadata Protection**: Always block `.git`, gitdir indirection files, bare-repository administrative paths, recursive deletes that would include current-repository Git metadata, and any nested `.git` files/directories (including those of nested repositories) found in the deletion target or its subtree
+- **Git Metadata Protection**: Always block `.git`, gitdir indirection files, bare-repository administrative paths, recursive deletes that would include current-repository Git metadata, and any nested `.git` files/directories (including those of nested repositories) found in the deletion target, any intermediate path component, or its subtree. Component matching is ASCII case-insensitive to also block `.GIT` bypass attempts on case-insensitive filesystems (e.g., macOS APFS)
 - **Nested Untracked Protection**: Strict-mode checks catch files inside untracked directories and mixed ignored/untracked directories instead of treating them as outside Git
 - **Directory Traversal Prevention**: Block `../` escape attempts, including `link/../victim` patterns that try to abuse OS path resolution through symlinks
 - **Ignored File Passthrough**: Allow deletion of `.gitignore`d files (build artifacts, etc.)

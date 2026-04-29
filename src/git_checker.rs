@@ -67,19 +67,25 @@ impl GitChecker {
             .any(|root| target.starts_with(root) || root.starts_with(&target))
     }
 
-    /// 削除対象パス自体、または再帰削除時にその配下に `.git` が含まれるかを判定する。
+    /// 削除対象パス自体、その途中の任意コンポーネント、または再帰削除時に
+    /// その配下に `.git` が含まれるかを判定する。
     ///
     /// safe-rm を実行している現在のリポジトリと無関係でも、任意階層の Git 管理
     /// メタデータの削除を常に拒否する。シンボリックリンクは辿らず、リンク自身を
     /// 評価することで、リンク経由の脱出も防ぐ。
+    /// macOS APFS のような大文字小文字を区別しないファイルシステムで
+    /// `.GIT` 経由のバイパスを防ぐため、コンポーネント比較は ASCII case-insensitive。
     /// I/O エラー時は fail-open（保護対象外）として扱い、後段の包含検証や
     /// Git ステータスチェックに判断を委ねる。
     pub fn path_targets_or_contains_git_metadata(path: &Path, recursive: bool) -> bool {
-        let dot_git = std::ffi::OsStr::new(".git");
-
-        // 末尾コンポーネントが `.git` の場合は常時ブロック（ファイル/ディレクトリ問わず）
-        if path.file_name() == Some(dot_git) {
-            return true;
+        // パス内の任意のコンポーネントが `.git`（大文字小文字無視）の場合は常時ブロック。
+        // 末尾だけでなく `nested/.git/config` のような中間コンポーネントも対象。
+        for component in path.components() {
+            if let std::path::Component::Normal(name) = component {
+                if Self::is_dot_git_component(name) {
+                    return true;
+                }
+            }
         }
 
         if !recursive {
@@ -99,18 +105,26 @@ impl GitChecker {
         Self::contains_dot_git_recursive(path)
     }
 
+    /// `.git` の大文字小文字を区別しない比較。
+    /// 末尾コンポーネントだけでなく中間コンポーネントの判定にも使う。
+    fn is_dot_git_component(name: &std::ffi::OsStr) -> bool {
+        name.to_str()
+            .map(|s| s.eq_ignore_ascii_case(".git"))
+            .unwrap_or(false)
+    }
+
     /// 指定ディレクトリ配下に `.git` ファイル/ディレクトリが存在するかを再帰的に確認する。
     ///
     /// `fs::remove_dir_all` と同様にシンボリックリンクは辿らない。
+    /// 大文字小文字を区別しない比較で `.GIT` 等のバリアントも検出する。
     fn contains_dot_git_recursive(dir: &Path) -> bool {
-        let dot_git = std::ffi::OsStr::new(".git");
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return false,
         };
 
         for entry in entries.flatten() {
-            if entry.file_name() == dot_git {
+            if Self::is_dot_git_component(&entry.file_name()) {
                 return true;
             }
             let file_type = match entry.file_type() {
