@@ -75,31 +75,42 @@ impl GitChecker {
     /// 評価することで、リンク経由の脱出も防ぐ。
     /// macOS APFS のような大文字小文字を区別しないファイルシステムで
     /// `.GIT` 経由のバイパスを防ぐため、コンポーネント比較は ASCII case-insensitive。
-    /// I/O エラー時は fail-open（保護対象外）として扱い、後段の包含検証や
-    /// Git ステータスチェックに判断を委ねる。
     pub fn path_targets_or_contains_git_metadata(path: &Path, recursive: bool) -> bool {
+        Self::try_path_targets_or_contains_git_metadata(path, recursive).unwrap_or(true)
+    }
+
+    /// 削除対象パス自体、その途中の任意コンポーネント、または再帰削除時に
+    /// その配下に `.git` が含まれるかを判定する。
+    ///
+    /// 実削除前に使う検査経路。ディレクトリ読み取りエラーやエントリ取得エラーを
+    /// 呼び出し元へ返し、fail-closed で削除をブロックできるようにする。
+    pub fn try_path_targets_or_contains_git_metadata(
+        path: &Path,
+        recursive: bool,
+    ) -> Result<bool, SafeRmError> {
         // パス内の任意のコンポーネントが `.git`（大文字小文字無視）の場合は常時ブロック。
         // 末尾だけでなく `nested/.git/config` のような中間コンポーネントも対象。
         for component in path.components() {
             if let std::path::Component::Normal(name) = component {
                 if Self::is_dot_git_component(name) {
-                    return true;
+                    return Ok(true);
                 }
             }
         }
 
         if !recursive {
-            return false;
+            return Ok(false);
         }
 
         // 再帰削除でも、対象が通常ディレクトリでなければ配下に `.git` は存在しない
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
-            Err(_) => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(SafeRmError::IoError(e)),
         };
         let file_type = metadata.file_type();
         if file_type.is_symlink() || !file_type.is_dir() {
-            return false;
+            return Ok(false);
         }
 
         Self::contains_dot_git_recursive(path)
@@ -117,28 +128,37 @@ impl GitChecker {
     ///
     /// `fs::remove_dir_all` と同様にシンボリックリンクは辿らない。
     /// 大文字小文字を区別しない比較で `.GIT` 等のバリアントも検出する。
-    fn contains_dot_git_recursive(dir: &Path) -> bool {
+    fn contains_dot_git_recursive(dir: &Path) -> Result<bool, SafeRmError> {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
-            Err(_) => return false,
+            Err(_) => {
+                return Err(SafeRmError::DirectoryReadError {
+                    path: dir.to_path_buf(),
+                });
+            }
         };
 
-        for entry in entries.flatten() {
+        for entry_result in entries {
+            let entry = entry_result.map_err(|_| SafeRmError::DirectoryReadError {
+                path: dir.to_path_buf(),
+            })?;
             if Self::is_dot_git_component(&entry.file_name()) {
-                return true;
+                return Ok(true);
             }
             let file_type = match entry.file_type() {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(_) => {
+                    return Err(SafeRmError::DirectoryReadError { path: entry.path() });
+                }
             };
             if file_type.is_dir() && !file_type.is_symlink() {
                 let entry_path = entry.path();
-                if Self::contains_dot_git_recursive(&entry_path) {
-                    return true;
+                if Self::contains_dot_git_recursive(&entry_path)? {
+                    return Ok(true);
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     /// 絶対パスからワークディレクトリ相対パスを取得
@@ -770,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_path_targets_nonexistent_path() {
-        // 存在しないパスは fail-open で false（後段の包含検証等に判断を委ねる）
+        // 存在しないパスは false（後段の包含検証等に判断を委ねる）
         let temp_dir = TempDir::new().unwrap();
         let nonexistent = temp_dir.path().join("missing");
 
@@ -778,6 +798,38 @@ mod tests {
             &nonexistent,
             true
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_try_path_targets_reports_directory_read_error() {
+        // `.git` 探索中に読めないディレクトリへ到達した場合は fail-closed で返す
+        let temp_dir = TempDir::new().unwrap();
+        let parent = temp_dir.path().join("parent");
+        let unreadable = parent.join("unreadable");
+        fs::create_dir_all(&unreadable).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let original_permissions = fs::metadata(&unreadable).unwrap().permissions();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let read_dir_denied = fs::read_dir(&unreadable).is_err();
+        let try_result = GitChecker::try_path_targets_or_contains_git_metadata(&parent, true);
+        let legacy_result = GitChecker::path_targets_or_contains_git_metadata(&parent, true);
+
+        fs::set_permissions(&unreadable, original_permissions).unwrap();
+
+        // root 等で読み取り制限が効かない環境では、このケースは検証対象外にする
+        if read_dir_denied {
+            match try_result {
+                Err(SafeRmError::DirectoryReadError { path }) => assert_eq!(path, unreadable),
+                other => panic!("DirectoryReadError が期待されたが {other:?} が返された"),
+            }
+            assert!(
+                legacy_result,
+                "互換用 bool API も読み取りエラー時は保守的にブロックするべき"
+            );
+        }
     }
 
     #[cfg(unix)]

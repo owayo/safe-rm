@@ -160,7 +160,7 @@ fn process_path(
     // Git 管理メタデータは設定より優先して常時ブロックする。
     // (1) 任意階層の `.git` ファイル/ディレクトリ自身、および再帰削除時に
     //     その配下に存在する `.git` を保護する（ネストしたリポジトリ対応）。
-    if GitChecker::path_targets_or_contains_git_metadata(&normalized_path, args.recursive) {
+    if GitChecker::try_path_targets_or_contains_git_metadata(&normalized_path, args.recursive)? {
         return Err(SafeRmError::ProtectedGitPath {
             path: path.to_path_buf(),
         });
