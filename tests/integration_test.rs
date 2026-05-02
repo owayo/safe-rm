@@ -540,6 +540,35 @@ mod block_flow_tests {
     }
 
     #[test]
+    fn test_ignored_directory_with_tracked_modified_file_blocked() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // tracked ファイル作成後に親ディレクトリを ignore しても、tracked 変更は保護対象。
+        commit_file(&repo_path, "ignored/tracked.txt", "original");
+        commit_file(&repo_path, ".gitignore", "ignored/\n");
+        fs::write(repo_path.join("ignored/tracked.txt"), "modified").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "ignored"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "ignored ディレクトリ配下の tracked 変更済みファイルはブロックされるべき"
+        );
+        assert!(
+            stderr.contains("Modified") || stderr.contains("未コミット"),
+            "変更済みファイルのエラーが必要: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("ignored/tracked.txt").exists(),
+            "tracked 変更済みファイルは削除されてはならない"
+        );
+    }
+
+    #[test]
     fn test_git_metadata_directory_blocked_in_strict_mode() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();

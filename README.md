@@ -32,7 +32,7 @@
 - **Path Containment**: Block deletion of files outside project directory
 - **Strict-Mode Git Status Protection**: When `allow_project_deletion = false`, prevent deletion of modified, staged, or untracked files
 - **Git Metadata Protection**: Always block `.git`, gitdir indirection files, bare-repository administrative paths, recursive deletes that would include current-repository Git metadata, and any nested `.git` files/directories (including those of nested repositories) found in the deletion target, any intermediate path component, or its subtree. Component matching is ASCII case-insensitive to also block `.GIT` bypass attempts on case-insensitive filesystems (e.g., macOS APFS)
-- **Nested Untracked Protection**: Strict-mode checks catch files inside untracked directories and mixed ignored/untracked directories instead of treating them as outside Git
+- **Nested Dirty-File Protection**: Strict-mode checks catch files inside untracked directories, mixed ignored/untracked directories, and tracked modifications inside ignored directories instead of treating them as outside Git
 - **Directory Traversal Prevention**: Block `../` escape attempts, including `link/../victim` patterns that try to abuse OS path resolution through symlinks
 - **Ignored File Passthrough**: Allow deletion of `.gitignore`d files (build artifacts, etc.)
 - **Symlink-Safe Git Checks**: Directory symlinks are checked as links themselves (not traversed)
@@ -140,7 +140,7 @@ recursive = false
 ### Behavior
 
 - **`allow_project_deletion = true` (default)**: Worktree files inside the project can be deleted without Git status checks. Git administrative paths such as `.git`, and recursive deletion of a path that contains the current repository's Git metadata, are still blocked.
-- **`allow_project_deletion = false`**: Only clean (committed) or ignored worktree files can be deleted. Uncommitted changes are protected, and Git administrative paths are still blocked.
+- **`allow_project_deletion = false`**: Only clean (committed) or ignored worktree files can be deleted. Uncommitted changes are protected even when they live under an ignored parent directory, and Git administrative paths are still blocked.
 - Paths matching `allowed_paths` bypass project containment and Git status checks, but they do **not** bypass Git metadata protection for the current repository. For nonexistent targets, the nearest existing parent is canonicalized so alias-path differences are still absorbed
 - The `recursive` flag controls whether subdirectories are included:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` is allowed
@@ -184,7 +184,7 @@ flowchart TB
 1. **Git Metadata Protection**: Always blocks `.git`, gitdir indirection files, bare-repository administrative paths, and recursive deletion of paths that contain current-repository Git metadata, even if config would otherwise allow deletion. If a recursive metadata scan cannot read a directory entry, deletion is blocked fail-closed.
 2. **Path Containment**: Ensures all paths resolve within the project directory (Git repository root, or cwd if not a Git repo) (always enforced). For nonexistent targets, it canonicalizes the nearest existing parent to absorb alias differences (e.g. repo symlink alias, `/var` vs `/private/var`).
 3. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked), including files nested under untracked directories
-4. **Recursive Check**: For real directories, validates all contained files. Strict mode only short-circuits when the directory itself is ignored; ignored descendants do not hide untracked or modified siblings
+4. **Recursive Check**: For real directories, validates all contained files. Ignored descendants remain deletable, but ignored parent directories do not hide tracked modified/staged files or untracked siblings
 5. **Fail-Closed**: Any directory read failure (including entry iteration errors) or Git API error blocks deletion
 6. **Alias-Path Hardening**: Path containment and `allowed_paths` matching canonicalize the nearest existing parent and reattach missing segments, while Git checks canonicalize non-symlink paths and only parent directories for symlink paths, to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
 

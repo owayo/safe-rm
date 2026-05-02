@@ -415,50 +415,9 @@ impl GitChecker {
     /// * `Ok(())` - 全ファイルが Clean または Ignored
     /// * `Err(SafeRmError::DirtyFiles)` - 変更のあるファイルが存在
     pub fn check_directory(&self, dir: &Path) -> Result<(), SafeRmError> {
-        // まずディレクトリ自体が Ignored かチェック（早期許可）
-        let dir_status = self.get_directory_status(dir);
-        if dir_status == FileStatus::Ignored {
-            return Ok(());
-        }
-
-        // ディレクトリ内のファイルを再帰的にチェック
+        // ディレクトリ自体が ignored でも、配下に tracked な変更済みファイルが
+        // 存在し得るため、早期許可せず各エントリを再帰的に検査する。
         self.check_directory_recursive(dir)
-    }
-
-    /// ディレクトリ自体のステータスを取得
-    fn get_directory_status(&self, dir: &Path) -> FileStatus {
-        let relative_path = match self.to_workdir_relative(dir) {
-            Some(p) => p,
-            None => return FileStatus::NotInRepo,
-        };
-
-        // ディレクトリ自体が .gitignore にマッチするかを直接チェックする。
-        // 配下の ignored ファイルだけでディレクトリ全体を ignored 扱いにしない。
-        if self.is_ignored_path(dir) {
-            return FileStatus::Ignored;
-        }
-
-        // ディレクトリパスの末尾にスラッシュを追加して gitignore マッチング
-        let dir_key = Self::to_git_relative_key(&relative_path);
-        let dir_pattern = format!("{dir_key}/");
-
-        let mut opts = StatusOptions::new();
-        opts.pathspec(&dir_pattern);
-        opts.include_ignored(true);
-
-        if let Ok(statuses) = self.repo.statuses(Some(&mut opts)) {
-            for entry in statuses.iter() {
-                let Some(entry_path) = entry.path() else {
-                    continue;
-                };
-                let entry_key = entry_path.trim_end_matches('/');
-                if entry_key == dir_key && entry.status().contains(Status::IGNORED) {
-                    return FileStatus::Ignored;
-                }
-            }
-        }
-
-        FileStatus::Clean
     }
 
     /// パスが .gitignore に含まれるかチェック
@@ -515,12 +474,8 @@ impl GitChecker {
         dir: &Path,
         cache: &HashMap<String, FileStatus>,
     ) -> Result<(), SafeRmError> {
-        // まずディレクトリ自体が Ignored かチェック（早期許可）
-        let dir_status = self.get_directory_status(dir);
-        if dir_status == FileStatus::Ignored {
-            return Ok(());
-        }
-
+        // キャッシュ利用時も、ignored ディレクトリ配下の tracked 変更を
+        // 見落とさないように必ず各エントリを検査する。
         self.check_directory_recursive_with_cache(dir, cache)
     }
 
@@ -1829,50 +1784,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_directory_status_ignored() {
-        // .gitignore で無視されたディレクトリのステータス確認
-        let temp_dir = create_test_repo();
-        let repo_path = temp_dir.path().canonicalize().unwrap();
-
-        // .gitignore を作成してコミット
-        commit_file(&repo_path, ".gitignore", "build/\n");
-
-        // 無視対象ディレクトリを作成
-        let build_dir = repo_path.join("build");
-        fs::create_dir_all(&build_dir).unwrap();
-        fs::write(build_dir.join("output.bin"), "binary").unwrap();
-
-        let checker = GitChecker::open(&repo_path).unwrap();
-
-        // ディレクトリ自体が Ignored として判定される
-        let status = checker.get_directory_status(&build_dir);
-        assert_eq!(
-            status,
-            FileStatus::Ignored,
-            "gitignore 対象ディレクトリは Ignored として扱うべき"
-        );
-    }
-
-    #[test]
-    fn test_get_directory_status_not_ignored() {
-        // 通常のディレクトリは Clean として判定される
-        let temp_dir = create_test_repo();
-        let repo_path = temp_dir.path().canonicalize().unwrap();
-
-        let src_dir = repo_path.join("src");
-        fs::create_dir_all(&src_dir).unwrap();
-        commit_file(&repo_path, "src/main.rs", "fn main() {}");
-
-        let checker = GitChecker::open(&repo_path).unwrap();
-        let status = checker.get_directory_status(&src_dir);
-        assert_eq!(
-            status,
-            FileStatus::Clean,
-            "通常のディレクトリは Clean として扱うべき"
-        );
-    }
-
-    #[test]
     fn test_convert_status_current() {
         // Status が空（CURRENT = 0x0）の場合は Clean を返す
         let status = Status::CURRENT;
@@ -2122,6 +2033,34 @@ mod tests {
         assert!(
             cached_result.is_err(),
             "キャッシュ使用時も未追跡ファイルを見落としてはならない"
+        );
+    }
+
+    #[test]
+    fn test_check_directory_with_cache_blocks_tracked_modified_file_in_ignored_dir() {
+        // ディレクトリ全体が ignored でも、配下の tracked ファイルは保護対象。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        fs::create_dir_all(repo_path.join("ignored")).unwrap();
+        commit_file(&repo_path, "ignored/tracked.txt", "original");
+        commit_file(&repo_path, ".gitignore", "ignored/\n");
+        fs::write(repo_path.join("ignored/tracked.txt"), "modified").unwrap();
+
+        let checker = GitChecker::open(&repo_path).unwrap();
+        let cache = checker.get_all_statuses().unwrap();
+        let result = checker.check_directory_with_cache(&repo_path.join("ignored"), &cache);
+
+        assert!(
+            matches!(
+                result,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Modified,
+                    ..
+                })
+            ),
+            "ignored ディレクトリ配下でも tracked な変更済みファイルはブロックされるべき: {:?}",
+            result
         );
     }
 
