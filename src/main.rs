@@ -64,17 +64,10 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
         .and_then(|checker| checker.workdir())
         .unwrap_or_else(|| cwd.clone());
 
-    // Git ステータスを必要時のみ一括事前取得（パフォーマンス最適化）
-    // allow_project_deletion 有効時はスキップ
-    // Git API エラー時は fail-closed でエラーを返す
-    let status_cache: HashMap<String, FileStatus> = if !config.allow_project_deletion {
-        match git_checker.as_ref() {
-            Some(checker) => checker.get_all_statuses()?,
-            None => HashMap::new(),
-        }
-    } else {
-        HashMap::new()
-    };
+    // Git ステータスは、厳格モードかつ allowed_paths 外の削除で初めて取得する。
+    // allowed_paths は Git チェックをバイパスするため、現在のリポジトリに
+    // Git API エラーがあっても allowed_paths の削除を巻き込まない。
+    let mut status_cache: Option<HashMap<String, FileStatus>> = None;
 
     let mut success_count = 0;
     let mut error_count = 0;
@@ -88,7 +81,7 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
             &project_root,
             &cwd,
             &git_checker,
-            &status_cache,
+            &mut status_cache,
             &args,
             &config,
         ) {
@@ -140,7 +133,7 @@ fn process_path(
     project_root: &Path,
     cwd: &Path,
     git_checker: &Option<GitChecker>,
-    status_cache: &HashMap<String, FileStatus>,
+    status_cache: &mut Option<HashMap<String, FileStatus>>,
     args: &CliArgs,
     config: &Config,
 ) -> Result<bool, SafeRmError> {
@@ -157,25 +150,10 @@ fn process_path(
     // 以降のメタデータ取得・削除・許可判定はすべて clean 済みパスで行う。
     let normalized_path = abs_path.clean();
 
-    // Git 管理メタデータは設定より優先して常時ブロックする。
-    // (1) 任意階層の `.git` ファイル/ディレクトリ自身、および再帰削除時に
-    //     その配下に存在する `.git` を保護する（ネストしたリポジトリ対応）。
-    if GitChecker::try_path_targets_or_contains_git_metadata(&normalized_path, args.recursive)? {
-        return Err(SafeRmError::ProtectedGitPath {
-            path: path.to_path_buf(),
-        });
-    }
-    // (2) 現在のリポジトリの Git 管理メタデータも保護する。
-    if let Some(checker) = git_checker {
-        if checker.touches_git_metadata_path(&normalized_path) {
-            return Err(SafeRmError::ProtectedGitPath {
-                path: path.to_path_buf(),
-            });
-        }
-    }
-
     // allowed_paths 内のパスか確認（包含検証と Git チェックをバイパス）
     if config.is_path_allowed(&normalized_path) {
+        ensure_git_metadata_not_targeted(&normalized_path, path, args.recursive, git_checker)?;
+
         // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
         let metadata = match std::fs::symlink_metadata(&normalized_path) {
             Ok(m) => m,
@@ -209,6 +187,8 @@ fn process_path(
         // パスがプロジェクト内にあることを最初に検証（セキュリティチェック優先）
         // プロジェクト外のファイル存在情報の漏洩を防止
         let canonical_path = PathChecker::verify_containment_with_base(project_root, cwd, path)?;
+
+        ensure_git_metadata_not_targeted(&normalized_path, path, args.recursive, git_checker)?;
 
         // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
         let metadata = match std::fs::symlink_metadata(&normalized_path) {
@@ -252,7 +232,13 @@ fn process_path(
                         None
                     };
                 let git_check_path = symlink_git_check_path.as_deref().unwrap_or(&canonical_path);
-                checker.check_path_with_cache(git_check_path, status_cache)?;
+                if status_cache.is_none() {
+                    *status_cache = Some(checker.get_all_statuses()?);
+                }
+                let cache = status_cache
+                    .as_ref()
+                    .expect("status_cache must be initialized before strict Git check");
+                checker.check_path_with_cache(git_check_path, cache)?;
             }
         }
 
@@ -266,6 +252,33 @@ fn process_path(
             Ok(true)
         }
     }
+}
+
+/// Git 管理メタデータの削除対象化を検査する。
+fn ensure_git_metadata_not_targeted(
+    normalized_path: &Path,
+    original_path: &Path,
+    recursive: bool,
+    git_checker: &Option<GitChecker>,
+) -> Result<(), SafeRmError> {
+    // 任意階層の `.git` や bare リポジトリ、および再帰削除時に配下へ含まれる
+    // Git 管理メタデータを保護する（ネストしたリポジトリ対応）。
+    if GitChecker::try_path_targets_or_contains_git_metadata(normalized_path, recursive)? {
+        return Err(SafeRmError::ProtectedGitPath {
+            path: original_path.to_path_buf(),
+        });
+    }
+
+    // 現在のリポジトリの Git 管理メタデータも保護する。
+    if let Some(checker) = git_checker {
+        if checker.touches_git_metadata_path(normalized_path) {
+            return Err(SafeRmError::ProtectedGitPath {
+                path: original_path.to_path_buf(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// メタデータを使用してファイルまたはディレクトリを削除（追加 syscall を回避）

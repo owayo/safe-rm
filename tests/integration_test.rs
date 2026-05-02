@@ -606,6 +606,31 @@ mod block_flow_tests {
     }
 
     #[test]
+    fn test_outside_project_with_nested_git_metadata_reports_outside_project() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let outside_dir = TempDir::new().unwrap();
+        let outside_path = outside_dir.path().canonicalize().unwrap();
+        fs::create_dir_all(outside_path.join("nested").join(".git")).unwrap();
+
+        let outside_arg = outside_path.to_string_lossy().to_string();
+        let (exit_code, _, stderr) = run_safe_rm(&["-r", outside_arg.as_str()], &repo_path);
+
+        assert_eq!(exit_code, 2, "プロジェクト外の削除はブロックされるべき");
+        assert!(
+            stderr.contains("プロジェクト外") || stderr.contains("Outside"),
+            "プロジェクト外エラーを返すべき: {}",
+            stderr
+        );
+        assert!(
+            !stderr.contains("Git 管理メタデータ"),
+            "包含検証前に外部ディレクトリを再帰スキャンしてはならない: {}",
+            stderr
+        );
+    }
+
+    #[test]
     fn test_traversal_attack_blocked() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
@@ -1334,6 +1359,53 @@ recursive = true
             stdout
         );
         assert!(!outside_file.exists(), "File should be deleted");
+    }
+
+    #[test]
+    fn test_allowed_paths_strict_mode_bypasses_git_status_error() {
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+        commit_file(&project_path, "tracked.txt", "tracked");
+
+        let outside_dir = TempDir::new().unwrap();
+        let outside_path = outside_dir.path().canonicalize().unwrap();
+        let outside_file = outside_path.join("file.txt");
+        fs::write(&outside_file, "content").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+allow_project_deletion = false
+
+[[allowed_paths]]
+path = "{}"
+recursive = true
+"#,
+            outside_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // allowed_paths は Git ステータスチェックをバイパスするため、
+        // 現在のリポジトリの index が壊れていても許可パスの削除は巻き込まれない。
+        fs::write(project_path.join(".git").join("index"), "corrupted").unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &[outside_file.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "allowed_paths の削除は Git status エラーに巻き込まれてはならない: {}",
+            stderr
+        );
+        assert!(
+            stdout.contains("allowed by config"),
+            "設定許可の注釈が必要: {}",
+            stdout
+        );
+        assert!(!outside_file.exists(), "許可パスのファイルは削除されるべき");
     }
 
     #[test]
@@ -3929,6 +4001,14 @@ mod nested_git_metadata_tests {
             .unwrap();
     }
 
+    /// `git init --bare` で bare リポジトリを初期化
+    fn init_bare_repo(path: &std::path::Path) {
+        Command::new("git")
+            .args(["init", "--bare", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+    }
+
     #[test]
     fn test_non_git_parent_blocks_child_repo_dot_git_deletion() {
         // 非 Git ディレクトリ直下のリポジトリの `.git` を直接削除しようとする
@@ -3971,6 +4051,47 @@ mod nested_git_metadata_tests {
             "ネストした repo の再帰削除は配下の .git のため拒否されるべき"
         );
         assert!(nested.join(".git").exists(), "内側の .git は保護されるべき");
+    }
+
+    #[test]
+    fn test_nested_bare_repo_recursive_delete_blocked() {
+        // bare リポジトリは `.git` コンポーネントがなくても Git 管理メタデータ。
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        commit_file(&outer_path, "outer.txt", "outer");
+
+        let bare_repo = outer_path.join("cache.git");
+        init_bare_repo(&bare_repo);
+
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["-r", "cache.git"], &outer_path);
+
+        assert_ne!(
+            exit_code, 0,
+            "bare リポジトリ全体の再帰削除は拒否されるべき"
+        );
+        assert!(
+            bare_repo.join("HEAD").exists(),
+            "bare リポジトリは保護されるべき"
+        );
+    }
+
+    #[test]
+    fn test_nested_bare_repo_head_delete_blocked() {
+        let parent = TempDir::new().unwrap();
+        let parent_canonical = parent.path().canonicalize().unwrap();
+        let bare_repo = parent_canonical.join("repo.git");
+        init_bare_repo(&bare_repo);
+
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["repo.git/HEAD"], &parent_canonical);
+
+        assert_ne!(
+            exit_code, 0,
+            "bare リポジトリ内の管理ファイル削除は拒否されるべき"
+        );
+        assert!(
+            bare_repo.join("HEAD").exists(),
+            "bare リポジトリの HEAD は保護されるべき"
+        );
     }
 
     #[test]

@@ -68,11 +68,12 @@ impl GitChecker {
     }
 
     /// 削除対象パス自体、その途中の任意コンポーネント、または再帰削除時に
-    /// その配下に `.git` が含まれるかを判定する。
+    /// その配下に Git 管理メタデータが含まれるかを判定する。
     ///
     /// safe-rm を実行している現在のリポジトリと無関係でも、任意階層の Git 管理
-    /// メタデータの削除を常に拒否する。シンボリックリンクは辿らず、リンク自身を
-    /// 評価することで、リンク経由の脱出も防ぐ。
+    /// メタデータの削除を常に拒否する。bare リポジトリは `.git` という
+    /// コンポーネントを持たないため、既存祖先が bare リポジトリの場合も拒否する。
+    /// シンボリックリンクは辿らず、リンク自身を評価することでリンク経由の脱出も防ぐ。
     /// macOS APFS のような大文字小文字を区別しないファイルシステムで
     /// `.GIT` 経由のバイパスを防ぐため、コンポーネント比較は ASCII case-insensitive。
     pub fn path_targets_or_contains_git_metadata(path: &Path, recursive: bool) -> bool {
@@ -80,7 +81,7 @@ impl GitChecker {
     }
 
     /// 削除対象パス自体、その途中の任意コンポーネント、または再帰削除時に
-    /// その配下に `.git` が含まれるかを判定する。
+    /// その配下に Git 管理メタデータが含まれるかを判定する。
     ///
     /// 実削除前に使う検査経路。ディレクトリ読み取りエラーやエントリ取得エラーを
     /// 呼び出し元へ返し、fail-closed で削除をブロックできるようにする。
@@ -98,11 +99,15 @@ impl GitChecker {
             }
         }
 
+        if Self::path_targets_bare_repository_metadata(path) {
+            return Ok(true);
+        }
+
         if !recursive {
             return Ok(false);
         }
 
-        // 再帰削除でも、対象が通常ディレクトリでなければ配下に `.git` は存在しない
+        // 再帰削除でも、対象が通常ディレクトリでなければ配下に Git メタデータは存在しない
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -113,7 +118,7 @@ impl GitChecker {
             return Ok(false);
         }
 
-        Self::contains_dot_git_recursive(path)
+        Self::contains_git_metadata_recursive(path)
     }
 
     /// `.git` の大文字小文字を区別しない比較。
@@ -124,11 +129,37 @@ impl GitChecker {
             .unwrap_or(false)
     }
 
-    /// 指定ディレクトリ配下に `.git` ファイル/ディレクトリが存在するかを再帰的に確認する。
+    /// 指定パス自体または既存祖先が bare リポジトリか確認する。
+    fn path_targets_bare_repository_metadata(path: &Path) -> bool {
+        let mut current = Some(path);
+        while let Some(candidate) = current {
+            if Self::is_bare_repository_root(candidate) {
+                return true;
+            }
+            current = candidate.parent();
+        }
+        false
+    }
+
+    /// 指定ディレクトリが bare リポジトリのルートか確認する。
+    fn is_bare_repository_root(path: &Path) -> bool {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return false;
+        }
+
+        Repository::open_bare(path).is_ok()
+    }
+
+    /// 指定ディレクトリ配下に Git 管理メタデータが存在するかを再帰的に確認する。
     ///
     /// `fs::remove_dir_all` と同様にシンボリックリンクは辿らない。
-    /// 大文字小文字を区別しない比較で `.GIT` 等のバリアントも検出する。
-    fn contains_dot_git_recursive(dir: &Path) -> Result<bool, SafeRmError> {
+    /// 大文字小文字を区別しない比較で `.GIT` 等のバリアントも検出し、
+    /// `.git` コンポーネントを持たない bare リポジトリも検出する。
+    fn contains_git_metadata_recursive(dir: &Path) -> Result<bool, SafeRmError> {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => {
@@ -153,7 +184,9 @@ impl GitChecker {
             };
             if file_type.is_dir() && !file_type.is_symlink() {
                 let entry_path = entry.path();
-                if Self::contains_dot_git_recursive(&entry_path)? {
+                if Self::is_bare_repository_root(&entry_path)
+                    || Self::contains_git_metadata_recursive(&entry_path)?
+                {
                     return Ok(true);
                 }
             }
@@ -240,6 +273,7 @@ impl GitChecker {
         let mut opts = StatusOptions::new();
         opts.include_untracked(true);
         opts.include_ignored(true);
+        opts.include_unmodified(true);
         opts.recurse_untracked_dirs(true);
 
         let statuses = self.repo.statuses(Some(&mut opts))?;
@@ -713,6 +747,49 @@ mod tests {
         // recursive=false なら配下は探索しない
         assert!(!GitChecker::path_targets_or_contains_git_metadata(
             &nested, false
+        ));
+    }
+
+    #[test]
+    fn test_path_targets_bare_repo_recursive() {
+        // bare リポジトリは `.git` コンポーネントを持たないが Git 管理メタデータ。
+        let temp_dir = TempDir::new().unwrap();
+        let bare_repo_path = temp_dir.path().join("repo.git");
+
+        Command::new("git")
+            .args(["init", "--bare", bare_repo_path.to_str().unwrap()])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+
+        assert!(GitChecker::path_targets_or_contains_git_metadata(
+            &bare_repo_path,
+            true
+        ));
+        assert!(GitChecker::path_targets_or_contains_git_metadata(
+            &bare_repo_path.join("HEAD"),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_path_targets_dir_with_nested_bare_repo_recursive() {
+        let temp_dir = TempDir::new().unwrap();
+        let parent = temp_dir.path().join("parent");
+        let bare_repo_path = parent.join("cache.git");
+        fs::create_dir_all(&parent).unwrap();
+
+        Command::new("git")
+            .args(["init", "--bare", bare_repo_path.to_str().unwrap()])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+
+        assert!(GitChecker::path_targets_or_contains_git_metadata(
+            &parent, true
+        ));
+        assert!(!GitChecker::path_targets_or_contains_git_metadata(
+            &parent, false
         ));
     }
 
@@ -1247,13 +1324,11 @@ mod tests {
         let checker = GitChecker::open(&repo_path).unwrap();
         let statuses = checker.get_all_statuses().unwrap();
 
-        // Modified, Untracked, Ignored は status に含まれる
+        // Clean, Modified, Untracked, Ignored が status に含まれる
+        assert_eq!(statuses.get("clean.txt"), Some(&FileStatus::Clean));
         assert!(statuses.contains_key("modified.txt"));
         assert!(statuses.contains_key("new.txt"));
         assert!(statuses.contains_key("debug.log"));
-
-        // Clean ファイルはステータスリストに含まれない（変更なし）
-        assert!(!statuses.contains_key("clean.txt"));
     }
 
     #[test]
@@ -2066,7 +2141,7 @@ mod tests {
 
     #[test]
     fn test_get_file_status_from_cache_returns_clean_for_tracked_file() {
-        // キャッシュに含まれない追跡済みファイルは Clean を返すことを確認
+        // 追跡済み Clean ファイルは一括取得キャッシュから Clean を返すことを確認
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
 
@@ -2076,20 +2151,15 @@ mod tests {
         let checker = GitChecker::open(&repo_path).unwrap();
         let cache = checker.get_all_statuses().unwrap();
 
-        // Clean ファイルはキャッシュに含まれないため、フォールバックで Clean が返る
         let file_path = repo_path.join("tracked_clean.txt");
         let status = checker.get_file_status_from_cache(&file_path, &cache);
         assert_eq!(
             status,
             FileStatus::Clean,
-            "キャッシュに含まれない追跡済みファイルは Clean を返すべき"
+            "追跡済み Clean ファイルは Clean を返すべき"
         );
 
-        // キャッシュにエントリがないことも確認
-        assert!(
-            !cache.contains_key("tracked_clean.txt"),
-            "Clean ファイルは get_all_statuses のキャッシュに含まれないべき"
-        );
+        assert_eq!(cache.get("tracked_clean.txt"), Some(&FileStatus::Clean));
     }
 
     #[test]
@@ -2472,8 +2542,7 @@ mod tests {
         assert_eq!(statuses.get("staged.txt"), Some(&FileStatus::Staged));
         assert_eq!(statuses.get("new.txt"), Some(&FileStatus::Untracked));
         assert_eq!(statuses.get("debug.log"), Some(&FileStatus::Ignored));
-        // Clean ファイルはステータスリストに含まれない
-        assert!(!statuses.contains_key("clean.txt"));
+        assert_eq!(statuses.get("clean.txt"), Some(&FileStatus::Clean));
     }
 
     #[test]
