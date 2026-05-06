@@ -91,15 +91,22 @@ impl GitChecker {
     ) -> Result<bool, SafeRmError> {
         // パス内の任意のコンポーネントが `.git`（大文字小文字無視）の場合は常時ブロック。
         // 末尾だけでなく `nested/.git/config` のような中間コンポーネントも対象。
-        for component in path.components() {
-            if let std::path::Component::Normal(name) = component {
-                if Self::is_dot_git_component(name) {
-                    return Ok(true);
-                }
-            }
+        if Self::path_has_dot_git_component(path) {
+            return Ok(true);
         }
 
-        if Self::path_targets_bare_repository_metadata(path) {
+        // 中間コンポーネントが symlink で、その実体が `.git` を含むパスを指す場合
+        // （例: `gitlink -> nested/.git` のとき `gitlink/config` の削除で
+        // `nested/.git/config` が消されるケース）も検出する。
+        // `try_canonicalize_existing_parent` は既存祖先を辿りながら解決し、
+        // 未作成の末尾コンポーネントは保持する。これにより中間 symlink を辿った
+        // 実体パスにも `.git` コンポーネント検査を効かせる。
+        let canonical_path = Self::try_canonicalize_existing_parent(path);
+        if canonical_path != path && Self::path_has_dot_git_component(&canonical_path) {
+            return Ok(true);
+        }
+
+        if Self::path_targets_bare_repository_metadata(&canonical_path) {
             return Ok(true);
         }
 
@@ -119,6 +126,13 @@ impl GitChecker {
         }
 
         Self::contains_git_metadata_recursive(path)
+    }
+
+    /// パスのいずれかのコンポーネントが `.git`（ASCII case-insensitive）か判定する。
+    fn path_has_dot_git_component(path: &Path) -> bool {
+        path.components().any(|component| {
+            matches!(component, std::path::Component::Normal(name) if Self::is_dot_git_component(name))
+        })
     }
 
     /// `.git` の大文字小文字を区別しない比較。
@@ -383,6 +397,13 @@ impl GitChecker {
         // Ignored チェック（最優先）
         if status.contains(Status::IGNORED) {
             return FileStatus::Ignored;
+        }
+
+        // マージコンフリクト中のファイルは未解決の変更として扱い削除を禁止する。
+        // 通常は INDEX_*/WT_* と一緒に立つが、単独で立つ稀なケースでも
+        // Clean に落ちて削除許可にならないよう先にチェックする。
+        if status.contains(Status::CONFLICTED) {
+            return FileStatus::Modified;
         }
 
         // Index 変更（Staged）
@@ -2563,5 +2584,79 @@ mod tests {
         let path = Path::new("");
         let key = GitChecker::to_git_relative_key(path);
         assert_eq!(key, "");
+    }
+
+    #[test]
+    fn test_convert_status_conflicted_returns_modified() {
+        // マージコンフリクト中（CONFLICTED 単独）のファイルは
+        // Clean に落とさず削除を禁止できる Modified として扱うべき
+        let status = Status::CONFLICTED;
+        assert_eq!(
+            GitChecker::convert_status(status),
+            FileStatus::Modified,
+            "CONFLICTED 単独でも Modified として扱い削除を禁止すべき"
+        );
+    }
+
+    #[test]
+    fn test_convert_status_conflicted_with_wt_modified() {
+        // CONFLICTED と他のフラグが同時に立っている場合も削除禁止扱い
+        let status = Status::CONFLICTED | Status::WT_MODIFIED;
+        let converted = GitChecker::convert_status(status);
+        assert!(
+            !converted.is_deletable(),
+            "CONFLICTED を含むステータスは削除許可にしてはならない: {:?}",
+            converted
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_targets_via_symlink_to_dot_git_blocked() {
+        // 中間 symlink が `.git` ディレクトリを指している場合、
+        // OS の path resolution は `gitlink/config` → `nested/.git/config` と解決するが、
+        // 元の path のコンポーネントには `.git` が出ないためバイパスされ得る。
+        // 正規化済みパスでも `.git` 検出を行うことでこのバイパスをブロックする。
+        let temp_dir = TempDir::new().unwrap();
+        let nested_dot_git = temp_dir.path().join("nested").join(".git");
+        fs::create_dir_all(&nested_dot_git).unwrap();
+        // `.git` 配下の管理ファイルを作成
+        fs::write(nested_dot_git.join("config"), "[core]").unwrap();
+
+        // gitlink -> nested/.git の symlink を作成
+        let gitlink = temp_dir.path().join("gitlink");
+        std::os::unix::fs::symlink(&nested_dot_git, &gitlink).unwrap();
+
+        // gitlink/config を削除しようとすると nested/.git/config に到達してしまう。
+        // これは確実にブロックされなければならない。
+        let target = gitlink.join("config");
+        assert!(
+            GitChecker::path_targets_or_contains_git_metadata(&target, false),
+            "中間 symlink 経由で .git 配下を指すパスはブロックすべき"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_targets_via_symlink_to_bare_repo_blocked() {
+        // bare リポジトリへの中間 symlink でも同様のバイパスを許してはならない。
+        let temp_dir = TempDir::new().unwrap();
+        let bare = temp_dir.path().join("bare.git");
+
+        Command::new("git")
+            .args(["init", "--bare", bare.to_str().unwrap()])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+
+        let alias = temp_dir.path().join("alias");
+        std::os::unix::fs::symlink(&bare, &alias).unwrap();
+
+        // alias/HEAD は bare リポジトリの管理ファイルに解決される
+        let target = alias.join("HEAD");
+        assert!(
+            GitChecker::path_targets_or_contains_git_metadata(&target, false),
+            "中間 symlink 経由で bare リポジトリ配下を指すパスはブロックすべき"
+        );
     }
 }

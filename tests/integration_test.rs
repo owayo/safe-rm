@@ -4157,6 +4157,59 @@ mod nested_git_metadata_tests {
             ".git/config は保護されるべき"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_nested_dot_git_via_intermediate_symlink_blocked() {
+        // 中間 symlink で `.git` ディレクトリを指している場合、
+        // 元の path のコンポーネントには `.git` が出ないため `.git` 検出を
+        // バイパスされ得る。OS の path resolution は `gitlink/config` を
+        // `nested/.git/config` に解決するので、これを必ずブロックする。
+        let parent = TempDir::new().unwrap();
+        let parent_canonical = parent.path().canonicalize().unwrap();
+        let nested = parent_canonical.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        init_repo(&nested);
+
+        let dot_git = nested.join(".git");
+        let gitlink = parent_canonical.join("gitlink");
+        std::os::unix::fs::symlink(&dot_git, &gitlink).unwrap();
+
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["gitlink/config"], &parent_canonical);
+
+        assert_ne!(
+            exit_code, 0,
+            "中間 symlink 経由で .git/config を指す削除は拒否されるべき"
+        );
+        assert!(
+            dot_git.join("config").exists(),
+            "実体の .git/config は保護されるべき"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bare_repo_via_intermediate_symlink_blocked() {
+        // bare リポジトリへの中間 symlink でも同様のバイパスは許してはならない。
+        let parent = TempDir::new().unwrap();
+        let parent_canonical = parent.path().canonicalize().unwrap();
+        let bare = parent_canonical.join("bare.git");
+        init_bare_repo(&bare);
+
+        let alias = parent_canonical.join("alias");
+        std::os::unix::fs::symlink(&bare, &alias).unwrap();
+
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["alias/HEAD"], &parent_canonical);
+
+        assert_ne!(
+            exit_code, 0,
+            "中間 symlink 経由で bare リポジトリの管理ファイルを指す削除は拒否されるべき"
+        );
+        assert!(
+            bare.join("HEAD").exists(),
+            "bare リポジトリの HEAD は保護されるべき"
+        );
+    }
 }
 
 mod config_edge_case_tests {
