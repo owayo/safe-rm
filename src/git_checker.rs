@@ -98,15 +98,14 @@ impl GitChecker {
         // 中間コンポーネントが symlink で、その実体が `.git` を含むパスを指す場合
         // （例: `gitlink -> nested/.git` のとき `gitlink/config` の削除で
         // `nested/.git/config` が消されるケース）も検出する。
-        // `try_canonicalize_existing_parent` は既存祖先を辿りながら解決し、
-        // 未作成の末尾コンポーネントは保持する。これにより中間 symlink を辿った
-        // 実体パスにも `.git` コンポーネント検査を効かせる。
-        let canonical_path = Self::try_canonicalize_existing_parent(path);
-        if canonical_path != path && Self::path_has_dot_git_component(&canonical_path) {
+        // 末尾コンポーネントは canonicalize しない（symlink 自身の削除はリンクだけが
+        // 消えて実体は残るため、`gitlink` 単体の削除を過剰にブロックしない）。
+        let resolved_for_check = Self::canonicalize_parent_keep_filename(path);
+        if resolved_for_check != path && Self::path_has_dot_git_component(&resolved_for_check) {
             return Ok(true);
         }
 
-        if Self::path_targets_bare_repository_metadata(&canonical_path) {
+        if Self::path_targets_bare_repository_metadata(&resolved_for_check) {
             return Ok(true);
         }
 
@@ -133,6 +132,27 @@ impl GitChecker {
         path.components().any(|component| {
             matches!(component, std::path::Component::Normal(name) if Self::is_dot_git_component(name))
         })
+    }
+
+    /// 親ディレクトリのみを canonicalize し、末尾のコンポーネントは元のまま保持する。
+    ///
+    /// これにより中間 symlink を辿った実体パスを得つつ、末尾が symlink でも
+    /// その実体は解決しない。`gitlink/config` のように中間 symlink で `.git` を
+    /// バイパスするケースは検出できるが、`gitlink` 単体の削除（リンクだけ消える）は
+    /// 通常ファイルとして扱える。
+    fn canonicalize_parent_keep_filename(path: &Path) -> PathBuf {
+        let Some(file_name) = path.file_name() else {
+            return path.to_path_buf();
+        };
+        let Some(parent) = path.parent() else {
+            return path.to_path_buf();
+        };
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            return canonical_parent.join(file_name);
+        }
+        // 親も canonicalize できない場合は、既存祖先まで辿って再結合する。
+        // 末尾コンポーネントは保持するので末尾 symlink を辿らない原則は守られる。
+        Self::try_canonicalize_existing_parent(path)
     }
 
     /// `.git` の大文字小文字を区別しない比較。
@@ -2657,6 +2677,48 @@ mod tests {
         assert!(
             GitChecker::path_targets_or_contains_git_metadata(&target, false),
             "中間 symlink 経由で bare リポジトリ配下を指すパスはブロックすべき"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_targets_symlink_self_to_dot_git_allowed() {
+        // symlink 自身を削除する場合はリンクだけが消え実体の `.git` は残るため、
+        // リンク先が `.git` でも削除を許可する（既存方針との整合性）。
+        let temp_dir = TempDir::new().unwrap();
+        let nested_dot_git = temp_dir.path().join("nested").join(".git");
+        fs::create_dir_all(&nested_dot_git).unwrap();
+
+        let gitlink = temp_dir.path().join("gitlink");
+        std::os::unix::fs::symlink(&nested_dot_git, &gitlink).unwrap();
+
+        // gitlink 自身（リンクのみ）の削除はブロックしない
+        assert!(
+            !GitChecker::path_targets_or_contains_git_metadata(&gitlink, false),
+            "symlink 自身（リンク先が .git）の削除はブロックしないでよい"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_targets_symlink_self_to_bare_repo_allowed() {
+        // bare リポジトリへの symlink 自身も同様にリンクだけ消えるので許可。
+        let temp_dir = TempDir::new().unwrap();
+        let bare = temp_dir.path().join("bare.git");
+
+        Command::new("git")
+            .args(["init", "--bare", bare.to_str().unwrap()])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+
+        let alias = temp_dir.path().join("alias");
+        std::os::unix::fs::symlink(&bare, &alias).unwrap();
+
+        // alias 自身（リンクのみ）の削除はブロックしない
+        assert!(
+            !GitChecker::path_targets_or_contains_git_metadata(&alias, false),
+            "symlink 自身（リンク先が bare repo）の削除はブロックしないでよい"
         );
     }
 }

@@ -40,20 +40,21 @@ CLI引数パース → Config読込 → Git repo検出 → [Git status一括取�
 | `config.rs` | `~/.config/safe-rm/config.toml` の読込。`allowed_paths` と `allow_project_deletion` の管理 |
 | `error.rs` | `SafeRmError` enum（終了コード: 0=成功, 1=操作エラー, 2=セキュリティブロック）、`FileStatus` enum（`is_deletable()` メソッド付き）。`PartialFailure` には `dry_run` フラグがあり、ドライラン時は「would be removed」と表示する |
 | `path_checker.rs` | パス正規化、プロジェクトルート内包含検証、シンボリックリンク解決、非存在パスでも既存親を canonicalize して別名パス差異を吸収、ディレクトリトラバーサル防止 |
-| `git_checker.rs` | Git リポジトリ検出、ファイルステータス判定 (Clean/Modified/Staged/Untracked/Ignored/NotInRepo)、ディレクトリ再帰チェック（symlink非追従）、Git 管理メタデータを含む再帰削除の検出。`path_targets_or_contains_git_metadata()` / `try_path_targets_or_contains_git_metadata()` で削除対象自体・任意の中間コンポーネント・再帰削除時の配下に含まれる任意階層の Git 管理メタデータを検出し、ネストしたリポジトリのメタデータも保護する。`.git` ファイル/ディレクトリに加え、`.git` コンポーネントを持たない bare リポジトリのルートや配下の管理ファイルも検出する。コンポーネント比較は ASCII case-insensitive で行い、macOS APFS のような大文字小文字を区別しないファイルシステムで `.GIT` 経由のバイパスも防ぐ。実削除前の検査ではディレクトリ読み取り・エントリ取得エラーを `DirectoryReadError` として返し、fail-closed でブロックする。ワークディレクトリは構造体に canonicalize 済みでキャッシュし、`to_workdir_relative()` で canonical/未解決両方のパスに対応。`status_file()` が未追跡ディレクトリを畳み込むケースでは、再帰付き status 一覧で再確認してネストした未追跡ファイルを取りこぼさない。ディレクトリ配下は常に再帰検査し、ignored ファイルは許可する一方で、ignored 親ディレクトリ配下の tracked 変更済み/ステージング済みファイルや未追跡ファイルはブロックする。Git API エラー時は fail-closed で削除をブロック（`get_all_statuses` は `Result` を返し、`resolve_status_from_relative_path` は予期しないエラーで `Modified` を返し、`lookup_status_in_listing` も `statuses()` 失敗時に `Modified` を返す） |
+| `git_checker.rs` | Git リポジトリ検出、ファイルステータス判定 (Clean/Modified/Staged/Untracked/Ignored/NotInRepo)、ディレクトリ再帰チェック（symlink非追従）、Git 管理メタデータを含む再帰削除の検出。`path_targets_or_contains_git_metadata()` / `try_path_targets_or_contains_git_metadata()` で削除対象自体・任意の中間コンポーネント・再帰削除時の配下に含まれる任意階層の Git 管理メタデータを検出し、ネストしたリポジトリのメタデータも保護する。`.git` ファイル/ディレクトリに加え、`.git` コンポーネントを持たない bare リポジトリのルートや配下の管理ファイルも検出する。中間 symlink 経由のバイパスを防ぐため、親ディレクトリのみ canonicalize して末尾コンポーネントは保持する `canonicalize_parent_keep_filename()` を併用する（symlink 自身の削除は許可しつつ、`gitlink/config` のように中間 symlink で `.git` を指すケースは確実にブロックする）。コンポーネント比較は ASCII case-insensitive で行い、macOS APFS のような大文字小文字を区別しないファイルシステムで `.GIT` 経由のバイパスも防ぐ。`convert_status()` は `Status::CONFLICTED` を Modified にマッピングして、CONFLICTED が単独で立つ稀なケースでも Clean に落として削除許可してしまう不具合を防ぐ。実削除前の検査ではディレクトリ読み取り・エントリ取得エラーを `DirectoryReadError` として返し、fail-closed でブロックする。ワークディレクトリは構造体に canonicalize 済みでキャッシュし、`to_workdir_relative()` で canonical/未解決両方のパスに対応。`status_file()` が未追跡ディレクトリを畳み込むケースでは、再帰付き status 一覧で再確認してネストした未追跡ファイルを取りこぼさない。ディレクトリ配下は常に再帰検査し、ignored ファイルは許可する一方で、ignored 親ディレクトリ配下の tracked 変更済み/ステージング済みファイルや未追跡ファイルはブロックする。Git API エラー時は fail-closed で削除をブロック（`get_all_statuses` は `Result` を返し、`resolve_status_from_relative_path` は予期しないエラーで `Modified` を返し、`lookup_status_in_listing` も `statuses()` 失敗時に `Modified` を返す） |
 | `init.rs` | `safe-rm init` によるデフォルト設定ファイル生成 |
 
 ### セキュリティモデル
 
 1. **Git管理メタデータ保護** (常時有効): `.git`、gitdir 参照ファイル、bare リポジトリ管理パス、現在のリポジトリの Git 管理メタデータを含む再帰削除に加え、削除対象自身・パスの任意の中間コンポーネント・再帰削除時に配下に存在する任意階層の Git 管理メタデータ（ネストした `.git` と bare リポジトリを含む）をブロック。コンポーネント比較は ASCII case-insensitive で、macOS APFS のような大文字小文字を区別しないファイルシステムでの `.GIT` 経由バイパスも防止
 2. **パス包含検証** (常時有効): `allowed_paths` 以外では、再帰的な Git 管理メタデータ探索より先にプロジェクトルート外への削除をブロック
-3. **Git保護** (`allow_project_deletion = false` 時): Modified/Staged/Untracked ファイルの削除をブロック
+3. **Git保護** (`allow_project_deletion = false` 時): Modified/Staged/Untracked/コンフリクト中ファイルの削除をブロック（CONFLICTED フラグも Modified として扱う）
 4. **allowed_paths**: 設定ファイルで指定したパスは包含チェックと Git ステータスチェックをバイパスするが、Git管理メタデータ保護はバイパスしない
 5. **Fail-Closed**: ディレクトリ読取エラーおよび Git API エラー時は削除をブロック（無視しない）
 6. **Ignored混在ディレクトリ保護**: 厳格モードでは ignored ディレクトリでも配下を再帰検査し、ignored ファイルは許可する一方で tracked 変更済み/ステージング済みファイルや未追跡ファイルをブロックする
 7. **Symlink安全性**: Gitチェック時のディレクトリ判定および任意階層 `.git` 検出は `symlink_metadata()` ベースで、ディレクトリsymlinkを辿らずリンク自体を評価
 8. **シンボリックリンク経由の `..` 脱出防止**: メタデータ取得・削除・許可判定はすべて `path_clean` で字句的に `..` を解決した正規化パス（`normalized_path`）で行い、`link/../victim` のように OS の path resolution を悪用したプロジェクト境界の脱出をブロック
 9. **エイリアスパス耐性**: パス包含検証と `allowed_paths` 判定では、非存在パスでも既存親ディレクトリまで canonicalize して未作成部分を再結合し、repo symlink 別名や `/var` と `/private/var` 差異を吸収。Git管理メタデータ保護と Gitチェックでは非symlinkパスを canonicalize して比較し、symlink パスは「親ディレクトリのみ canonicalize + リンク名維持」で照合することでバイパスを防止（repo symlink 別名を cwd にした場合も含む）
+10. **中間 symlink 経由 `.git` バイパス防止**: `gitlink -> nested/.git` のような symlink を中間に挟んで `gitlink/config` を削除しようとしても、親ディレクトリを canonicalize して `.git` コンポーネントの存在を確認することで実体パスへの到達をブロックする。bare リポジトリへの中間 symlink 経由削除も同様に防止。symlink 自身の削除はリンクのみが消えて実体は残るため、リンク先が `.git` や bare repo であっても削除を許可する（過剰防御を回避）
 
 ### パフォーマンス最適化
 
