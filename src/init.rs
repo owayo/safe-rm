@@ -5,7 +5,7 @@
 use crate::config::Config;
 use std::fs;
 
-/// ~/.claude/skills を有効にしたデフォルト設定テンプレート
+/// ~/.claude/skills と /tmp を有効にしたデフォルト設定テンプレート
 const CONFIG_TEMPLATE: &str = r#"# safe-rm の設定
 # 保存先: ~/.config/safe-rm/config.toml
 #
@@ -16,6 +16,11 @@ const CONFIG_TEMPLATE: &str = r#"# safe-rm の設定
 # ~/.claude/skills 配下を再帰的に許可
 [[allowed_paths]]
 path = "~/.claude/skills"
+recursive = true
+
+# /tmp 配下を再帰的に許可
+[[allowed_paths]]
+path = "/tmp"
 recursive = true
 
 # 例: /tmp/logs の直下の子だけを許可
@@ -52,7 +57,7 @@ pub fn run_init() -> Result<(), String> {
 
     println!("Created config file: {}", config_path.display());
     println!();
-    println!("Default: ~/.claude/skills is allowed (recursive).");
+    println!("Defaults: ~/.claude/skills and /tmp are allowed (recursive).");
     println!("Edit the file to add more allowed paths.");
 
     Ok(())
@@ -72,9 +77,11 @@ mod tests {
     #[test]
     fn test_config_template_is_valid_toml() {
         let config: Config = toml::from_str(CONFIG_TEMPLATE).unwrap();
-        assert_eq!(config.allowed_paths.len(), 1);
+        assert_eq!(config.allowed_paths.len(), 2);
         assert_eq!(config.allowed_paths[0].path, "~/.claude/skills");
         assert!(config.allowed_paths[0].recursive);
+        assert_eq!(config.allowed_paths[1].path, "/tmp");
+        assert!(config.allowed_paths[1].recursive);
     }
 
     #[test]
@@ -151,6 +158,10 @@ recursive = false
         assert!(
             CONFIG_TEMPLATE.contains("~/.claude/skills"),
             "テンプレートに ~/.claude/skills が必要"
+        );
+        assert!(
+            CONFIG_TEMPLATE.contains("\"/tmp\""),
+            "テンプレートに /tmp が必要"
         );
     }
 }
