@@ -108,6 +108,7 @@ safe-rm -rf build/
 # デフォルト設定ファイルを生成
 safe-rm init
 # → ~/.config/safe-rm/config.toml を作成
+# デフォルトでは ~/.claude/skills と /tmp を再帰的に許可
 ```
 
 ### 設定ファイル形式
@@ -124,10 +125,15 @@ allow_project_deletion = true
 path = "~/.claude/skills"
 recursive = true
 
-# このディレクトリの直下のファイルのみ許可
+# /tmp 配下を再帰的に許可
 [[allowed_paths]]
-path = "/tmp/logs"
-recursive = false
+path = "/tmp"
+recursive = true
+
+# このディレクトリの直下のファイルのみ許可
+# [[allowed_paths]]
+# path = "/tmp/logs"
+# recursive = false
 ```
 
 ### フィールド
@@ -140,9 +146,9 @@ recursive = false
 
 ### 動作
 
-- **`allow_project_deletion = true`（デフォルト）**: プロジェクト内の作業ツリーファイルは Git ステータスチェックなしで削除可能。`.git` などの Git 管理パスと、現在のリポジトリの Git 管理メタデータを含む再帰削除は引き続きブロック。
+- **`allow_project_deletion = true`（デフォルト）**: プロジェクト内の作業ツリーファイルは Git ステータスチェックなしで削除可能。`.git` などの Git 管理パスと、ネストしたリポジトリを含む任意リポジトリの Git 管理メタデータを含む再帰削除は引き続きブロック。
 - **`allow_project_deletion = false`**: クリーン（コミット済み）または無視された作業ツリーファイルのみ削除可能。ignored な親ディレクトリ配下にある場合でも未コミットの変更は保護され、Git 管理パスも引き続きブロック。`allowed_paths` にマッチするパスは、現在のリポジトリの index を読めない場合でも Git ステータスチェックをバイパス。
-- `allowed_paths` にマッチするパスは、プロジェクト境界チェックと Git ステータスチェックをバイパスするが、現在のリポジトリの Git 管理メタデータ保護はバイパスできない。未作成パスでも既存親ディレクトリまで canonicalize して別名パス差異を吸収
+- `allowed_paths` にマッチするパスは、プロジェクト境界チェックと Git ステータスチェックをバイパスするが、任意リポジトリの Git 管理メタデータ保護はバイパスできない。未作成パスでも既存親ディレクトリまで canonicalize して別名パス差異を吸収
 - `recursive` フラグでサブディレクトリの扱いを制御:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可
   - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可
@@ -152,7 +158,11 @@ recursive = false
 ### 例
 
 ```bash
-# 設定: allowed_paths = [{ path = "~/.claude/skills", recursive = true }]
+# `safe-rm init` が生成するデフォルト設定:
+# allowed_paths = [
+#   { path = "~/.claude/skills", recursive = true },
+#   { path = "/tmp", recursive = true },
+# ]
 
 # 現在のプロジェクト外でも動作:
 safe-rm ~/.claude/skills/my-skill/rules.md

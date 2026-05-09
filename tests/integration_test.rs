@@ -922,6 +922,21 @@ mod edge_case_tests {
             stdout.contains("--dry-run"),
             "Help should mention --dry-run"
         );
+        assert!(
+            stdout.contains("blocks deletion outside the project"),
+            "Help should describe the default containment protection: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("allow_project_deletion = false"),
+            "Help should describe strict-mode Git status protection: {}",
+            stdout
+        );
+        assert!(
+            !stdout.contains("only clean or ignored files"),
+            "Help must not claim strict-mode behavior is the default: {}",
+            stdout
+        );
     }
 
     #[test]

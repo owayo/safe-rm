@@ -11,9 +11,9 @@ use std::path::PathBuf;
     name = "safe-rm",
     version,
     about = "Safe file deletion tool for AI agents",
-    long_about = "A CLI tool that provides Git-aware access control for file deletion.\n\
-                  It allows deleting only clean or ignored files within the project directory,\n\
-                  preventing accidental deletion of uncommitted work or files outside the project.",
+    long_about = "A CLI tool that blocks deletion outside the project and protects Git metadata.\n\
+                  By default, worktree files inside the project are allowed. When \
+                  allow_project_deletion = false, modified, staged, and untracked files are also blocked.",
     subcommand_negates_reqs = true
 )]
 pub struct CliArgs {
