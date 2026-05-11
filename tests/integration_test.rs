@@ -3633,7 +3633,7 @@ mod batch_exit_code_priority_tests {
         assert_eq!(exit_code, 0, "全ファイル削除成功時は exit 0");
         assert!(stdout.contains("removed: file1.txt"));
         assert!(stdout.contains("removed: file2.txt"));
-        assert!(stderr.is_empty(), "エラー出力はない��き");
+        assert!(stderr.is_empty(), "エラー出力はないべき");
     }
 }
 
@@ -3943,15 +3943,15 @@ mod symlink_dotdot_traversal_tests {
         return; // Unix のみ対応
 
         // `link/../victim.txt` を削除しようとする
-        let (exit_code, _stdout, _stderr) = run_safe_rm(&["link/../victim.txt"], &repo_path);
+        let (exit_code, _stdout, stderr) = run_safe_rm(&["link/../victim.txt"], &repo_path);
 
-        // 包含チェックの仕様としては「字句的 clean → repo/victim.txt」となり、
-        // repo/victim.txt は存在しないため NotFound (exit 1) になる、もしくは
-        // 包含検証で OutsideProject (exit 2) になるべき。
-        // どちらにしても、プロジェクト外の victim.txt を削除してはならない。
-        assert_ne!(
-            exit_code, 0,
-            "symlink/.. による脱出は許してはならない: stderr 不要"
+        // `..` がシンボリックリンク成分を消す時点で、正規化後の別パスに
+        // すり替わるため、削除前にセキュリティエラーとして拒否する。
+        assert_eq!(exit_code, 2, "symlink/.. は拒否されるべき");
+        assert!(
+            stderr.contains("シンボリックリンク経由"),
+            "拒否理由が表示されるべき: {}",
+            stderr
         );
         assert!(
             victim.exists(),
@@ -3979,11 +3979,57 @@ mod symlink_dotdot_traversal_tests {
         return;
 
         // --force を付けても削除されてはならない
-        let (_exit_code, _stdout, _stderr) = run_safe_rm(&["-f", "link/../victim.txt"], &repo_path);
+        let (exit_code, _stdout, stderr) = run_safe_rm(&["-f", "link/../victim.txt"], &repo_path);
 
+        assert_eq!(exit_code, 2, "--force でも symlink/.. は拒否されるべき");
+        assert!(
+            stderr.contains("シンボリックリンク経由"),
+            "拒否理由が表示されるべき: {}",
+            stderr
+        );
         assert!(
             victim.exists(),
             "--force でも symlink/.. による脱出を許してはならない"
+        );
+    }
+
+    #[test]
+    fn test_symlink_dotdot_does_not_delete_normalized_inside_file() {
+        // 字句的 clean 後の repo/victim.txt が存在しても、攻撃パスから削除してはならない
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "victim.txt", "inside");
+
+        let outside_dir = TempDir::new().unwrap();
+        let outside_canonical = outside_dir.path().canonicalize().unwrap();
+        let outside_sub = outside_canonical.join("sub");
+        fs::create_dir_all(&outside_sub).unwrap();
+        let outside_victim = outside_canonical.join("victim.txt");
+        fs::write(&outside_victim, "outside").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_sub, repo_path.join("link")).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let (exit_code, _stdout, stderr) = run_safe_rm(&["link/../victim.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "symlink/.. は削除対象を変えるため拒否されるべき"
+        );
+        assert!(
+            stderr.contains("シンボリックリンク経由"),
+            "拒否理由が表示されるべき: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("victim.txt").exists(),
+            "正規化後のプロジェクト内ファイルも削除してはならない"
+        );
+        assert!(
+            outside_victim.exists(),
+            "プロジェクト外のファイルも削除してはならない"
         );
     }
 }

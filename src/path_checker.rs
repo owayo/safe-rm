@@ -65,6 +65,53 @@ impl PathChecker {
         Ok(canonical_path)
     }
 
+    /// `..` がシンボリックリンク成分を消すパスを拒否する。
+    ///
+    /// OS の path resolution はシンボリックリンクを辿ってから `..` を解決するが、
+    /// `path_clean` は字句的に `..` を畳み込む。そのため `link/../victim` のような
+    /// パスを許すと、外部脱出を防げても正規化後の別ファイルを削除してしまう。
+    pub fn reject_symlink_parent_traversal(
+        resolve_base: &Path,
+        target_path: &Path,
+    ) -> Result<(), SafeRmError> {
+        let absolute_path = Self::to_absolute(resolve_base, target_path);
+        let mut current = PathBuf::new();
+        let mut component_is_symlink = Vec::new();
+
+        for component in absolute_path.components() {
+            match component {
+                std::path::Component::Prefix(prefix) => {
+                    current.push(prefix.as_os_str());
+                    component_is_symlink.clear();
+                }
+                std::path::Component::RootDir => {
+                    current.push(component.as_os_str());
+                    component_is_symlink.clear();
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(name) => {
+                    current.push(name);
+                    let is_symlink = std::fs::symlink_metadata(&current)
+                        .map(|metadata| metadata.file_type().is_symlink())
+                        .unwrap_or(false);
+                    component_is_symlink.push(is_symlink);
+                }
+                std::path::Component::ParentDir => {
+                    if let Some(removed_symlink) = component_is_symlink.pop() {
+                        if removed_symlink {
+                            return Err(SafeRmError::UnsafeTraversal {
+                                path: target_path.to_path_buf(),
+                            });
+                        }
+                        current.pop();
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// 相対パスを絶対パスに変換
     fn to_absolute(base: &Path, path: &Path) -> PathBuf {
         if path.is_absolute() {
@@ -288,6 +335,39 @@ mod tests {
 
         let result = PathChecker::verify_containment(&project_root, &link_path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_reject_symlink_parent_traversal_blocks_removed_symlink_component() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let outside_sub = outside_dir.path().join("sub");
+        fs::create_dir_all(&outside_sub).unwrap();
+
+        std::os::unix::fs::symlink(&outside_sub, project_root.join("link")).unwrap();
+
+        let result = PathChecker::reject_symlink_parent_traversal(
+            &project_root,
+            Path::new("link/../victim.txt"),
+        );
+
+        assert!(matches!(result, Err(SafeRmError::UnsafeTraversal { .. })));
+    }
+
+    #[test]
+    fn test_reject_symlink_parent_traversal_allows_normal_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+        fs::create_dir(project_root.join("sub")).unwrap();
+
+        let result = PathChecker::reject_symlink_parent_traversal(
+            &project_root,
+            Path::new("sub/../victim.txt"),
+        );
+
+        assert!(result.is_ok());
     }
 
     #[test]

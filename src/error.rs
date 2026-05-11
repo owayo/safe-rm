@@ -67,6 +67,8 @@ pub enum SafeRmError {
     DangerousOption { option: String },
     /// ディレクトリ読み取り失敗（fail-closed）
     DirectoryReadError { path: PathBuf },
+    /// シンボリックリンク経由の親ディレクトリ参照
+    UnsafeTraversal { path: PathBuf },
     /// Git 管理メタデータへのアクセス
     ProtectedGitPath { path: PathBuf },
     /// プロジェクト外へのアクセス
@@ -92,6 +94,7 @@ impl SafeRmError {
             Self::ShellExpansionDetected { .. }
             | Self::DangerousOption { .. }
             | Self::DirectoryReadError { .. }
+            | Self::UnsafeTraversal { .. }
             | Self::ProtectedGitPath { .. }
             | Self::OutsideProject { .. }
             | Self::DirtyFiles { .. } => 2,
@@ -144,6 +147,12 @@ impl SafeRmError {
             Self::DirectoryReadError { path } => {
                 format!(
                     "ディレクトリの読み取りに失敗しました（安全のため削除をブロック）。\nPath: {}",
+                    path.display()
+                )
+            }
+            Self::UnsafeTraversal { path } => {
+                format!(
+                    "シンボリックリンク経由の親ディレクトリ参照は許可されていません。\nPath: {}\n正規化で別の削除対象に変わる可能性があるため、実体パスを直接指定してください。",
                     path.display()
                 )
             }
@@ -227,6 +236,13 @@ mod tests {
         assert_eq!(
             SafeRmError::ProtectedGitPath {
                 path: PathBuf::from(".git")
+            }
+            .exit_code(),
+            2
+        );
+        assert_eq!(
+            SafeRmError::UnsafeTraversal {
+                path: PathBuf::from("link/../victim.txt")
             }
             .exit_code(),
             2
@@ -402,6 +418,16 @@ mod tests {
         let msg = err.user_message();
         assert!(msg.contains("/tmp/unreadable"));
         assert!(msg.contains("ディレクトリの読み取り"));
+    }
+
+    #[test]
+    fn test_user_message_unsafe_traversal() {
+        let err = SafeRmError::UnsafeTraversal {
+            path: PathBuf::from("link/../victim.txt"),
+        };
+        let msg = err.user_message();
+        assert!(msg.contains("シンボリックリンク経由"));
+        assert!(msg.contains("link/../victim.txt"));
     }
 
     #[test]

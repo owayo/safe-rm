@@ -143,6 +143,8 @@ fn process_path(
     } else {
         cwd.join(path)
     };
+    PathChecker::reject_symlink_parent_traversal(cwd, path)?;
+
     // 字句的に `..` を解決した正規化パス。
     // OS の path resolution は symlink を辿った後で `..` を解決するため、
     // ユーザー入力をそのまま OS に渡すと `link/../victim` のような形で
