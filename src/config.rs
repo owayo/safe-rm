@@ -63,6 +63,21 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// 設定ファイルの読込/解析に失敗した場合のフォールバック設定。
+    ///
+    /// 既に設定ファイルが置かれている環境で `allow_project_deletion = false`
+    /// を意図していた可能性があるため、安全側の strict 設定に倒す。
+    /// 設定ファイル自体が存在しない場合は通常の `default()` が使われる。
+    fn fail_closed_default() -> Self {
+        Self {
+            allow_project_deletion: false,
+            allowed_paths: Vec::new(),
+            allowed_paths_resolved: Vec::new(),
+        }
+    }
+}
+
 /// ディレクトリごとの設定を持つ許可パスエントリ
 #[derive(Debug, Clone, Deserialize)]
 pub struct AllowedPathEntry {
@@ -95,14 +110,15 @@ impl Config {
     }
 
     /// 指定パスから設定を読み込み
+    ///
+    /// `read_to_string()` を直接呼ぶことで、`Path::exists()` が権限エラーで
+    /// `false` を返し permissive default に倒れてしまう経路を避ける。
+    /// `ErrorKind::NotFound` の場合のみファイル不在として permissive default を返し、
+    /// それ以外の I/O エラー（権限、I/O 失敗等）は fail-closed で strict モードへ倒す。
     pub fn load_from_path(path: Option<PathBuf>) -> Self {
         let Some(path) = path else {
             return Self::default();
         };
-
-        if !path.exists() {
-            return Self::default();
-        }
 
         match std::fs::read_to_string(&path) {
             Ok(content) => match toml::from_str::<Config>(&content) {
@@ -111,21 +127,27 @@ impl Config {
                     config
                 }
                 Err(e) => {
+                    // fail-closed: 設定ファイルが壊れているときは strict モードへ倒す。
+                    // permissive default に戻すと、利用者が意図した strict 設定が
+                    // 一部の構文エラーで無効化されてしまうため。
                     eprintln!(
-                        "safe-rm: warning: config parse error ({}): {}",
+                        "safe-rm: warning: config parse error ({}): {}; falling back to strict mode (allow_project_deletion = false)",
                         path.display(),
                         e
                     );
-                    Self::default()
+                    Self::fail_closed_default()
                 }
             },
+            // ファイル不在のみ permissive default にフォールバック
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            // 権限エラー等のその他の I/O エラーは fail-closed
             Err(e) => {
                 eprintln!(
-                    "safe-rm: warning: cannot read config ({}): {}",
+                    "safe-rm: warning: cannot read config ({}): {}; falling back to strict mode (allow_project_deletion = false)",
                     path.display(),
                     e
                 );
-                Self::default()
+                Self::fail_closed_default()
             }
         }
     }
@@ -335,14 +357,25 @@ mod tests {
 
     #[test]
     fn test_load_missing_file() {
+        // 設定ファイルが存在しない場合は permissive default (allow_project_deletion = true) を返す。
+        // fail-closed (parse エラー時) と挙動を区別する必要があるため明示的に検証する。
         let config = Config::load_from_path(Some(PathBuf::from("/nonexistent/config.toml")));
         assert!(config.allowed_paths.is_empty());
+        assert!(
+            config.allow_project_deletion,
+            "存在しない設定ファイルは permissive default にフォールバックすべき"
+        );
     }
 
     #[test]
     fn test_load_none_path() {
+        // 設定パスが None の場合も permissive default を返す。
         let config = Config::load_from_path(None);
         assert!(config.allowed_paths.is_empty());
+        assert!(
+            config.allow_project_deletion,
+            "None パスは permissive default にフォールバックすべき"
+        );
     }
 
     #[test]
@@ -373,10 +406,16 @@ recursive = false
 
     #[test]
     fn test_parse_invalid_config() {
+        // 設定ファイルがパース失敗した場合、fail-closed で strict モード
+        // (allow_project_deletion = false) にフォールバックする。
         let tmp = tempfile::NamedTempFile::new().unwrap();
         fs::write(tmp.path(), "invalid[[[toml").unwrap();
         let config = Config::load_from_path(Some(tmp.path().to_path_buf()));
         assert!(config.allowed_paths.is_empty());
+        assert!(
+            !config.allow_project_deletion,
+            "parse 失敗時は strict モード (allow_project_deletion = false) にフォールバックすべき"
+        );
     }
 
     #[test]

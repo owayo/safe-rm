@@ -20,19 +20,67 @@ impl GitChecker {
     /// `Repository::discover` を使用して上位ディレクトリを走査し、
     /// Gitリポジトリを検出する。サブディレクトリからでもリポジトリルートを正しく検出可能。
     ///
+    /// Git API エラー（壊れた `.git`、権限不足、I/O エラー等）は fail-closed で
+    /// `Err` を返す。`NotFound` 等のエラーコードでも、`path` 直下またはその祖先に
+    /// `.git` メタデータが存在する場合は「壊れた `.git`」と判断して `Err` を伝播し、
+    /// メタデータがどこにも見つからない場合のみ `Ok(None)` を返す。
+    ///
     /// # 戻り値
-    /// * `Some(GitChecker)` - Git リポジトリが存在
-    /// * `None` - Git リポジトリなし（Git チェックスキップ）
-    pub fn open(path: &Path) -> Option<Self> {
-        Repository::discover(path).ok().map(|repo| {
-            let workdir_canonical = repo
-                .workdir()
-                .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
-            Self {
-                repo,
-                workdir_canonical,
+    /// * `Ok(Some(GitChecker))` - Git リポジトリが存在
+    /// * `Ok(None)` - Git リポジトリなし（Git チェックスキップ）
+    /// * `Err(SafeRmError::GitError)` - Git API エラー（fail-closed）
+    pub fn open(path: &Path) -> Result<Option<Self>, SafeRmError> {
+        match Repository::discover(path) {
+            Ok(repo) => {
+                let workdir_canonical = repo
+                    .workdir()
+                    .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+                Ok(Some(Self {
+                    repo,
+                    workdir_canonical,
+                }))
             }
-        })
+            Err(e) => {
+                // `NotFound` 等で「Git リポジトリが見つからない」と判定された場合でも、
+                // 実際には `.git` メタデータが存在する可能性がある（壊れた `.git` が
+                // discover から NotFound として返るケース等）。祖先に `.git` の痕跡が
+                // 一切なければ非 Git 環境として扱い、それ以外は fail-closed で伝播する。
+                if Self::has_git_metadata_ancestor(path) {
+                    Err(SafeRmError::GitError(e))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// `path` 自身または任意の祖先ディレクトリに `.git` メタデータが存在するか確認する。
+    ///
+    /// 通常リポジトリの `.git` ディレクトリ/ファイル、および bare リポジトリの
+    /// ルートを検出する。`Repository::discover` が `NotFound` 系のエラーを返した
+    /// 場合でも、`.git` が見つかれば「壊れた Git リポジトリ」とみなして fail-closed に倒す。
+    fn has_git_metadata_ancestor(path: &Path) -> bool {
+        // path 自身が `.git` ディレクトリ/ファイル、または bare リポジトリの場合も検出
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if metadata.file_type().is_dir() && Self::is_bare_repository_root(path) {
+                return true;
+            }
+        }
+
+        let mut current = Some(path);
+        while let Some(dir) = current {
+            // 通常リポジトリの `.git` ファイル/ディレクトリの存在確認
+            let dot_git = dir.join(".git");
+            if std::fs::symlink_metadata(&dot_git).is_ok() {
+                return true;
+            }
+            // bare リポジトリ（HEAD/objects/refs が同階層）の存在確認
+            if Self::is_bare_repository_root(dir) {
+                return true;
+            }
+            current = dir.parent();
+        }
+        false
     }
 
     /// Git リポジトリのワークディレクトリ（ルート）を取得
@@ -49,8 +97,12 @@ impl GitChecker {
     /// 通常のリポジトリでは `.git` ディレクトリとその配下を保護し、
     /// bare リポジトリではリポジトリ全体を保護対象にする。
     /// `.git` が gitdir ファイルの環境でも、そのファイル自体を削除できないようにする。
+    ///
+    /// 末尾コンポーネントは canonicalize せず保持することで、`.git` を指す
+    /// symlink 自身は実体ではないため Git 管理メタデータには含めない。
+    /// 中間 symlink 経由のアクセスは親までの canonicalize で検出する。
     pub fn is_git_metadata_path(&self, path: &Path) -> bool {
-        let target = Self::try_canonicalize_existing_parent(path);
+        let target = Self::canonicalize_parent_keep_filename(path);
         self.protected_git_roots()
             .iter()
             .any(|root| target.starts_with(root))
@@ -60,8 +112,14 @@ impl GitChecker {
     ///
     /// `safe-rm -r .` のようにリポジトリルートを再帰削除すると、直接 `.git` を
     /// 指定していなくても Git 管理メタデータが削除対象に含まれるためブロックする。
+    ///
+    /// 末尾コンポーネントは canonicalize せずに保持することで、`.git` を指す
+    /// symlink 自身の削除はリンクだけが消えて実体が残るため許可する
+    /// （`test_path_targets_symlink_self_to_dot_git_allowed` と同じ方針）。
+    /// `gitlink/config` のように中間 symlink を介して `.git` を指すケースでは、
+    /// 親までは canonicalize されるため引き続きブロックされる。
     pub fn touches_git_metadata_path(&self, path: &Path) -> bool {
-        let target = Self::try_canonicalize_existing_parent(path);
+        let target = Self::canonicalize_parent_keep_filename(path);
         self.protected_git_roots()
             .iter()
             .any(|root| target.starts_with(root) || root.starts_with(&target))
@@ -670,6 +728,14 @@ mod tests {
         temp_dir
     }
 
+    /// テスト用ヘルパー: Git リポジトリを開いて `GitChecker` を取得する。
+    /// `open()` は `Result<Option<Self>>` を返すため、テストでは二重 unwrap を避ける。
+    fn open_checker(path: &Path) -> GitChecker {
+        GitChecker::open(path)
+            .expect("Git API エラーは想定外")
+            .expect("Git リポジトリが存在すべき")
+    }
+
     /// ファイルを作成してコミット
     fn commit_file(repo_path: &Path, filename: &str, content: &str) {
         let file_path = repo_path.join(filename);
@@ -694,14 +760,14 @@ mod tests {
     fn test_open_git_repo() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
-        let checker = GitChecker::open(&repo_path);
+        let checker = GitChecker::open(&repo_path).expect("Git API エラーは想定外");
         assert!(checker.is_some());
     }
 
     #[test]
     fn test_open_non_git_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let checker = GitChecker::open(temp_dir.path());
+        let checker = GitChecker::open(temp_dir.path()).expect("非 Git ディレクトリは Ok(None)");
         assert!(checker.is_none());
     }
 
@@ -711,7 +777,7 @@ mod tests {
         let repo_path = temp_dir.path().canonicalize().unwrap();
         commit_file(&repo_path, "tracked.txt", "tracked");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
 
         assert!(checker.is_git_metadata_path(&repo_path.join(".git")));
         assert!(checker.is_git_metadata_path(&repo_path.join(".git").join("config")));
@@ -724,7 +790,7 @@ mod tests {
         let repo_path = temp_dir.path().canonicalize().unwrap();
         commit_file(&repo_path, "tracked.txt", "tracked");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
 
         assert!(checker.touches_git_metadata_path(&repo_path));
         assert!(checker.touches_git_metadata_path(&repo_path.join(".git")));
@@ -953,7 +1019,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let checker = GitChecker::open(&bare_repo_path).unwrap();
+        let checker = open_checker(&bare_repo_path);
 
         assert!(checker.is_git_metadata_path(&bare_repo_path.join("HEAD")));
         assert!(checker.is_git_metadata_path(&bare_repo_path.join("objects")));
@@ -969,7 +1035,7 @@ mod tests {
         // ファイルを作成してコミット
         commit_file(&repo_path, "clean.txt", "clean content");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let file_path = repo_path.join("clean.txt");
         let status = checker.get_file_status(&file_path);
 
@@ -988,7 +1054,7 @@ mod tests {
         let file_path = repo_path.join("modified.txt");
         fs::write(&file_path, "modified content").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let status = checker.get_file_status(&file_path);
 
         assert_eq!(status, FileStatus::Modified);
@@ -1010,7 +1076,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let status = checker.get_file_status(&file_path);
 
         assert_eq!(status, FileStatus::Staged);
@@ -1028,7 +1094,7 @@ mod tests {
         let file_path = repo_path.join("untracked.txt");
         fs::write(&file_path, "untracked content").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let status = checker.get_file_status(&file_path);
 
         assert_eq!(status, FileStatus::Untracked);
@@ -1047,7 +1113,7 @@ mod tests {
         let file_path = nested_dir.join("untracked.txt");
         fs::write(&file_path, "untracked content").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let status = checker.get_file_status(&file_path);
 
         assert_eq!(
@@ -1082,7 +1148,7 @@ mod tests {
         let file_path = repo_path.join("debug.log");
         fs::write(&file_path, "log content").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let status = checker.get_file_status(&file_path);
 
         assert_eq!(status, FileStatus::Ignored);
@@ -1148,7 +1214,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.check_directory(&subdir);
 
         assert!(result.is_ok());
@@ -1183,7 +1249,7 @@ mod tests {
         let file2 = subdir.join("untracked.txt");
         fs::write(&file2, "untracked").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.check_directory(&subdir);
 
         assert!(result.is_err());
@@ -1208,7 +1274,7 @@ mod tests {
         let dirty_file = nested_dir.join("untracked.txt");
         fs::write(&dirty_file, "untracked").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.check_directory(&dirty_dir);
 
         assert!(
@@ -1253,7 +1319,7 @@ mod tests {
         let artifact = build_dir.join("output.bin");
         fs::write(&artifact, "binary content").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.check_directory(&build_dir);
 
         // Ignored ディレクトリは早期許可
@@ -1285,7 +1351,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let parent = repo_path.join("a");
         let result = checker.check_directory(&parent);
 
@@ -1299,7 +1365,7 @@ mod tests {
 
         commit_file(&repo_path, "clean.txt", "clean");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let file_path = repo_path.join("clean.txt");
         let result = checker.check_path(&file_path);
 
@@ -1316,7 +1382,7 @@ mod tests {
         let file_path = repo_path.join("file.txt");
         fs::write(&file_path, "modified").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.check_path(&file_path);
 
         assert!(result.is_err());
@@ -1362,7 +1428,7 @@ mod tests {
         // Ignored ファイル
         fs::write(repo_path.join("debug.log"), "log").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let statuses = checker.get_all_statuses().unwrap();
 
         // Clean, Modified, Untracked, Ignored が status に含まれる
@@ -1379,7 +1445,7 @@ mod tests {
 
         commit_file(&repo_path, "cached_clean.txt", "content");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
         let file_path = repo_path.join("cached_clean.txt");
         let result = checker.check_file_with_cache(&file_path, &cache);
@@ -1395,7 +1461,7 @@ mod tests {
         commit_file(&repo_path, "cached_mod.txt", "original");
         fs::write(repo_path.join("cached_mod.txt"), "changed").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
         let file_path = repo_path.join("cached_mod.txt");
         let result = checker.check_file_with_cache(&file_path, &cache);
@@ -1413,7 +1479,7 @@ mod tests {
         commit_file(&repo_path, "cachedir/file1.txt", "content1");
         commit_file(&repo_path, "cachedir/file2.txt", "content2");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
         let result = checker.check_path_with_cache(&subdir, &cache);
 
@@ -1435,7 +1501,7 @@ mod tests {
         // 未追跡ファイルを追加
         fs::write(subdir.join("untracked.txt"), "untracked").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
         let result = checker.check_directory_with_cache(&subdir, &cache);
 
@@ -1450,7 +1516,7 @@ mod tests {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let workdir = checker.workdir();
 
         assert!(workdir.is_some(), "Git repo should have a workdir");
@@ -1465,7 +1531,7 @@ mod tests {
 
         commit_file(&repo_path, "dummy.txt", "dummy");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
 
         // リポジトリ外のパスに対して NotInRepo が返ることを確認
@@ -1580,7 +1646,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let mut cache = HashMap::new();
         cache.insert("nested/file.txt".to_string(), FileStatus::Untracked);
 
@@ -1608,7 +1674,7 @@ mod tests {
         let repo_path = temp_dir.path().canonicalize().unwrap();
         commit_file(&repo_path, "dummy.txt", "dummy");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
 
         // リポジトリ外のパスは NotInRepo
         let outside = Path::new("/tmp/outside_file.txt");
@@ -1626,7 +1692,7 @@ mod tests {
         let empty_dir = repo_path.join("empty");
         fs::create_dir(&empty_dir).unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.check_directory(&empty_dir);
         assert!(result.is_ok(), "空ディレクトリは削除可能であるべき");
     }
@@ -1641,7 +1707,7 @@ mod tests {
         let empty_dir = repo_path.join("empty_cached");
         fs::create_dir(&empty_dir).unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
         let result = checker.check_directory_with_cache(&empty_dir, &cache);
         assert!(
@@ -1706,7 +1772,7 @@ mod tests {
         // 実体ディレクトリ側を dirty にしても、link 自体が clean なら削除判定は許可されるべき
         fs::write(repo_path.join("target_dir").join("untracked.txt"), "dirty").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
         let result = checker.check_path_with_cache(&link_path, &cache);
         assert!(
@@ -1738,7 +1804,7 @@ mod tests {
         // Ignored ファイルを作成
         fs::write(repo_path.join("debug.log"), "log data").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         // 空キャッシュ（意図的にキャッシュミスさせる）
         let empty_cache = HashMap::new();
 
@@ -1758,7 +1824,7 @@ mod tests {
 
         commit_file(&repo_path, "tracked.txt", "content");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let empty_cache = HashMap::new();
 
         let status =
@@ -1782,7 +1848,7 @@ mod tests {
         let file_path = nested_dir.join("untracked.txt");
         fs::write(&file_path, "untracked").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let empty_cache = HashMap::new();
 
         let status = checker.get_file_status_from_cache(&file_path, &empty_cache);
@@ -1815,7 +1881,7 @@ mod tests {
         std::os::unix::fs::symlink(&repo_path, &alias_repo).unwrap();
 
         // alias 経由で repo を開く
-        let checker = GitChecker::open(&alias_repo).unwrap();
+        let checker = open_checker(&alias_repo);
 
         // canonical path で問い合わせる
         let status = checker.get_file_status(&repo_path.join("tracked.txt"));
@@ -1839,7 +1905,7 @@ mod tests {
         let alias_repo = alias_dir.path().join("repo-link");
         std::os::unix::fs::symlink(&repo_path, &alias_repo).unwrap();
 
-        let checker = GitChecker::open(&alias_repo).unwrap();
+        let checker = open_checker(&alias_repo);
         let cache = checker.get_all_statuses().unwrap();
 
         // canonical path で clean ファイルを問い合わせ
@@ -1872,7 +1938,7 @@ mod tests {
         let alias_repo = alias_dir.path().join("repo-link");
         std::os::unix::fs::symlink(&repo_path, &alias_repo).unwrap();
 
-        let checker = GitChecker::open(&alias_repo).unwrap();
+        let checker = open_checker(&alias_repo);
         let cache = checker.get_all_statuses().unwrap();
 
         // canonical path でチェック → Modified でブロックされるべき
@@ -1888,7 +1954,7 @@ mod tests {
         // ワークディレクトリ外のパスは None を返す
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
 
         let outside_path = Path::new("/tmp/definitely-not-in-repo/file.txt");
         let status = checker.get_file_status(outside_path);
@@ -1925,7 +1991,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         commit_file(&repo_path, "subdir/sub.txt", "sub content");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
 
         // ファイル — Clean で成功
         assert!(checker.check_path(&file).is_ok());
@@ -1945,7 +2011,7 @@ mod tests {
         // 無視対象ファイルを作成
         fs::write(repo_path.join("debug.log"), "log data").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let statuses = checker.get_all_statuses().unwrap();
 
         assert_eq!(
@@ -1967,7 +2033,7 @@ mod tests {
         let empty_dir = repo_path.join("empty");
         fs::create_dir_all(&empty_dir).unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         assert!(
             checker.check_directory(&empty_dir).is_ok(),
             "空ディレクトリの削除は許可されるべき"
@@ -1989,7 +2055,7 @@ mod tests {
         // 未追跡ファイルを追加
         fs::write(nested.join("untracked.txt"), "new").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.check_directory(&repo_path.join("a"));
         assert!(
             result.is_err(),
@@ -2043,7 +2109,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.check_file(&file_path);
 
         assert!(result.is_err(), "Staged ファイルの削除はブロックされるべき");
@@ -2069,7 +2135,7 @@ mod tests {
         commit_file(&repo_path, "dirty_file.txt", "original");
         fs::write(repo_path.join("dirty_file.txt"), "changed").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
 
         // Clean ファイルは成功
@@ -2109,7 +2175,7 @@ mod tests {
         fs::write(subdir.join("app.log"), "log data").unwrap();
         fs::write(subdir.join("debug.tmp"), "tmp data").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.check_directory(&subdir);
 
         assert!(
@@ -2132,7 +2198,7 @@ mod tests {
         fs::write(subdir.join("app.log"), "ignored log").unwrap();
         fs::write(subdir.join("untracked.txt"), "new data").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.check_directory(&subdir);
         assert!(
             result.is_err(),
@@ -2163,7 +2229,7 @@ mod tests {
         commit_file(&repo_path, ".gitignore", "ignored/\n");
         fs::write(repo_path.join("ignored/tracked.txt"), "modified").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
         let result = checker.check_directory_with_cache(&repo_path.join("ignored"), &cache);
 
@@ -2189,7 +2255,7 @@ mod tests {
         // ファイルを作成してコミット（変更なし = Clean）
         commit_file(&repo_path, "tracked_clean.txt", "content");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
 
         let file_path = repo_path.join("tracked_clean.txt");
@@ -2210,7 +2276,7 @@ mod tests {
         let repo_path = temp_dir.path().canonicalize().unwrap();
         commit_file(&repo_path, "file.txt", "content");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.get_all_statuses();
         assert!(result.is_ok(), "正常なリポジトリでは Ok を返すべき");
     }
@@ -2226,7 +2292,7 @@ mod tests {
         let repo_path = temp_dir.path().canonicalize().unwrap();
         commit_file(&repo_path, "dummy.txt", "content");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
 
         // check_file で Modified（fail-closed）が返され削除がブロックされることを確認
         // get_file_status 経由: ワークディレクトリ内の追跡済みファイルは Clean
@@ -2246,7 +2312,7 @@ mod tests {
         let repo_path = temp_dir.path().canonicalize().unwrap();
         commit_file(&repo_path, "file.txt", "content");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
 
         // 存在しないディレクトリに対してキャッシュ付きチェック
@@ -2280,7 +2346,7 @@ mod tests {
         commit_file(&repo_path, "clean.txt", "clean");
         fs::write(repo_path.join("dirty.txt"), "untracked").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
 
         // Clean ファイルは OK
         let clean_result = checker.check_file(&repo_path.join("clean.txt"));
@@ -2319,7 +2385,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
 
         // symlink-to-file は check_file 経由で処理される
         assert!(!GitChecker::is_real_directory(&link_path));
@@ -2352,7 +2418,7 @@ mod tests {
         fs::write(build_dir.join("output.bin"), "binary content").unwrap();
         fs::write(build_dir.join("log.txt"), "build log").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let result = checker.check_directory(&build_dir);
         assert!(
             result.is_ok(),
@@ -2382,7 +2448,7 @@ mod tests {
         // ignored ファイルを作成
         fs::write(repo_path.join("debug.log"), "log data").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
 
         // 空のキャッシュで問い合わせ → フォールバックで正しくステータスを取得
         let empty_cache = HashMap::new();
@@ -2402,7 +2468,7 @@ mod tests {
         let repo_path = temp_dir.path().canonicalize().unwrap();
         commit_file(&repo_path, "initial.txt", "initial");
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
 
         // リポジトリ外のパス
@@ -2421,7 +2487,7 @@ mod tests {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let statuses = checker.get_all_statuses().unwrap();
 
         // 空リポジトリではファイルがないのでマップも空
@@ -2439,7 +2505,7 @@ mod tests {
 
         fs::write(repo_path.join("new_file.txt"), "content").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let statuses = checker.get_all_statuses().unwrap();
 
         assert_eq!(
@@ -2462,7 +2528,7 @@ mod tests {
         let broken_link = repo_path.join("broken_link.txt");
         std::os::unix::fs::symlink("/nonexistent/target", &broken_link).unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let status = checker.get_file_status(&broken_link);
 
         // 壊れた symlink は未追跡ファイルとして扱われる
@@ -2485,7 +2551,7 @@ mod tests {
         let broken_link = repo_path.join("broken.txt");
         std::os::unix::fs::symlink("/nonexistent", &broken_link).unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
 
         // 壊れた symlink は Untracked なので is_deletable = false
@@ -2513,7 +2579,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
 
         let status = checker.get_file_status_from_cache(&staged_file, &cache);
@@ -2536,7 +2602,7 @@ mod tests {
         fs::create_dir_all(&build_dir).unwrap();
         fs::write(build_dir.join("output.bin"), "binary").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
         let result = checker.check_directory_with_cache(&build_dir, &cache);
 
@@ -2576,7 +2642,7 @@ mod tests {
         // Ignored ファイル
         fs::write(repo_path.join("debug.log"), "log").unwrap();
 
-        let checker = GitChecker::open(&repo_path).unwrap();
+        let checker = open_checker(&repo_path);
         let statuses = checker.get_all_statuses().unwrap();
 
         assert_eq!(statuses.get("modified.txt"), Some(&FileStatus::Modified));
@@ -2720,5 +2786,105 @@ mod tests {
             !GitChecker::path_targets_or_contains_git_metadata(&alias, false),
             "symlink 自身（リンク先が bare repo）の削除はブロックしないでよい"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_touches_git_metadata_path_allows_symlink_to_repo_dot_git() {
+        // 現在のリポジトリの `.git` を指す symlink 自身は、リンクだけ消えて
+        // 実体は残るため許可する（`test_path_targets_symlink_self_to_dot_git_allowed`
+        // と同じ「symlink 自身は許可」方針との整合性）。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let checker = open_checker(&repo_path);
+
+        // リポジトリ内に `.git` を指す symlink を作成
+        let dot_git = repo_path.join(".git");
+        let gitlink = repo_path.join("gitlink");
+        std::os::unix::fs::symlink(&dot_git, &gitlink).unwrap();
+
+        assert!(
+            !checker.touches_git_metadata_path(&gitlink),
+            "現在の repo の .git を指す symlink 自身の削除は許可すべき"
+        );
+
+        // 中間 symlink 経由で `.git` 配下に到達するケースは引き続きブロック
+        let inner = gitlink.join("config");
+        assert!(
+            checker.touches_git_metadata_path(&inner),
+            "中間 symlink を経由した .git 配下へのアクセスはブロックすべき"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_git_metadata_path_allows_symlink_to_repo_dot_git() {
+        // `is_git_metadata_path` も同様に symlink 自身は実体扱いしない方針。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let checker = open_checker(&repo_path);
+
+        let dot_git = repo_path.join(".git");
+        let gitlink = repo_path.join("gitlink");
+        std::os::unix::fs::symlink(&dot_git, &gitlink).unwrap();
+
+        assert!(
+            !checker.is_git_metadata_path(&gitlink),
+            "symlink 自身は Git 管理メタデータとして扱わない"
+        );
+
+        let inner = gitlink.join("config");
+        assert!(
+            checker.is_git_metadata_path(&inner),
+            "symlink 経由で .git 配下に到達するパスは Git 管理メタデータ扱い"
+        );
+    }
+
+    #[test]
+    fn test_open_fail_closed_on_broken_dot_git() {
+        // 壊れた `.git` ディレクトリ（必須ファイルが欠落）に対しては fail-closed
+        // で `Err` を返し、削除が permissive default に倒れないことを検証する。
+        // `Repository::discover` が `NotFound` を返した場合でも、`.git` 痕跡が
+        // 残っていれば `has_git_metadata_ancestor` が拾って `Err` に倒す。
+        let temp_dir = TempDir::new().unwrap();
+        let dot_git = temp_dir.path().join(".git");
+        fs::create_dir_all(&dot_git).unwrap();
+        // 必須エントリ（HEAD/objects/refs）を作成しないため、Git API は読込失敗する
+        fs::write(dot_git.join("dummy"), "not a real git repo").unwrap();
+
+        match GitChecker::open(temp_dir.path()) {
+            Err(SafeRmError::GitError(_)) => {
+                // 期待どおり: Git API エラーは fail-closed で伝播
+            }
+            Ok(Some(_)) => panic!("壊れた .git で Ok(Some) を返してはならない"),
+            Ok(None) => {
+                panic!("壊れた .git は fail-closed で Err(GitError) を返すべき (Ok(None) は不可)")
+            }
+            Err(other) => panic!("予期しないエラー種別: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_open_returns_none_for_truly_empty_directory() {
+        // 祖先のいずれにも `.git` 痕跡がない場合のみ `Ok(None)` を返す。
+        // CI 環境によっては `TempDir` の祖先側に `.git` がある可能性があるため、
+        // `Ok(None)` か `Err(GitError)` のどちらかを許容する（fail-closed 維持）。
+        let temp_dir = TempDir::new().unwrap();
+        let nonexistent = temp_dir.path().join("definitely-not-a-repo");
+        // ディレクトリは作らないため、`.git` 痕跡は当然ない
+        match GitChecker::open(&nonexistent) {
+            Ok(None) => {
+                // 期待どおり: 非 Git 環境として扱う
+            }
+            Err(SafeRmError::GitError(_)) => {
+                // CI 環境で祖先に `.git` が見つかった場合の fail-closed
+            }
+            Ok(Some(_)) => panic!("存在しないパスで Ok(Some) を返してはならない"),
+            Err(other) => panic!("予期しないエラー種別: {:?}", other),
+        }
     }
 }

@@ -3580,6 +3580,42 @@ mod git_error_fail_closed_tests {
             stderr
         );
     }
+
+    #[test]
+    fn test_config_parse_error_falls_back_to_strict_mode() {
+        // 設定ファイルが壊れている場合は fail-closed で strict モードに倒れ、
+        // 未追跡ファイルの削除がブロックされることを確認する。
+        // 以前は permissive default に戻っていたため、利用者が意図した
+        // strict 設定が無効化される脆弱性があった。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // 壊れた TOML を設定ファイルとして渡す
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "invalid[[[toml syntax").unwrap();
+
+        // 未追跡ファイルを作成 — strict モードならブロックされるはず
+        fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["untracked.txt"], &repo_path, Some(config.path()));
+
+        assert_ne!(
+            exit_code, 0,
+            "壊れた設定ファイルは fail-closed で strict モードに倒れ、未追跡削除をブロックすべき"
+        );
+        assert!(
+            repo_path.join("untracked.txt").exists(),
+            "strict モードフォールバック時は未追跡ファイルが残っているべき"
+        );
+        assert!(
+            stderr.contains("strict")
+                || stderr.contains("Untracked")
+                || stderr.contains("未コミット"),
+            "strict モード/未コミット由来のエラーが表示されるべき: stderr='{}'",
+            stderr
+        );
+    }
 }
 
 // =============================================================================

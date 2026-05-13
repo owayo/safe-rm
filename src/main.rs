@@ -55,7 +55,8 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
     let cwd = std::env::current_dir().map_err(SafeRmError::IoError)?;
 
     // Git リポジトリを開く（存在する場合）
-    let git_checker = GitChecker::open(&cwd);
+    // 壊れた `.git` や権限エラー時は fail-closed で `Err` が伝播される。
+    let git_checker = GitChecker::open(&cwd)?;
 
     // Git リポジトリルートをプロジェクト境界として使用（cwd ではなく）
     // 例: frontend/ から実行して backend/file.txt を削除する場合にも正しく動作

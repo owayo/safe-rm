@@ -152,7 +152,7 @@ recursive = true
 - `recursive` フラグでサブディレクトリの扱いを制御:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可
   - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可
-- 設定ファイルが存在しないか無効な場合、デフォルト動作（`allow_project_deletion = true`、許可パスなし）にフォールバック
+- 設定ファイルが**存在しない**場合は permissive デフォルト（`allow_project_deletion = true`、許可パスなし）にフォールバック。設定ファイルが**存在するが読み込み/パースに失敗**した場合は、利用者が意図した strict 設定が構文エラーで無効化されないよう、fail-closed で strict モード（`allow_project_deletion = false`、許可パスなし）にフォールバック
 - 設定で許可された削除には `(allowed by config)` の注釈が出力に表示
 
 ### 例
@@ -196,7 +196,7 @@ flowchart TB
 2. **パス境界チェック**: `allowed_paths` 以外のすべてのパスがプロジェクトディレクトリ（Gitリポジトリルート、Git外の場合はcwd）内に解決されることを、再帰的なメタデータ探索より先に確認。存在しない削除対象でも、既存の親ディレクトリまで canonicalize して別名パス差異（repo symlink 別名、`/var` と `/private/var` など）を吸収。
 3. **Git保護**: `allow_project_deletion = false` の場合、ダーティファイル（変更済み/ステージング済み/未追跡）の削除をブロック。未追跡ディレクトリの深い階層にあるファイルも対象
 4. **再帰チェック**: 実ディレクトリの場合、含まれるすべてのファイルを検証。ignored な子孫ファイルは削除可能だが、ignored な親ディレクトリが tracked な変更済み/ステージング済みファイルや未追跡の兄弟ファイルを隠すことはない
-5. **Fail-Closed**: ディレクトリ走査中のエラー（エントリ列挙エラーを含む）および Git API エラー時は削除をブロック
+5. **Fail-Closed**: ディレクトリ走査中のエラー（エントリ列挙エラーを含む）、`Repository::discover()` 由来の Git API エラー（壊れた `.git` / 権限不足 / I/O エラー等。`NotFound` だけは非 Git として扱う）、および設定ファイル読込/パースエラー時は削除をブロックまたは strict モードへフォールバック
 6. **symlink 親ディレクトリ参照ガード**: `..` が既存 symlink 成分を消すパスは削除前に拒否し、`link/../victim` が字句正規化後の別プロジェクト内ファイルへすり替わらないようにする
 7. **エイリアスパス対策**: 包含検証と `allowed_paths` 判定では既存親ディレクトリまで canonicalize して未作成部分を再結合し、Gitチェックでは非symlinkパスを canonicalize 比較し、symlink パスは「親ディレクトリのみ canonicalize + リンク自体を判定」することで、repo symlink 別名や `/var` と `/private/var` の差異による回避を防止
 
@@ -430,8 +430,8 @@ cargo build --release
 
 ### テストカバレッジ
 
-- **ユニットテスト**: ライブラリ234件 + バイナリ10件のテストで全モジュールをカバー（CLI、config、error、path_checker、git_checker、init）。Git API エラー時の fail-closed 検証、Git 管理メタデータの再帰探索エラー時の fail-closed 検証、symlink 経由の `..` 親ディレクトリ参照拒否、`FileStatus::is_deletable()` 検証、設定の前方互換性、Unix における `SAFE_RM_CONFIG` の非 UTF-8 パス対応、キャッシュフォールバック動作、空リポジトリ対応、壊れた symlink 検出、複数ステータスの一括取得、キャッシュ使用時の ignored サブディレクトリチェック、`Status::CONFLICTED` を `Modified` にマッピングする検証（単独フラグおよび他フラグとの組み合わせ）、中間 symlink 経由の `.git`/bare リポジトリバイパス検出（symlink 配下の管理ファイルはブロック、symlink 自身の削除は許可）を含む
-- **統合テスト**: 実際のGitリポジトリを使用した131件のテスト（許可/ブロックフロー、厳格モード、シンボリックリンク、repo symlink 別名の cwd からの相対実行を含むエイリアスパス対策、バッチ処理、ドライラン厳格モード、特殊ファイル名、forceフラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト、strict mode + force フラグの複合テスト、`..` コンポーネントを含む相対パス検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース、壊れた symlink のデフォルト/厳格モード対応、空リポジトリ厳格モード、バッチ force フラグ複合、allowed_paths ドライラン注釈、symlink 経由の `..` 親ディレクトリ参照拒否、中間 symlink で `.git`/bare リポジトリ配下を指す削除のブロック）
+- **ユニットテスト**: ライブラリ238件 + バイナリ10件のテストで全モジュールをカバー（CLI、config、error、path_checker、git_checker、init）。Git API エラー時の fail-closed 検証、Git 管理メタデータの再帰探索エラー時の fail-closed 検証、壊れた `.git` で `GitChecker::open()` が常に `Err(GitError)` を返し permissive 経路へ抜けないこと（祖先に `.git` 痕跡がない場合のみ `Ok(None)`）、`Config::load_from_path()` のフェイルクローズ検証（`read_to_string()` の結果で分岐し、`ErrorKind::NotFound` のみ permissive default、その他の I/O エラーと TOML パース失敗は strict モードへフォールバック）、symlink 経由の `..` 親ディレクトリ参照拒否、`FileStatus::is_deletable()` 検証、設定の前方互換性、Unix における `SAFE_RM_CONFIG` の非 UTF-8 パス対応、キャッシュフォールバック動作、空リポジトリ対応、壊れた symlink 検出、複数ステータスの一括取得、キャッシュ使用時の ignored サブディレクトリチェック、`Status::CONFLICTED` を `Modified` にマッピングする検証（単独フラグおよび他フラグとの組み合わせ）、`touches_git_metadata_path`/`is_git_metadata_path` が現在のリポジトリの `.git` を指す symlink 自身の削除を許可しつつ symlink 経由のアクセスはブロックする検証、中間 symlink 経由の `.git`/bare リポジトリバイパス検出（symlink 配下の管理ファイルはブロック、symlink 自身の削除は許可）を含む
+- **統合テスト**: 実際のGitリポジトリを使用した132件のテスト（許可/ブロックフロー、厳格モード、シンボリックリンク、repo symlink 別名の cwd からの相対実行を含むエイリアスパス対策、バッチ処理、ドライラン厳格モード、特殊ファイル名、forceフラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト、strict mode + force フラグの複合テスト、`..` コンポーネントを含む相対パス検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、設定ファイル破損時の strict モードフォールバック検証（壊れた config は permissive default に倒れず未追跡削除をブロックする）、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース、壊れた symlink のデフォルト/厳格モード対応、空リポジトリ厳格モード、バッチ force フラグ複合、allowed_paths ドライラン注釈、symlink 経由の `..` 親ディレクトリ参照拒否、中間 symlink で `.git`/bare リポジトリ配下を指す削除のブロック）
 
 ## コントリビューション
 
