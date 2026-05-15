@@ -40,17 +40,22 @@ impl GitChecker {
                     workdir_canonical,
                 }))
             }
-            Err(e) => {
-                // `NotFound` 等で「Git リポジトリが見つからない」と判定された場合でも、
-                // 実際には `.git` メタデータが存在する可能性がある（壊れた `.git` が
-                // discover から NotFound として返るケース等）。祖先に `.git` の痕跡が
-                // 一切なければ非 Git 環境として扱い、それ以外は fail-closed で伝播する。
-                if Self::has_git_metadata_ancestor(path) {
-                    Err(SafeRmError::GitError(e))
-                } else {
-                    Ok(None)
+            // `NotFound` は通常「Git リポジトリが見つからない」を意味する一方、
+            // 壊れた `.git` でも `NotFound` として返るケースがあるため、祖先に
+            // `.git` 痕跡があれば「壊れたリポジトリ」とみなし、痕跡確認そのものが
+            // 失敗した場合も信頼できないため fail-closed に倒す。痕跡が一切なく、
+            // 確認にも成功した場合のみ非 Git 環境として `Ok(None)` を返す。
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                match Self::has_git_metadata_ancestor(path) {
+                    Ok(false) => Ok(None),
+                    // `.git` 痕跡がある場合だけでなく、痕跡確認そのものが権限等で
+                    // 失敗した場合も非 Git 環境として扱わず fail-closed に倒す。
+                    Ok(true) | Err(_) => Err(SafeRmError::GitError(e)),
                 }
             }
+            // それ以外（権限エラー、I/O 失敗、壊れた `.git` で別エラーコード等）は
+            // 無条件に fail-closed で伝播。祖先確認では拾いきれない経路を許さない。
+            Err(e) => Err(SafeRmError::GitError(e)),
         }
     }
 
@@ -59,28 +64,42 @@ impl GitChecker {
     /// 通常リポジトリの `.git` ディレクトリ/ファイル、および bare リポジトリの
     /// ルートを検出する。`Repository::discover` が `NotFound` 系のエラーを返した
     /// 場合でも、`.git` が見つかれば「壊れた Git リポジトリ」とみなして fail-closed に倒す。
-    fn has_git_metadata_ancestor(path: &Path) -> bool {
+    fn has_git_metadata_ancestor(path: &Path) -> Result<bool, std::io::Error> {
         // path 自身が `.git` ディレクトリ/ファイル、または bare リポジトリの場合も検出
-        if let Ok(metadata) = std::fs::symlink_metadata(path) {
-            if metadata.file_type().is_dir() && Self::is_bare_repository_root(path) {
-                return true;
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_dir() && Self::is_bare_repository_root(path) {
+                    return Ok(true);
+                }
             }
+            Err(e) if Self::metadata_absence_error(&e) => {}
+            Err(e) => return Err(e),
         }
 
         let mut current = Some(path);
         while let Some(dir) = current {
             // 通常リポジトリの `.git` ファイル/ディレクトリの存在確認
             let dot_git = dir.join(".git");
-            if std::fs::symlink_metadata(&dot_git).is_ok() {
-                return true;
+            match std::fs::symlink_metadata(&dot_git) {
+                Ok(_) => return Ok(true),
+                Err(e) if Self::metadata_absence_error(&e) => {}
+                Err(e) => return Err(e),
             }
             // bare リポジトリ（HEAD/objects/refs が同階層）の存在確認
             if Self::is_bare_repository_root(dir) {
-                return true;
+                return Ok(true);
             }
             current = dir.parent();
         }
-        false
+        Ok(false)
+    }
+
+    /// メタデータ取得失敗のうち「対象が存在しない」と同等に扱えるエラーか判定する。
+    fn metadata_absence_error(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
     }
 
     /// Git リポジトリのワークディレクトリ（ルート）を取得
@@ -2863,6 +2882,38 @@ mod tests {
             Ok(Some(_)) => panic!("壊れた .git で Ok(Some) を返してはならない"),
             Ok(None) => {
                 panic!("壊れた .git は fail-closed で Err(GitError) を返すべき (Ok(None) は不可)")
+            }
+            Err(other) => panic!("予期しないエラー種別: {:?}", other),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_fail_closed_on_permission_denied_without_git_metadata() {
+        // Git メタデータが見つからない場合でも、探索対象自体を読めない I/O エラーは
+        // 非 Git 環境として許可せず fail-closed で伝播する。
+        let temp_dir = TempDir::new().unwrap();
+        let unreadable = temp_dir.path().join("unreadable");
+        fs::create_dir(&unreadable).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&unreadable).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&unreadable, permissions).unwrap();
+
+        let result = GitChecker::open(&unreadable);
+
+        let mut permissions = fs::metadata(&unreadable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&unreadable, permissions).unwrap();
+
+        match result {
+            Err(SafeRmError::GitError(_)) => {
+                // 期待どおり: Git 探索の I/O エラーは fail-closed で伝播
+            }
+            Ok(Some(_)) => panic!("Git メタデータのない unreadable directory で Ok(Some) は不可"),
+            Ok(None) => {
+                panic!("Git 探索の I/O エラーを非 Git 環境として扱ってはならない")
             }
             Err(other) => panic!("予期しないエラー種別: {:?}", other),
         }
