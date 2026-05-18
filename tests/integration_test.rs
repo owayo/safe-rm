@@ -3395,6 +3395,113 @@ mod allowed_paths_directory_self_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_allowed_paths_blocks_intermediate_symlink_to_dot_git() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let allowed_dir = tempfile::tempdir().unwrap();
+        let canonical_allowed = allowed_dir.path().canonicalize().unwrap();
+        let nested_repo = canonical_allowed.join("nested");
+        fs::create_dir(&nested_repo).unwrap();
+        let init_output = Command::new("git")
+            .args(["init"])
+            .current_dir(&nested_repo)
+            .output()
+            .unwrap();
+        assert!(
+            init_output.status.success(),
+            "ネストしたリポジトリの作成に成功すべき"
+        );
+
+        let git_link = canonical_allowed.join("gitlink");
+        std::os::unix::fs::symlink(nested_repo.join(".git"), &git_link).unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            "allow_project_deletion = false\n\n[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n",
+            canonical_allowed.to_string_lossy()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        let target = git_link.join("config");
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&[target.to_str().unwrap()], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "allowed_paths でも中間 symlink 経由の .git 配下削除はブロックされるべき"
+        );
+        assert!(
+            stderr.contains("Git 管理メタデータ"),
+            "Git 管理メタデータの保護エラーが必要: {}",
+            stderr
+        );
+        assert!(
+            nested_repo.join(".git").join("config").exists(),
+            "ネストしたリポジトリの config は削除されてはならない"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_allowed_paths_allows_symlink_self_to_dot_git() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let allowed_dir = tempfile::tempdir().unwrap();
+        let canonical_allowed = allowed_dir.path().canonicalize().unwrap();
+        let nested_repo = canonical_allowed.join("nested");
+        fs::create_dir(&nested_repo).unwrap();
+        let init_output = Command::new("git")
+            .args(["init"])
+            .current_dir(&nested_repo)
+            .output()
+            .unwrap();
+        assert!(
+            init_output.status.success(),
+            "ネストしたリポジトリの作成に成功すべき"
+        );
+
+        let git_link = canonical_allowed.join("gitlink");
+        std::os::unix::fs::symlink(nested_repo.join(".git"), &git_link).unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            "allow_project_deletion = false\n\n[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n",
+            canonical_allowed.to_string_lossy()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &[git_link.to_str().unwrap()],
+            &repo_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "allowed_paths 配下の .git への symlink 自身は削除可能であるべき: {}",
+            stderr
+        );
+        assert!(
+            stdout.contains("allowed by config"),
+            "設定による許可メッセージが表示されるべき: {}",
+            stdout
+        );
+        assert!(
+            git_link.symlink_metadata().is_err(),
+            "symlink 自身が削除されているべき"
+        );
+        assert!(
+            nested_repo.join(".git").join("config").exists(),
+            "リンク先の Git 管理メタデータは残っているべき"
+        );
+    }
+
     /// 非再帰 allowed_paths で許可ディレクトリ自体は削除不可であることを検証
     #[test]
     fn test_non_recursive_allowed_path_directory_itself_blocked() {

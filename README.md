@@ -148,7 +148,7 @@ recursive = true
 
 - **`allow_project_deletion = true` (default)**: Worktree files inside the project can be deleted without Git status checks. Git administrative paths such as `.git`, and recursive deletion of a path that contains any repository metadata (including nested repositories), are still blocked.
 - **`allow_project_deletion = false`**: Only clean (committed) or ignored worktree files can be deleted. Uncommitted changes are protected even when they live under an ignored parent directory, and Git administrative paths are still blocked. Paths matching `allowed_paths` still bypass Git status checks even if the current repository cannot read its index.
-- Paths matching `allowed_paths` bypass project containment and Git status checks, but they do **not** bypass Git metadata protection for any repository metadata. For nonexistent targets, the nearest existing parent is canonicalized so alias-path differences are still absorbed
+- Paths matching `allowed_paths` bypass project containment and Git status checks, but they do **not** bypass Git metadata protection for any repository metadata. Intermediate symlinks that resolve into `.git` or bare-repository metadata are still blocked, while deleting the symlink itself is allowed because only the link is removed. For nonexistent targets, the nearest existing parent is canonicalized so alias-path differences are still absorbed
 - The `recursive` flag controls whether subdirectories are included:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` is allowed
   - `recursive = false`: Only `/path/to/dir/file.txt` is allowed (direct children)

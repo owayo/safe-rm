@@ -148,7 +148,7 @@ recursive = true
 
 - **`allow_project_deletion = true`（デフォルト）**: プロジェクト内の作業ツリーファイルは Git ステータスチェックなしで削除可能。`.git` などの Git 管理パスと、ネストしたリポジトリを含む任意リポジトリの Git 管理メタデータを含む再帰削除は引き続きブロック。
 - **`allow_project_deletion = false`**: クリーン（コミット済み）または無視された作業ツリーファイルのみ削除可能。ignored な親ディレクトリ配下にある場合でも未コミットの変更は保護され、Git 管理パスも引き続きブロック。`allowed_paths` にマッチするパスは、現在のリポジトリの index を読めない場合でも Git ステータスチェックをバイパス。
-- `allowed_paths` にマッチするパスは、プロジェクト境界チェックと Git ステータスチェックをバイパスするが、任意リポジトリの Git 管理メタデータ保護はバイパスできない。未作成パスでも既存親ディレクトリまで canonicalize して別名パス差異を吸収
+- `allowed_paths` にマッチするパスは、プロジェクト境界チェックと Git ステータスチェックをバイパスするが、任意リポジトリの Git 管理メタデータ保護はバイパスできない。中間 symlink が `.git` や bare リポジトリ管理領域へ解決される場合は引き続きブロックし、symlink 自身の削除はリンクだけを消すため許可する。未作成パスでも既存親ディレクトリまで canonicalize して別名パス差異を吸収
 - `recursive` フラグでサブディレクトリの扱いを制御:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可
   - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可
