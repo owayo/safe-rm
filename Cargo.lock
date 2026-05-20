@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "safe-rm"
-version = "26.3.101"
+version = "26.5.100"
 dependencies = [
  "assert_cmd",
  "clap",
