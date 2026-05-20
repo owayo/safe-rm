@@ -4053,13 +4053,15 @@ mod batch_force_tests {
 }
 
 // =============================================================================
-// シンボリックリンクと `..` を組み合わせた脱出攻撃のテスト
+// `..` を組み合わせた脱出・正規化すり替えのテスト
 // =============================================================================
 //
-// `link/../victim.txt` のように、シンボリックリンク経由で `..` を辿ると
-// OS は path resolution の途中でリンク先に飛ぶため、
-// 字句的 clean ベースのプロジェクト境界判定をすり抜ける可能性がある。
-// 削除対象パスは正規化済み（cleaned）パスを使う必要がある。
+// `link/../victim.txt`、`missing/../victim.txt`、`file/../victim.txt` のように、
+// `..` の直前成分が通常ディレクトリ以外の場合、OS の path resolution は
+// 途中で symlink を辿ったり ENOENT/ENOTDIR で失敗するが、
+// 字句的 clean ベースのプロジェクト境界判定は別ファイルに化けてしまう。
+// 削除対象パスは正規化済み（cleaned）パスを使うため、`..` の直前成分が
+// 「実体として存在する通常ディレクトリ」である場合のみ許可する必要がある。
 mod symlink_dotdot_traversal_tests {
     use super::*;
 
@@ -4092,7 +4094,7 @@ mod symlink_dotdot_traversal_tests {
         // すり替わるため、削除前にセキュリティエラーとして拒否する。
         assert_eq!(exit_code, 2, "symlink/.. は拒否されるべき");
         assert!(
-            stderr.contains("シンボリックリンク経由"),
+            stderr.contains("通常ディレクトリ") || stderr.contains("実体パス"),
             "拒否理由が表示されるべき: {}",
             stderr
         );
@@ -4126,13 +4128,94 @@ mod symlink_dotdot_traversal_tests {
 
         assert_eq!(exit_code, 2, "--force でも symlink/.. は拒否されるべき");
         assert!(
-            stderr.contains("シンボリックリンク経由"),
+            stderr.contains("通常ディレクトリ") || stderr.contains("実体パス"),
             "拒否理由が表示されるべき: {}",
             stderr
         );
         assert!(
             victim.exists(),
             "--force でも symlink/.. による脱出を許してはならない"
+        );
+    }
+
+    #[test]
+    fn test_missing_intermediate_dotdot_traversal_blocked() {
+        // `missing_dir/../victim.txt` のように、中間成分が存在しないパスは
+        // OS の path resolution では `ENOENT` で失敗するため、削除されてはならない。
+        // path_clean による字句正規化で `victim.txt` に化けて削除される脆弱性を防ぐ。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "victim.txt", "victim");
+
+        let (exit_code, _stdout, stderr) = run_safe_rm(&["missing_dir/../victim.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "存在しない中間成分の `..` は UnsafeTraversal で拒否されるべき"
+        );
+        assert!(
+            stderr.contains("通常ディレクトリ") || stderr.contains("実体パス"),
+            "拒否理由が表示されるべき: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("victim.txt").exists(),
+            "正規化後のファイルを誤って削除してはならない"
+        );
+    }
+
+    #[test]
+    fn test_file_intermediate_dotdot_traversal_blocked() {
+        // `regular_file/../victim.txt` のように、中間成分が通常ファイルのパスは
+        // OS の path resolution では `ENOTDIR` で失敗するため、削除されてはならない。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "regular_file", "file content");
+        commit_file(&repo_path, "victim.txt", "victim");
+
+        let (exit_code, _stdout, stderr) = run_safe_rm(&["regular_file/../victim.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "通常ファイルが中間成分の `..` は UnsafeTraversal で拒否されるべき"
+        );
+        assert!(
+            stderr.contains("通常ディレクトリ") || stderr.contains("実体パス"),
+            "拒否理由が表示されるべき: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("victim.txt").exists(),
+            "正規化後のファイルを誤って削除してはならない"
+        );
+        assert!(
+            repo_path.join("regular_file").exists(),
+            "通常ファイル自体も誤って削除してはならない"
+        );
+    }
+
+    #[test]
+    fn test_missing_intermediate_dotdot_traversal_with_force_blocked() {
+        // --force でも、存在しない中間成分の `..` は拒否される（fail-closed）。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "victim.txt", "victim");
+
+        let (exit_code, _stdout, stderr) =
+            run_safe_rm(&["-f", "missing_dir/../victim.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "--force でも UnsafeTraversal は拒否されるべき"
+        );
+        assert!(
+            stderr.contains("通常ディレクトリ") || stderr.contains("実体パス"),
+            "拒否理由が表示されるべき: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("victim.txt").exists(),
+            "--force でも誤って別ファイルを削除してはならない"
         );
     }
 
@@ -4162,7 +4245,7 @@ mod symlink_dotdot_traversal_tests {
             "symlink/.. は削除対象を変えるため拒否されるべき"
         );
         assert!(
-            stderr.contains("シンボリックリンク経由"),
+            stderr.contains("通常ディレクトリ") || stderr.contains("実体パス"),
             "拒否理由が表示されるべき: {}",
             stderr
         );

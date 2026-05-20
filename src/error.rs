@@ -152,7 +152,7 @@ impl SafeRmError {
             }
             Self::UnsafeTraversal { path } => {
                 format!(
-                    "シンボリックリンク経由の親ディレクトリ参照は許可されていません。\nPath: {}\n正規化で別の削除対象に変わる可能性があるため、実体パスを直接指定してください。",
+                    "`..` で消える成分が通常ディレクトリでないパスは許可されていません。\nPath: {}\nシンボリックリンク・ファイル・存在しない/読み取り不能な中間成分を含むパスは、字句正規化で別の削除対象に化ける可能性があるため、実体パスを直接指定してください。",
                     path.display()
                 )
             }
@@ -426,7 +426,18 @@ mod tests {
             path: PathBuf::from("link/../victim.txt"),
         };
         let msg = err.user_message();
-        assert!(msg.contains("シンボリックリンク経由"));
+        // メッセージは「`..` で消える成分が通常ディレクトリでない」ケース全般を扱う
+        // ため、symlink/ファイル/存在しない/読み取り不能の各バリアントを示唆する文言を確認する。
+        assert!(
+            msg.contains("通常ディレクトリ"),
+            "通常ディレクトリ要件を案内すべき: {}",
+            msg
+        );
+        assert!(
+            msg.contains("シンボリックリンク") || msg.contains("実体パス"),
+            "代表的なケースの説明が含まれるべき: {}",
+            msg
+        );
         assert!(msg.contains("link/../victim.txt"));
     }
 

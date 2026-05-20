@@ -65,46 +65,66 @@ impl PathChecker {
         Ok(canonical_path)
     }
 
-    /// `..` がシンボリックリンク成分を消すパスを拒否する。
+    /// `..` の解決対象が「実体として存在する通常ディレクトリ」でないパスを拒否する。
     ///
-    /// OS の path resolution はシンボリックリンクを辿ってから `..` を解決するが、
-    /// `path_clean` は字句的に `..` を畳み込む。そのため `link/../victim` のような
-    /// パスを許すと、外部脱出を防げても正規化後の別ファイルを削除してしまう。
+    /// OS の path resolution は symlink を辿ってから `..` を解決し、対象が
+    /// ディレクトリでなければ `ENOTDIR`、存在しなければ `ENOENT` で失敗するが、
+    /// `path_clean` は字句的に `..` を畳み込むため、`link/../victim` や
+    /// `missing/../victim`、`file/../victim` といったパスを許すと、OS では
+    /// 到達できないはずの別ファイルを正規化後に削除してしまう。
+    ///
+    /// そのため `..` の直前成分は以下を必ず満たす必要がある:
+    /// - 実体として存在する（メタデータ取得に成功）
+    /// - 通常ディレクトリである（`is_dir() && !is_symlink()`）
+    ///
+    /// 上記を満たさない（symlink、通常ファイル、特殊ファイル、存在しない、
+    /// メタデータ取得失敗）場合は `UnsafeTraversal` で拒否する。
     pub fn reject_symlink_parent_traversal(
         resolve_base: &Path,
         target_path: &Path,
     ) -> Result<(), SafeRmError> {
         let absolute_path = Self::to_absolute(resolve_base, target_path);
         let mut current = PathBuf::new();
-        let mut component_is_symlink = Vec::new();
+        // 各成分が `..` で安全に解決できる「通常ディレクトリ」かを記録する。
+        let mut component_is_traversable_dir = Vec::new();
 
         for component in absolute_path.components() {
             match component {
                 std::path::Component::Prefix(prefix) => {
                     current.push(prefix.as_os_str());
-                    component_is_symlink.clear();
+                    component_is_traversable_dir.clear();
                 }
                 std::path::Component::RootDir => {
                     current.push(component.as_os_str());
-                    component_is_symlink.clear();
+                    component_is_traversable_dir.clear();
                 }
                 std::path::Component::CurDir => {}
                 std::path::Component::Normal(name) => {
                     current.push(name);
-                    let is_symlink = std::fs::symlink_metadata(&current)
-                        .map(|metadata| metadata.file_type().is_symlink())
+                    // `..` で安全に解決するためには、対象成分が「実体として存在する
+                    // 通常ディレクトリ」である必要がある。symlink、通常ファイル、
+                    // 存在しない、特殊ファイル、メタデータ取得失敗は不可。
+                    let is_traversable_dir = std::fs::symlink_metadata(&current)
+                        .map(|metadata| {
+                            let file_type = metadata.file_type();
+                            file_type.is_dir() && !file_type.is_symlink()
+                        })
                         .unwrap_or(false);
-                    component_is_symlink.push(is_symlink);
+                    component_is_traversable_dir.push(is_traversable_dir);
                 }
                 std::path::Component::ParentDir => {
-                    if let Some(removed_symlink) = component_is_symlink.pop() {
-                        if removed_symlink {
+                    if let Some(was_traversable_dir) = component_is_traversable_dir.pop() {
+                        if !was_traversable_dir {
                             return Err(SafeRmError::UnsafeTraversal {
                                 path: target_path.to_path_buf(),
                             });
                         }
                         current.pop();
                     }
+                    // stack 空のときの `..` は無視:
+                    // - 絶対パスの `RootDir` 直後（Unix では `/..` は `/`）
+                    // - 相対パスの先頭（基底ディレクトリの親を指すが、最終的な
+                    //   包含検証で扱われる）
                 }
             }
         }
@@ -354,6 +374,47 @@ mod tests {
         );
 
         assert!(matches!(result, Err(SafeRmError::UnsafeTraversal { .. })));
+    }
+
+    #[test]
+    fn test_reject_symlink_parent_traversal_blocks_missing_intermediate() {
+        // `missing/../victim.txt` のように、`..` の直前成分が存在しないパスは
+        // OS の path resolution では `ENOENT` で失敗する。
+        // path_clean による字句正規化で別ファイル削除に化けないよう拒否する。
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+        fs::write(project_root.join("victim.txt"), "victim").unwrap();
+
+        let result = PathChecker::reject_symlink_parent_traversal(
+            &project_root,
+            Path::new("missing_dir/../victim.txt"),
+        );
+
+        assert!(
+            matches!(result, Err(SafeRmError::UnsafeTraversal { .. })),
+            "存在しない中間成分の `..` は UnsafeTraversal で拒否すべき"
+        );
+    }
+
+    #[test]
+    fn test_reject_symlink_parent_traversal_blocks_file_as_intermediate() {
+        // `file/../victim.txt` のように、`..` の直前成分が通常ファイルのパスは
+        // OS の path resolution では `ENOTDIR` で失敗する。
+        // path_clean による字句正規化で別ファイル削除に化けないよう拒否する。
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+        fs::write(project_root.join("file"), "regular file").unwrap();
+        fs::write(project_root.join("victim.txt"), "victim").unwrap();
+
+        let result = PathChecker::reject_symlink_parent_traversal(
+            &project_root,
+            Path::new("file/../victim.txt"),
+        );
+
+        assert!(
+            matches!(result, Err(SafeRmError::UnsafeTraversal { .. })),
+            "通常ファイルが中間成分の `..` は UnsafeTraversal で拒否すべき"
+        );
     }
 
     #[test]

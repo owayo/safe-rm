@@ -472,4 +472,75 @@ mod tests {
         let result = super::delete_path_with_metadata(&nonexistent, false, &metadata);
         assert!(result.is_err(), "存在しないパスの削除は失敗すべき");
     }
+
+    #[test]
+    fn test_ensure_git_metadata_not_targeted_allows_plain_file() {
+        // Git 管理メタデータに該当しない通常パスは許可される
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let plain_file = tmp_dir.path().join("note.txt");
+        std::fs::write(&plain_file, "content").unwrap();
+
+        let result =
+            super::ensure_git_metadata_not_targeted(&plain_file, &plain_file, false, &None);
+
+        assert!(
+            result.is_ok(),
+            "通常ファイルは Git 管理メタデータ判定を通すべき"
+        );
+    }
+
+    #[test]
+    fn test_ensure_git_metadata_not_targeted_blocks_dot_git_component() {
+        // パスの末尾コンポーネントが `.git` の場合はブロック
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dot_git_path = tmp_dir.path().join(".git");
+        std::fs::create_dir(&dot_git_path).unwrap();
+
+        let result =
+            super::ensure_git_metadata_not_targeted(&dot_git_path, &dot_git_path, false, &None);
+
+        assert!(
+            matches!(result, Err(super::SafeRmError::ProtectedGitPath { .. })),
+            "末尾が .git のパスは ProtectedGitPath で拒否されるべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_git_metadata_not_targeted_blocks_intermediate_dot_git() {
+        // パスの中間コンポーネントが `.git` の場合もブロック
+        // ファイルが存在しなくても、字句的に検出される
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let inside_dot_git = tmp_dir.path().join(".git").join("config");
+
+        let result =
+            super::ensure_git_metadata_not_targeted(&inside_dot_git, &inside_dot_git, false, &None);
+
+        assert!(
+            matches!(result, Err(super::SafeRmError::ProtectedGitPath { .. })),
+            "中間に .git を含むパスは ProtectedGitPath で拒否されるべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_git_metadata_not_targeted_blocks_uppercase_dot_git_component() {
+        // macOS APFS のような case-insensitive FS で `.GIT` 経由の
+        // バイパスが起きないことを検証する
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let inside_dot_git_upper = tmp_dir.path().join(".GIT").join("config");
+
+        let result = super::ensure_git_metadata_not_targeted(
+            &inside_dot_git_upper,
+            &inside_dot_git_upper,
+            false,
+            &None,
+        );
+
+        assert!(
+            matches!(result, Err(super::SafeRmError::ProtectedGitPath { .. })),
+            "大文字バリアントの .GIT 中間コンポーネントも拒否されるべき: {:?}",
+            result
+        );
+    }
 }
