@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use path_clean::PathClean;
@@ -15,6 +15,69 @@ use safe_rm::error::{FileStatus, SafeRmError};
 use safe_rm::git_checker::GitChecker;
 use safe_rm::init;
 use safe_rm::path_checker::PathChecker;
+
+/// Git リポジトリ検出を必要になるまで遅延するための状態。
+struct GitContext {
+    checker: Option<GitChecker>,
+    project_root: PathBuf,
+    opened: bool,
+    optional_open_failed: bool,
+}
+
+impl GitContext {
+    fn new(cwd: &Path) -> Self {
+        Self {
+            checker: None,
+            project_root: cwd.to_path_buf(),
+            opened: false,
+            optional_open_failed: false,
+        }
+    }
+
+    /// allowed_paths の Git メタデータ保護を強化するため、可能なら Git 情報を取得する。
+    /// ただし allowed_paths は Git チェックをバイパスする仕様なので、Git 検出失敗では止めない。
+    fn try_open_optional(&mut self, cwd: &Path) {
+        if self.opened || self.optional_open_failed {
+            return;
+        }
+
+        match GitChecker::open(cwd) {
+            Ok(checker) => self.set_checker(cwd, checker),
+            Err(_) => {
+                self.optional_open_failed = true;
+            }
+        }
+    }
+
+    /// 通常パスの包含検証や strict モードでは Git 情報が安全境界になるため、
+    /// Git 検出エラーを fail-closed で呼び出し元へ返す。
+    fn ensure_open_required(&mut self, cwd: &Path) -> Result<(), SafeRmError> {
+        if self.opened {
+            return Ok(());
+        }
+
+        let checker = GitChecker::open(cwd)?;
+        self.set_checker(cwd, checker);
+        Ok(())
+    }
+
+    fn set_checker(&mut self, cwd: &Path, checker: Option<GitChecker>) {
+        self.project_root = checker
+            .as_ref()
+            .and_then(|checker| checker.workdir())
+            .unwrap_or_else(|| cwd.to_path_buf());
+        self.checker = checker;
+        self.opened = true;
+    }
+
+    fn checker(&self) -> Option<&GitChecker> {
+        self.checker.as_ref()
+    }
+
+    fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+}
 
 fn main() -> ExitCode {
     let args = CliArgs::parse_args();
@@ -54,16 +117,10 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
     // カレントディレクトリの取得
     let cwd = std::env::current_dir().map_err(SafeRmError::IoError)?;
 
-    // Git リポジトリを開く（存在する場合）
-    // 壊れた `.git` や権限エラー時は fail-closed で `Err` が伝播される。
-    let git_checker = GitChecker::open(&cwd)?;
-
-    // Git リポジトリルートをプロジェクト境界として使用（cwd ではなく）
-    // 例: frontend/ から実行して backend/file.txt を削除する場合にも正しく動作
-    let project_root = git_checker
-        .as_ref()
-        .and_then(|checker| checker.workdir())
-        .unwrap_or_else(|| cwd.clone());
+    // Git リポジトリ検出は allowed_paths 以外の安全境界が必要になるまで遅延する。
+    // allowed_paths は包含検証と Git ステータスチェックをバイパスする仕様なので、
+    // cwd の `.git` が壊れていても許可パスの削除まで巻き込まない。
+    let mut git_context = GitContext::new(&cwd);
 
     // Git ステータスは、厳格モードかつ allowed_paths 外の削除で初めて取得する。
     // allowed_paths は Git チェックをバイパスするため、現在のリポジトリに
@@ -79,9 +136,8 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
     for path in &args.paths {
         match process_path(
             path,
-            &project_root,
             &cwd,
-            &git_checker,
+            &mut git_context,
             &mut status_cache,
             &args,
             &config,
@@ -131,9 +187,8 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
 /// 単一パスの削除処理
 fn process_path(
     path: &Path,
-    project_root: &Path,
     cwd: &Path,
-    git_checker: &Option<GitChecker>,
+    git_context: &mut GitContext,
     status_cache: &mut Option<HashMap<String, FileStatus>>,
     args: &CliArgs,
     config: &Config,
@@ -155,7 +210,13 @@ fn process_path(
 
     // allowed_paths 内のパスか確認（包含検証と Git チェックをバイパス）
     if config.is_path_allowed(&normalized_path) {
-        ensure_git_metadata_not_targeted(&normalized_path, path, args.recursive, git_checker)?;
+        git_context.try_open_optional(cwd);
+        ensure_git_metadata_not_targeted(
+            &normalized_path,
+            path,
+            args.recursive,
+            git_context.checker(),
+        )?;
 
         // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
         let metadata = match std::fs::symlink_metadata(&normalized_path) {
@@ -187,11 +248,19 @@ fn process_path(
     } else {
         // 標準安全チェック
 
+        git_context.ensure_open_required(cwd)?;
+
         // パスがプロジェクト内にあることを最初に検証（セキュリティチェック優先）
         // プロジェクト外のファイル存在情報の漏洩を防止
-        let canonical_path = PathChecker::verify_containment_with_base(project_root, cwd, path)?;
+        let canonical_path =
+            PathChecker::verify_containment_with_base(git_context.project_root(), cwd, path)?;
 
-        ensure_git_metadata_not_targeted(&normalized_path, path, args.recursive, git_checker)?;
+        ensure_git_metadata_not_targeted(
+            &normalized_path,
+            path,
+            args.recursive,
+            git_context.checker(),
+        )?;
 
         // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
         let metadata = match std::fs::symlink_metadata(&normalized_path) {
@@ -214,7 +283,7 @@ fn process_path(
         // 事前取得キャッシュを使用して Git ステータスをチェック（バッチ最適化）
         // allow_project_deletion 有効時はスキップ（包含検証は上記で完了）
         if !config.allow_project_deletion {
-            if let Some(checker) = git_checker {
+            if let Some(checker) = git_context.checker() {
                 // シンボリックリンクの場合、親ディレクトリのみ canonicalize し
                 // リンク名自体は保持。「リンク自体をチェック」するセマンティクスを
                 // 維持しつつ、リポジトリエイリアスパスを解決する。
@@ -262,7 +331,7 @@ fn ensure_git_metadata_not_targeted(
     normalized_path: &Path,
     original_path: &Path,
     recursive: bool,
-    git_checker: &Option<GitChecker>,
+    git_checker: Option<&GitChecker>,
 ) -> Result<(), SafeRmError> {
     // 任意階層の `.git` や bare リポジトリ、および再帰削除時に配下へ含まれる
     // Git 管理メタデータを保護する（ネストしたリポジトリ対応）。
@@ -480,8 +549,7 @@ mod tests {
         let plain_file = tmp_dir.path().join("note.txt");
         std::fs::write(&plain_file, "content").unwrap();
 
-        let result =
-            super::ensure_git_metadata_not_targeted(&plain_file, &plain_file, false, &None);
+        let result = super::ensure_git_metadata_not_targeted(&plain_file, &plain_file, false, None);
 
         assert!(
             result.is_ok(),
@@ -497,7 +565,7 @@ mod tests {
         std::fs::create_dir(&dot_git_path).unwrap();
 
         let result =
-            super::ensure_git_metadata_not_targeted(&dot_git_path, &dot_git_path, false, &None);
+            super::ensure_git_metadata_not_targeted(&dot_git_path, &dot_git_path, false, None);
 
         assert!(
             matches!(result, Err(super::SafeRmError::ProtectedGitPath { .. })),
@@ -514,7 +582,7 @@ mod tests {
         let inside_dot_git = tmp_dir.path().join(".git").join("config");
 
         let result =
-            super::ensure_git_metadata_not_targeted(&inside_dot_git, &inside_dot_git, false, &None);
+            super::ensure_git_metadata_not_targeted(&inside_dot_git, &inside_dot_git, false, None);
 
         assert!(
             matches!(result, Err(super::SafeRmError::ProtectedGitPath { .. })),
@@ -534,7 +602,7 @@ mod tests {
             &inside_dot_git_upper,
             &inside_dot_git_upper,
             false,
-            &None,
+            None,
         );
 
         assert!(

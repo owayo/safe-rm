@@ -38,7 +38,7 @@
 - **Ignored File Passthrough**: Allow deletion of `.gitignore`d files (build artifacts, etc.)
 - **Symlink-Safe Git Checks**: Directory symlinks are checked as links themselves (not traversed)
 - **Alias-Path Safety (Containment + allowed_paths + Strict Mode)**: Containment checks and `allowed_paths` matching canonicalize up to the nearest existing parent and re-append missing segments, while strict-mode Git checks canonicalize non-symlink paths and canonicalize only symlink parents (checking the link itself), blocking bypasses via alternate absolute aliases
-- **Configurable Allowed Paths**: Bypass safety checks for specified directories (per-directory recursive control)
+- **Configurable Allowed Paths**: Bypass project containment and Git status checks for specified directories (per-directory recursive control), without requiring current-directory Git discovery to succeed
 - **Non-Git Support**: Works safely in non-Git directories
 - **Dry Run Mode**: Preview what would be deleted without actually deleting
 - **Deterministic Error Output**: Single-path failures emit one stderr block, while batch runs emit one error per failed path without duplicating the same message
@@ -147,8 +147,8 @@ recursive = true
 ### Behavior
 
 - **`allow_project_deletion = true` (default)**: Worktree files inside the project can be deleted without Git status checks. Git administrative paths such as `.git`, and recursive deletion of a path that contains any repository metadata (including nested repositories), are still blocked.
-- **`allow_project_deletion = false`**: Only clean (committed) or ignored worktree files can be deleted. Uncommitted changes are protected even when they live under an ignored parent directory, and Git administrative paths are still blocked. Paths matching `allowed_paths` still bypass Git status checks even if the current repository cannot read its index.
-- Paths matching `allowed_paths` bypass project containment and Git status checks, but they do **not** bypass Git metadata protection for any repository metadata. Intermediate symlinks that resolve into `.git` or bare-repository metadata are still blocked, while deleting the symlink itself is allowed because only the link is removed. For nonexistent targets, the nearest existing parent is canonicalized so alias-path differences are still absorbed
+- **`allow_project_deletion = false`**: Only clean (committed) or ignored worktree files can be deleted. Uncommitted changes are protected even when they live under an ignored parent directory, and Git administrative paths are still blocked. Paths matching `allowed_paths` still bypass Git status checks even if the current repository cannot read its index or the current working directory's Git metadata cannot be opened.
+- Paths matching `allowed_paths` bypass project containment and Git status checks, but they do **not** bypass Git metadata protection for any repository metadata. Current-repository Git metadata is checked when Git discovery is available, but a Git discovery failure in the current working directory does not by itself block an allowed path. Intermediate symlinks that resolve into `.git` or bare-repository metadata are still blocked, while deleting the symlink itself is allowed because only the link is removed. For nonexistent targets, the nearest existing parent is canonicalized so alias-path differences are still absorbed
 - The `recursive` flag controls whether subdirectories are included:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` is allowed
   - `recursive = false`: Only `/path/to/dir/file.txt` is allowed (direct children)
@@ -176,12 +176,15 @@ safe-rm -r ~/.claude/skills/old-skill/
 
 ```mermaid
 flowchart TB
-    CLI[CLI Arguments] --> GitMetaCheck{Git metadata path?}
-    GitMetaCheck -->|Yes| Exit2[Exit 2 + stderr]
-    GitMetaCheck -->|No| ConfigCheck{In allowed_paths?}
-    ConfigCheck -->|Yes| Delete[Delete File]
-    ConfigCheck -->|No| PathCheck[Path Checker]
-    PathCheck --> ProjectCheck{allow_project_deletion?}
+    CLI[CLI Arguments] --> ConfigCheck{In allowed_paths?}
+    ConfigCheck -->|Yes| AllowedGitMetaCheck{Git metadata path?}
+    AllowedGitMetaCheck -->|Yes| Exit2[Exit 2 + stderr]
+    AllowedGitMetaCheck -->|No| Delete[Delete File]
+    ConfigCheck -->|No| GitOpen[Open Git repo if needed]
+    GitOpen --> PathCheck[Path Checker]
+    PathCheck --> GitMetaCheck{Git metadata path?}
+    GitMetaCheck -->|Yes| Exit2
+    GitMetaCheck -->|No| ProjectCheck{allow_project_deletion?}
     ProjectCheck -->|true| Delete
     ProjectCheck -->|false| GitCheck[Git Checker]
     GitCheck --> Result{Clean or Ignored?}
@@ -196,7 +199,7 @@ flowchart TB
 2. **Path Containment**: Ensures all non-`allowed_paths` paths resolve within the project directory (Git repository root, or cwd if not a Git repo) before recursive metadata scanning. For nonexistent targets, it canonicalizes the nearest existing parent to absorb alias differences (e.g. repo symlink alias, `/var` vs `/private/var`).
 3. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked), including files nested under untracked directories
 4. **Recursive Check**: For real directories, validates all contained files. Ignored descendants remain deletable, but ignored parent directories do not hide tracked modified/staged files or untracked siblings
-5. **Fail-Closed**: Any directory read failure (including entry iteration errors), Git API error from `Repository::discover()` (e.g. corrupted `.git`, permission errors, I/O failures), unreadable metadata probe while classifying a `NotFound`, or config file read/parse error blocks deletion or falls back to strict mode. `NotFound` is treated as non-Git only when no `.git`/bare-repository ancestor is found and the ancestor probe itself succeeds
+5. **Fail-Closed**: Any directory read failure (including entry iteration errors), Git API error from `Repository::discover()` on non-`allowed_paths` deletion paths (e.g. corrupted `.git`, permission errors, I/O failures), unreadable metadata probe while classifying a `NotFound`, or config file read/parse error blocks deletion or falls back to strict mode. `NotFound` is treated as non-Git only when no `.git`/bare-repository ancestor is found and the ancestor probe itself succeeds. `allowed_paths` still enforce Git metadata protection, but they do not require current-directory Git discovery to succeed
 6. **Unsafe Parent Traversal Guard**: Reject paths whose `..` would collapse a component that is not a real directory before deletion. Patterns such as `link/../victim` (symlink), `missing/../victim` (non-existent), `file/../victim` (regular file), and any component whose metadata cannot be read (permission denied, special file) are rejected fail-closed, preventing lexical normalization from silently retargeting a different on-disk file
 7. **Alias-Path Hardening**: Path containment and `allowed_paths` matching canonicalize the nearest existing parent and reattach missing segments, while Git checks canonicalize non-symlink paths and only parent directories for symlink paths, to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
 

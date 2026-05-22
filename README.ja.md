@@ -38,7 +38,7 @@
 - **無視ファイルの許可**: `.gitignore` で指定されたファイル（ビルド成果物など）の削除を許可
 - **シンボリックリンク安全なGitチェック**: ディレクトリ symlink は辿らず、リンク自体として判定
 - **エイリアスパス耐性（包含検証 + allowed_paths + 厳格モード）**: 包含検証と `allowed_paths` 判定では「既存親ディレクトリまで canonicalize + 未作成部分を再結合」、厳格モードの Git チェックでは「非 symlink パスを canonicalize、symlink パスは親ディレクトリのみ canonicalize + リンク自体を判定」として、別名絶対パス経由のバイパスを防止
-- **許可パス設定**: 指定ディレクトリの安全チェックをバイパス（ディレクトリごとの再帰設定）
+- **許可パス設定**: 指定ディレクトリのプロジェクト境界チェックと Git ステータスチェックをバイパス（ディレクトリごとの再帰設定）。現在ディレクトリの Git 検出に失敗しても、許可パス削除はそれだけではブロックされない
 - **非Gitサポート**: 非Gitディレクトリでも安全に動作
 - **ドライランモード**: 実際に削除せずに削除対象をプレビュー
 - **決定的なエラー出力**: 単一パス失敗時は stderr を1回だけ出力し、複数パス実行時は失敗した各パスごとに1回ずつ出力
@@ -147,8 +147,8 @@ recursive = true
 ### 動作
 
 - **`allow_project_deletion = true`（デフォルト）**: プロジェクト内の作業ツリーファイルは Git ステータスチェックなしで削除可能。`.git` などの Git 管理パスと、ネストしたリポジトリを含む任意リポジトリの Git 管理メタデータを含む再帰削除は引き続きブロック。
-- **`allow_project_deletion = false`**: クリーン（コミット済み）または無視された作業ツリーファイルのみ削除可能。ignored な親ディレクトリ配下にある場合でも未コミットの変更は保護され、Git 管理パスも引き続きブロック。`allowed_paths` にマッチするパスは、現在のリポジトリの index を読めない場合でも Git ステータスチェックをバイパス。
-- `allowed_paths` にマッチするパスは、プロジェクト境界チェックと Git ステータスチェックをバイパスするが、任意リポジトリの Git 管理メタデータ保護はバイパスできない。中間 symlink が `.git` や bare リポジトリ管理領域へ解決される場合は引き続きブロックし、symlink 自身の削除はリンクだけを消すため許可する。未作成パスでも既存親ディレクトリまで canonicalize して別名パス差異を吸収
+- **`allow_project_deletion = false`**: クリーン（コミット済み）または無視された作業ツリーファイルのみ削除可能。ignored な親ディレクトリ配下にある場合でも未コミットの変更は保護され、Git 管理パスも引き続きブロック。`allowed_paths` にマッチするパスは、現在のリポジトリの index を読めない場合や cwd の Git 管理情報を開けない場合でも Git ステータスチェックをバイパス。
+- `allowed_paths` にマッチするパスは、プロジェクト境界チェックと Git ステータスチェックをバイパスするが、任意リポジトリの Git 管理メタデータ保護はバイパスできない。現在リポジトリの Git 管理メタデータは Git 検出に成功した場合に追加で確認し、cwd の Git 検出失敗だけでは許可パス削除を止めない。中間 symlink が `.git` や bare リポジトリ管理領域へ解決される場合は引き続きブロックし、symlink 自身の削除はリンクだけを消すため許可する。未作成パスでも既存親ディレクトリまで canonicalize して別名パス差異を吸収
 - `recursive` フラグでサブディレクトリの扱いを制御:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可
   - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可
@@ -176,12 +176,15 @@ safe-rm -r ~/.claude/skills/old-skill/
 
 ```mermaid
 flowchart TB
-    CLI[CLI引数] --> GitMetaCheck{Git 管理パス?}
-    GitMetaCheck -->|Yes| Exit2[Exit 2 + stderr]
-    GitMetaCheck -->|No| ConfigCheck{allowed_paths内?}
-    ConfigCheck -->|Yes| Delete[ファイル削除]
-    ConfigCheck -->|No| PathCheck[パスチェッカー]
-    PathCheck --> ProjectCheck{allow_project_deletion?}
+    CLI[CLI引数] --> ConfigCheck{allowed_paths内?}
+    ConfigCheck -->|Yes| AllowedGitMetaCheck{Git 管理パス?}
+    AllowedGitMetaCheck -->|Yes| Exit2[Exit 2 + stderr]
+    AllowedGitMetaCheck -->|No| Delete[ファイル削除]
+    ConfigCheck -->|No| GitOpen[必要時 Git リポジトリ検出]
+    GitOpen --> PathCheck[パスチェッカー]
+    PathCheck --> GitMetaCheck{Git 管理パス?}
+    GitMetaCheck -->|Yes| Exit2
+    GitMetaCheck -->|No| ProjectCheck{allow_project_deletion?}
     ProjectCheck -->|true| Delete
     ProjectCheck -->|false| GitCheck[Gitチェッカー]
     GitCheck --> Result{クリーンまたは無視?}
@@ -196,7 +199,7 @@ flowchart TB
 2. **パス境界チェック**: `allowed_paths` 以外のすべてのパスがプロジェクトディレクトリ（Gitリポジトリルート、Git外の場合はcwd）内に解決されることを、再帰的なメタデータ探索より先に確認。存在しない削除対象でも、既存の親ディレクトリまで canonicalize して別名パス差異（repo symlink 別名、`/var` と `/private/var` など）を吸収。
 3. **Git保護**: `allow_project_deletion = false` の場合、ダーティファイル（変更済み/ステージング済み/未追跡）の削除をブロック。未追跡ディレクトリの深い階層にあるファイルも対象
 4. **再帰チェック**: 実ディレクトリの場合、含まれるすべてのファイルを検証。ignored な子孫ファイルは削除可能だが、ignored な親ディレクトリが tracked な変更済み/ステージング済みファイルや未追跡の兄弟ファイルを隠すことはない
-5. **Fail-Closed**: ディレクトリ走査中のエラー（エントリ列挙エラーを含む）、`Repository::discover()` 由来の Git API エラー（壊れた `.git` / 権限不足 / I/O エラー等）、`NotFound` 判定時の祖先メタデータ確認エラー、および設定ファイル読込/パースエラー時は削除をブロックまたは strict モードへフォールバック。`NotFound` は `.git`/bare リポジトリの祖先がなく、祖先確認自体にも成功した場合のみ非 Git として扱う
+5. **Fail-Closed**: ディレクトリ走査中のエラー（エントリ列挙エラーを含む）、`allowed_paths` 外の削除経路で必要になる `Repository::discover()` 由来の Git API エラー（壊れた `.git` / 権限不足 / I/O エラー等）、`NotFound` 判定時の祖先メタデータ確認エラー、および設定ファイル読込/パースエラー時は削除をブロックまたは strict モードへフォールバック。`NotFound` は `.git`/bare リポジトリの祖先がなく、祖先確認自体にも成功した場合のみ非 Git として扱う。`allowed_paths` は Git 管理メタデータ保護を維持しつつ、現在ディレクトリの Git 検出成功は必須にしない
 6. **不正な親ディレクトリ参照ガード**: `..` の直前成分が「実体として存在する通常ディレクトリ」でないパス（symlink・通常ファイル・存在しない・読み取り不能・特殊ファイル）は削除前に fail-closed で拒否。`link/../victim`・`missing/../victim`・`file/../victim` が字句正規化で別ファイルへすり替わって削除される経路をブロック
 7. **エイリアスパス対策**: 包含検証と `allowed_paths` 判定では既存親ディレクトリまで canonicalize して未作成部分を再結合し、Gitチェックでは非symlinkパスを canonicalize 比較し、symlink パスは「親ディレクトリのみ canonicalize + リンク自体を判定」することで、repo symlink 別名や `/var` と `/private/var` の差異による回避を防止
 

@@ -1424,6 +1424,54 @@ recursive = true
     }
 
     #[test]
+    fn test_allowed_paths_bypasses_broken_cwd_git_discovery() {
+        let broken_repo = TempDir::new().unwrap();
+        let broken_repo_path = broken_repo.path().canonicalize().unwrap();
+        let dot_git = broken_repo_path.join(".git");
+        fs::create_dir_all(&dot_git).unwrap();
+        fs::write(dot_git.join("dummy"), "not a real git repo").unwrap();
+
+        let outside_dir = TempDir::new().unwrap();
+        let outside_path = outside_dir.path().canonicalize().unwrap();
+        let outside_file = outside_path.join("file.txt");
+        fs::write(&outside_file, "content").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+allow_project_deletion = false
+
+[[allowed_paths]]
+path = "{}"
+recursive = true
+"#,
+            outside_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &[outside_file.to_str().unwrap()],
+            &broken_repo_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "allowed_paths は cwd の Git 検出失敗に巻き込まれてはならない: {}",
+            stderr
+        );
+        assert!(
+            stdout.contains("allowed by config"),
+            "設定許可の注釈が必要: {}",
+            stdout
+        );
+        assert!(
+            !outside_file.exists(),
+            "Git 検出不能な cwd でも許可パスのファイルは削除されるべき"
+        );
+    }
+
+    #[test]
     fn test_allowed_paths_recursive_directory_deletion() {
         let project_dir = create_test_repo();
         let project_path = project_dir.path().canonicalize().unwrap();

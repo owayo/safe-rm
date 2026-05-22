@@ -28,14 +28,14 @@ cargo test --test integration_test <test_name>
 ### 実行フロー
 
 ```
-CLI引数パース → Config読込 → Git repo検出 → [Git status一括取得] → [Git管理メタデータ保護] → パス毎に処理 → 削除/ブロック
+CLI引数パース → Config読込 → パス毎に処理 → allowed_paths判定 → [必要時 Git repo検出] → [Git管理メタデータ保護] → [必要時 Git status一括取得] → 削除/ブロック
 ```
 
 ### モジュール構成
 
 | モジュール | 責務 |
 |---|---|
-| `main.rs` | エントリポイント。削除フロー全体のオーケストレーション、複数パスのバッチ処理 |
+| `main.rs` | エントリポイント。削除フロー全体のオーケストレーション、複数パスのバッチ処理。`GitContext` で Git リポジトリ検出を allowed_paths 以外の安全境界が必要になるまで遅延し、壊れた cwd の `.git` が許可パス削除を巻き込まないようにする |
 | `cli.rs` | clap derive による引数定義 (`-r`, `-f`, `-n`, `init` サブコマンド) |
 | `config.rs` | `~/.config/safe-rm/config.toml` の読込。`allowed_paths` と `allow_project_deletion` の管理。`Path::exists()` で fail-open に倒れないよう `read_to_string()` の結果で分岐する。`ErrorKind::NotFound` のみ permissive default を返し、その他の I/O エラー（権限不足等）と TOML パース失敗は fail-closed で `allow_project_deletion = false`（strict モード）にフォールバックする（`fail_closed_default()`）。利用者が意図した strict 設定が壊れた構文や stat 失敗だけで無効化されない |
 | `error.rs` | `SafeRmError` enum（終了コード: 0=成功, 1=操作エラー, 2=セキュリティブロック）、`FileStatus` enum（`is_deletable()` メソッド付き）。`PartialFailure` には `dry_run` フラグがあり、ドライラン時は「would be removed」と表示する |
@@ -48,8 +48,8 @@ CLI引数パース → Config読込 → Git repo検出 → [Git status一括取�
 1. **Git管理メタデータ保護** (常時有効): `.git`、gitdir 参照ファイル、bare リポジトリ管理パス、現在のリポジトリの Git 管理メタデータを含む再帰削除に加え、削除対象自身・パスの任意の中間コンポーネント・再帰削除時に配下に存在する任意階層の Git 管理メタデータ（ネストした `.git` と bare リポジトリを含む）をブロック。コンポーネント比較は ASCII case-insensitive で、macOS APFS のような大文字小文字を区別しないファイルシステムでの `.GIT` 経由バイパスも防止
 2. **パス包含検証** (常時有効): `allowed_paths` 以外では、再帰的な Git 管理メタデータ探索より先にプロジェクトルート外への削除をブロック
 3. **Git保護** (`allow_project_deletion = false` 時): Modified/Staged/Untracked/コンフリクト中ファイルの削除をブロック（CONFLICTED フラグも Modified として扱う）
-4. **allowed_paths**: 設定ファイルで指定したパスは包含チェックと Git ステータスチェックをバイパスするが、Git管理メタデータ保護はバイパスしない
-5. **Fail-Closed**: ディレクトリ読取エラー、`Repository::discover()` 由来の Git API エラー（壊れた `.git`/権限不足/I/O 等。`NotFound` でも祖先に `.git` 痕跡が残っている、または祖先確認が権限/I/O エラーで完了できない場合は `has_git_metadata_ancestor()` が fail-closed に倒す）、設定ファイル読込/パースエラー時はすべて fail-closed。Git API エラーは `SafeRmError::GitError` として伝播し、設定ファイルが読み取れない/パースできない場合は `Config::fail_closed_default()`（`allow_project_deletion = false`）にフォールバックして利用者の strict 意図を守る。Config の存在判定は `Path::exists()` ではなく `read_to_string()` の `ErrorKind::NotFound` で行い、stat 失敗で fail-open に倒れない
+4. **allowed_paths**: 設定ファイルで指定したパスは包含チェックと Git ステータスチェックをバイパスするが、Git管理メタデータ保護はバイパスしない。現在のリポジトリ情報は可能なら使うが、cwd の `.git` が壊れていても許可パス削除は Git 検出失敗に巻き込まれない
+5. **Fail-Closed**: ディレクトリ読取エラー、`allowed_paths` 外の通常経路で必要になる `Repository::discover()` 由来の Git API エラー（壊れた `.git`/権限不足/I/O 等。`NotFound` でも祖先に `.git` 痕跡が残っている、または祖先確認が権限/I/O エラーで完了できない場合は `has_git_metadata_ancestor()` が fail-closed に倒す）、設定ファイル読込/パースエラー時はすべて fail-closed。Git API エラーは `SafeRmError::GitError` として伝播し、設定ファイルが読み取れない/パースできない場合は `Config::fail_closed_default()`（`allow_project_deletion = false`）にフォールバックして利用者の strict 意図を守る。Config の存在判定は `Path::exists()` ではなく `read_to_string()` の `ErrorKind::NotFound` で行い、stat 失敗で fail-open に倒れない
 6. **Ignored混在ディレクトリ保護**: 厳格モードでは ignored ディレクトリでも配下を再帰検査し、ignored ファイルは許可する一方で tracked 変更済み/ステージング済みファイルや未追跡ファイルをブロックする
 7. **Symlink安全性**: Gitチェック時のディレクトリ判定および任意階層 `.git` 検出は `symlink_metadata()` ベースで、ディレクトリsymlinkを辿らずリンク自体を評価
 8. **`..` 解決による別ファイルすり替え防止**: `..` の直前成分が「実体として存在する通常ディレクトリ」でないパス（symlink、通常ファイル、特殊ファイル、存在しない/読み取り不能な中間成分等）は削除前に拒否する。OS の path resolution と `path_clean` の字句正規化の差を利用して、`link/../victim`・`missing/../victim`・`file/../victim` のように本来到達できない別ファイルを削除する経路をブロックする。メタデータ取得・削除・許可判定は引き続き `path_clean` で字句的に `..` を解決した正規化パス（`normalized_path`）で行う
@@ -58,6 +58,7 @@ CLI引数パース → Config読込 → Git repo検出 → [Git status一括取�
 
 ### パフォーマンス最適化
 
+- Git リポジトリ検出は allowed_paths 外の包含検証や strict Git チェックが必要になった時だけ必須化する。allowed_paths では可能な範囲で現在リポジトリの Git 管理メタデータ保護に使うが、Git 検出失敗だけでは許可パス削除をブロックしない
 - `allow_project_deletion = false` かつ `allowed_paths` 外の削除が必要になった時だけ Git status を一括取得（バッチ最適化、Clean ファイルもキャッシュに含め、allowed_paths は Git status エラーに巻き込まない）
 - `status_file()` の単体問い合わせで未追跡ディレクトリ配下を見落とすケースは、再帰付き status 一覧の再確認で補完
 - Config の `allowed_paths` はロード時に既存親までパスを事前解決（canonicalize）
@@ -67,12 +68,11 @@ CLI引数パース → Config読込 → Git repo検出 → [Git status一括取�
 ### テスト構成
 
 - **ユニットテスト**: 各モジュール内の `#[cfg(test)]` ブロック（パス検証、Git状態、Config解析、`SAFE_RM_CONFIG` の非 UTF-8 パス対応、symlink削除、symlink 経由の `..` 親ディレクトリ参照拒否、`reject_symlink_parent_traversal` による「`..` 直前成分が存在しない/通常ファイルである」パスの拒否、I/Oエラー、Git API エラー時の fail-closed 検証、壊れた `.git` や読み取り不可の探索対象で `GitChecker::open()` が `Err(GitError)` を返し permissive 経路へ抜けないこと、祖先に `.git` 痕跡がなく確認にも成功した場合のみ `Ok(None)` を返すこと、Config パースエラー時の strict モードフォールバック検証、Git管理メタデータ判定（`.git` を指す symlink 自身の削除は許可、symlink 経由のアクセスはブロックする挙動を `touches_git_metadata_path` / `is_git_metadata_path` 両方で検証）、Git管理メタデータを含む再帰削除の判定、`path_targets_or_contains_git_metadata` による任意階層 Git 管理メタデータ検出（ファイル/ディレクトリ自体・配下・深いネスト・bare リポジトリ・symlink 非追従・存在しないパス・再帰探索時のディレクトリ読み取りエラーを含む）、空リポジトリ対応、壊れた symlink 検出、複数ステータスの一括取得検証、キャッシュ使用時の ignored サブディレクトリチェック、ignored/未追跡混在ディレクトリのブロック、ignored ディレクトリ配下の tracked 変更済みファイルのブロック、`PartialFailure { dry_run: true }` のドライラン文言検証、`ensure_git_metadata_not_targeted()` 単体での `.git`/`.GIT` 中間コンポーネント検出と通常パスの許可検証等）
-- **統合テスト**: `tests/integration_test.rs` - 実際のGitリポジトリを tempfile で作成してE2Eテスト。repo symlink 別名の cwd からの相対実行、単一失敗時の stderr 非重複、CLI ヘルプがデフォルトモードと厳格モードを誤説明しないこと、force フラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ignored/未追跡混在ディレクトリのブロック、ignored ディレクトリ配下の tracked 変更済みファイルのブロック、プロジェクト外パスで包含検証を優先すること、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト（strict mode + allowed_paths、複数 allowed_paths エントリ、Git status エラー時の allowed_paths バイパス）、strict mode + force フラグの複合テスト、相対パスの `..` コンポーネント検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、allowed_paths でも現在のリポジトリの Git 管理メタデータ削除をバイパスできないこと、allowed_paths 配下でも中間 symlink 経由の `.git` 配下削除をブロックし、`.git` を指す symlink 自身の削除は許可すること、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、Config 設定ファイルが壊れたときに permissive default ではなく strict モードにフォールバックして未追跡削除がブロックされること、Git管理メタデータの常時ブロック、Git管理メタデータを含むリポジトリルート再帰削除のブロック、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース（空 allowed_paths 配列、存在しない allowed_paths ディレクトリ）、壊れた symlink のデフォルト/厳格モード対応、空リポジトリ厳格モード、バッチ force フラグ複合、allowed_paths ドライラン注釈、`link/../victim` 形式の symlink 経由 `..` 脱出ブロックと正規化後の別ファイルを削除しないこと（`-f` 併用も含む）、`missing_dir/../victim.txt` 形式（存在しない中間成分）の正規化すり替え拒否、`regular_file/../victim.txt` 形式（通常ファイル中間成分）の正規化すり替え拒否、`-f` 併用時も中間成分が通常ディレクトリでない `..` を fail-closed で拒否すること、非 Git 親直下リポジトリの `.git` 直接削除ブロック、ネストリポジトリ全体の再帰削除と内部 `.git` 直接削除のブロック、bare リポジトリ全体と内部管理ファイル削除のブロック、`nested/.git/config` 形式の中間コンポーネント `.git` 経由メタデータ削除ブロック、`nested/.GIT/config` のような大文字バリアント（macOS APFS 等の case-insensitive FS 対策）のブロック、ドライラン部分失敗の「would be removed」表記検証も含めて検証
+- **統合テスト**: `tests/integration_test.rs` - 実際のGitリポジトリを tempfile で作成してE2Eテスト。repo symlink 別名の cwd からの相対実行、単一失敗時の stderr 非重複、CLI ヘルプがデフォルトモードと厳格モードを誤説明しないこと、force フラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ignored/未追跡混在ディレクトリのブロック、ignored ディレクトリ配下の tracked 変更済みファイルのブロック、プロジェクト外パスで包含検証を優先すること、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト（strict mode + allowed_paths、複数 allowed_paths エントリ、Git status エラー時と cwd の Git 検出失敗時の allowed_paths バイパス）、strict mode + force フラグの複合テスト、相対パスの `..` コンポーネント検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、allowed_paths でも現在のリポジトリの Git 管理メタデータ削除をバイパスできないこと、allowed_paths 配下でも中間 symlink 経由の `.git` 配下削除をブロックし、`.git` を指す symlink 自身の削除は許可すること、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、Config 設定ファイルが壊れたときに permissive default ではなく strict モードにフォールバックして未追跡削除がブロックされること、Git管理メタデータの常時ブロック、Git管理メタデータを含むリポジトリルート再帰削除のブロック、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース（空 allowed_paths 配列、存在しない allowed_paths ディレクトリ）、壊れた symlink のデフォルト/厳格モード対応、空リポジトリ厳格モード、バッチ force フラグ複合、allowed_paths ドライラン注釈、`link/../victim` 形式の symlink 経由 `..` 脱出ブロックと正規化後の別ファイルを削除しないこと（`-f` 併用も含む）、`missing_dir/../victim.txt` 形式（存在しない中間成分）の正規化すり替え拒否、`regular_file/../victim.txt` 形式（通常ファイル中間成分）の正規化すり替え拒否、`-f` 併用時も中間成分が通常ディレクトリでない `..` を fail-closed で拒否すること、非 Git 親直下リポジトリの `.git` 直接削除ブロック、ネストリポジトリ全体の再帰削除と内部 `.git` 直接削除のブロック、bare リポジトリ全体と内部管理ファイル削除のブロック、`nested/.git/config` 形式の中間コンポーネント `.git` 経由メタデータ削除ブロック、`nested/.GIT/config` のような大文字バリアント（macOS APFS 等の case-insensitive FS 対策）のブロック、ドライラン部分失敗の「would be removed」表記検証も含めて検証
 
 ### 既知の限界
 
 - **TOCTOU**: 事前の Git 管理メタデータ判定と `fs::remove_dir_all` による実削除の間にはレースウィンドウがある。安全性は AI エージェントが単一プロセスで完結する前提を想定しており、別プロセスが削除対象配下に `.git` や bare リポジトリを置く・rename するシナリオは想定外。同一サーバ上で複数の非協力プロセスが同時に同じパスを操作する環境では追加の防御が必要
-- **GitChecker::open エラーの影響範囲**: 現状は run() 冒頭で `GitChecker::open(&cwd)?` を試行するため、cwd の `.git` が壊れているケースでは `allowed_paths` 配下の削除も巻き込まれて中断される。`get_all_statuses()` 起因の API エラーは allowed_paths をバイパスする経路と非対称な挙動になっている点に注意
 
 ### バージョン体系
 
