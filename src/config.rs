@@ -419,6 +419,21 @@ recursive = false
     }
 
     #[test]
+    fn test_load_config_read_error_falls_back_to_strict_mode() {
+        // 設定パスがファイルとして読めない場合、存在しない場合とは区別して
+        // fail-closed で strict モードにフォールバックする。
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let config = Config::load_from_path(Some(tmp_dir.path().to_path_buf()));
+
+        assert!(config.allowed_paths.is_empty());
+        assert!(
+            !config.allow_project_deletion,
+            "設定ファイルの読み取り失敗時は strict モード (allow_project_deletion = false) にフォールバックすべき"
+        );
+    }
+
+    #[test]
     fn test_recursive_default_is_false() {
         let toml_content = r#"
 [[allowed_paths]]

@@ -1157,13 +1157,14 @@ mod env_config_tests {
         let invalid_config = tempfile::NamedTempFile::new().unwrap();
         fs::write(invalid_config.path(), "invalid[[[toml content").unwrap();
 
-        // 無効な設定 → デフォルトにフォールバック
+        // 無効な設定は fail-closed で strict モードへフォールバックする。
+        // clean ファイルは strict モードでも削除可能なので成功する。
         let (exit_code, stdout, stderr) =
             run_safe_rm_with_config(&["clean.txt"], &repo_path, Some(invalid_config.path()));
 
         assert_eq!(
             exit_code, 0,
-            "Should fallback to default config and succeed"
+            "Should fallback to strict mode and still delete clean file"
         );
         assert!(stdout.contains("removed:"), "Should show removed message");
         assert!(
@@ -1171,6 +1172,37 @@ mod env_config_tests {
             "Should show warning about invalid config: {}",
             stderr
         );
+    }
+
+    #[test]
+    fn test_env_config_read_error_falls_back_to_strict_mode() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // 未追跡ファイルを作成。permissive default なら削除されるため、
+        // strict モードへ倒れたことを E2E で判定できる。
+        let untracked_file = repo_path.join("untracked.txt");
+        fs::write(&untracked_file, "untracked content").unwrap();
+
+        // 設定パスにディレクトリを指定し、read_to_string() を失敗させる。
+        let unreadable_config = tempfile::tempdir().unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["untracked.txt"],
+            &repo_path,
+            Some(unreadable_config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 2,
+            "Config read error should fallback to strict mode and block untracked deletion"
+        );
+        assert!(
+            stderr.contains("warning") && stderr.contains("未コミットの変更"),
+            "Should warn about config read error and block untracked file: {}",
+            stderr
+        );
+        assert!(untracked_file.exists(), "Untracked file should remain");
     }
 
     #[test]
