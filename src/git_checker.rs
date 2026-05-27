@@ -389,7 +389,10 @@ impl GitChecker {
 
         let statuses = self.repo.statuses(Some(&mut opts))?;
         for entry in statuses.iter() {
-            if let Some(path) = entry.path() {
+            // git2 0.21 で `entry.path()` は UTF-8 でないパスに対して `Err` を返すようになった。
+            // UTF-8 でないパスはキャッシュキーとして扱えないためスキップし、
+            // 該当パスは後続の単体問い合わせで fail-closed 経路に進ませる。
+            if let Ok(path) = entry.path() {
                 let status = Self::convert_status(entry.status());
                 status_map.insert(path.to_string(), status);
             }
@@ -467,10 +470,12 @@ impl GitChecker {
         match self.repo.statuses(Some(&mut opts)) {
             Ok(statuses) => {
                 for entry in statuses.iter() {
-                    if let Some(entry_path) = entry.path() {
-                        if entry_path == relative_path_key {
-                            return Some(Self::convert_status(entry.status()));
-                        }
+                    // git2 0.21 で `entry.path()` は UTF-8 でないパスに対して `Err` を返すようになった。
+                    // UTF-8 でないパスは比較対象外として無視し、見つからなければ後続の判定にフォールバックする。
+                    if let Ok(entry_path) = entry.path()
+                        && entry_path == relative_path_key
+                    {
+                        return Some(Self::convert_status(entry.status()));
                     }
                 }
             }

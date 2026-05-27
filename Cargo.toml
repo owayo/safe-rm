@@ -26,7 +26,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 path-clean = "1.0.1"
 
 # Git 操作（CI のクロスコンパイル向けに vendored 化）
-git2 = { version = "0.20.4", features = ["vendored-libgit2", "vendored-openssl"] }
+git2 = { version = "0.21.0", features = ["vendored-libgit2", "vendored-openssl"] }
 
 # 設定ファイル解析
 serde = { version = "1.0.228", features = ["derive"] }
