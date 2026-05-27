@@ -375,10 +375,14 @@ impl GitChecker {
     /// これにより、多数のファイルを処理する際の API 呼び出し回数を削減。
     /// Git API エラー時は fail-closed でエラーを返す。
     ///
+    /// キャッシュキーはバイト列（`Vec<u8>`）で持つ。UTF-8 でないパスを `String` に
+    /// 変換すると衝突や情報欠落が発生し、非 UTF-8 ファイルが `NotInRepo` に
+    /// 落ちて削除を許可される経路が生じるため、`entry.path_bytes()` を直接使う。
+    ///
     /// # 戻り値
-    /// * `Ok(HashMap<String, FileStatus>)` - 相対パス → ステータスのマップ
+    /// * `Ok(HashMap<Vec<u8>, FileStatus>)` - 相対パス（バイト列）→ ステータスのマップ
     /// * `Err(SafeRmError)` - Git API エラー（ステータス取得不可時は削除をブロック）
-    pub fn get_all_statuses(&self) -> Result<HashMap<String, FileStatus>, SafeRmError> {
+    pub fn get_all_statuses(&self) -> Result<HashMap<Vec<u8>, FileStatus>, SafeRmError> {
         let mut status_map = HashMap::new();
 
         let mut opts = StatusOptions::new();
@@ -389,13 +393,8 @@ impl GitChecker {
 
         let statuses = self.repo.statuses(Some(&mut opts))?;
         for entry in statuses.iter() {
-            // git2 0.21 で `entry.path()` は UTF-8 でないパスに対して `Err` を返すようになった。
-            // UTF-8 でないパスはキャッシュキーとして扱えないためスキップし、
-            // 該当パスは後続の単体問い合わせで fail-closed 経路に進ませる。
-            if let Ok(path) = entry.path() {
-                let status = Self::convert_status(entry.status());
-                status_map.insert(path.to_string(), status);
-            }
+            let status = Self::convert_status(entry.status());
+            status_map.insert(entry.path_bytes().to_vec(), status);
         }
 
         Ok(status_map)
@@ -404,11 +403,11 @@ impl GitChecker {
     /// キャッシュからファイルステータスを取得
     ///
     /// `get_all_statuses()` で事前取得したキャッシュを使用。
-    /// キャッシュにない場合は Clean として扱う（Git 追跡済みで変更なし）。
+    /// キャッシュにない場合は単体問い合わせ経路にフォールバックする。
     pub fn get_file_status_from_cache(
         &self,
         path: &Path,
-        cache: &HashMap<String, FileStatus>,
+        cache: &HashMap<Vec<u8>, FileStatus>,
     ) -> FileStatus {
         let relative_path = match self.to_workdir_relative(path) {
             Some(p) => p,
@@ -460,6 +459,10 @@ impl GitChecker {
     /// status 一覧から相対パスに対応するステータスを検索
     ///
     /// Git API エラー時は fail-closed で Modified を返し、削除をブロックする。
+    /// `entry.path_bytes()` を直接比較することで、非 UTF-8 パスでも正しく
+    /// ステータスを引ける（`entry.path()` の `Err` でスキップすると、未追跡
+    /// ディレクトリ配下の非 UTF-8 ファイルが `NotInRepo` に落ち、削除許可される
+    /// fail-open 経路に倒れてしまうのを防ぐ）。
     fn lookup_status_in_listing(&self, relative_path: &Path) -> Option<FileStatus> {
         let mut opts = StatusOptions::new();
         opts.include_untracked(true);
@@ -470,11 +473,7 @@ impl GitChecker {
         match self.repo.statuses(Some(&mut opts)) {
             Ok(statuses) => {
                 for entry in statuses.iter() {
-                    // git2 0.21 で `entry.path()` は UTF-8 でないパスに対して `Err` を返すようになった。
-                    // UTF-8 でないパスは比較対象外として無視し、見つからなければ後続の判定にフォールバックする。
-                    if let Ok(entry_path) = entry.path()
-                        && entry_path == relative_path_key
-                    {
+                    if entry.path_bytes() == relative_path_key.as_slice() {
                         return Some(Self::convert_status(entry.status()));
                     }
                 }
@@ -483,15 +482,14 @@ impl GitChecker {
             Err(_) => return Some(FileStatus::Modified),
         }
 
-        if self
-            .repo
-            .status_should_ignore(relative_path)
-            .unwrap_or(false)
-        {
-            return Some(FileStatus::Ignored);
+        // fail-closed: `status_should_ignore` のエラーは「ignore 判定不能」と
+        // みなし、`Modified` 相当でブロックする。`unwrap_or(false)` だと
+        // 「ignored ではない」→ `None` → `NotInRepo` → 削除許可に倒れる。
+        match self.repo.status_should_ignore(relative_path) {
+            Ok(true) => Some(FileStatus::Ignored),
+            Ok(false) => None,
+            Err(_) => Some(FileStatus::Modified),
         }
-
-        None
     }
 
     /// git2 のステータスフラグから FileStatus への変換
@@ -629,7 +627,7 @@ impl GitChecker {
     pub fn check_directory_with_cache(
         &self,
         dir: &Path,
-        cache: &HashMap<String, FileStatus>,
+        cache: &HashMap<Vec<u8>, FileStatus>,
     ) -> Result<(), SafeRmError> {
         // キャッシュ利用時も、ignored ディレクトリ配下の tracked 変更を
         // 見落とさないように必ず各エントリを検査する。
@@ -640,7 +638,7 @@ impl GitChecker {
     fn check_directory_recursive_with_cache(
         &self,
         dir: &Path,
-        cache: &HashMap<String, FileStatus>,
+        cache: &HashMap<Vec<u8>, FileStatus>,
     ) -> Result<(), SafeRmError> {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
@@ -676,7 +674,7 @@ impl GitChecker {
     pub fn check_file_with_cache(
         &self,
         path: &Path,
-        cache: &HashMap<String, FileStatus>,
+        cache: &HashMap<Vec<u8>, FileStatus>,
     ) -> Result<(), SafeRmError> {
         let status = self.get_file_status_from_cache(path, cache);
         if Self::is_deletable(status) {
@@ -693,7 +691,7 @@ impl GitChecker {
     pub fn check_path_with_cache(
         &self,
         path: &Path,
-        cache: &HashMap<String, FileStatus>,
+        cache: &HashMap<Vec<u8>, FileStatus>,
     ) -> Result<(), SafeRmError> {
         if Self::is_real_directory(path) {
             self.check_directory_with_cache(path, cache)
@@ -702,12 +700,28 @@ impl GitChecker {
         }
     }
 
-    /// Git status のキー形式（スラッシュ区切り）に揃える
-    fn to_git_relative_key(path: &Path) -> String {
-        path.components()
-            .map(|component| component.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/")
+    /// Git status のキー形式（スラッシュ区切り、バイト列）に揃える。
+    ///
+    /// 非 UTF-8 のパスでも一意なキーを作るため、`String` ではなく `Vec<u8>` を返す。
+    /// Unix では `OsStr` のバイト表現をそのまま使い、Windows では `to_string_lossy()`
+    /// にフォールバックする（Windows のパスは通常 UTF-16 で UTF-8 化可能）。
+    fn to_git_relative_key(path: &Path) -> Vec<u8> {
+        let mut key: Vec<u8> = Vec::new();
+        for (i, component) in path.components().enumerate() {
+            if i > 0 {
+                key.push(b'/');
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                key.extend_from_slice(component.as_os_str().as_bytes());
+            }
+            #[cfg(not(unix))]
+            {
+                key.extend_from_slice(component.as_os_str().to_string_lossy().as_bytes());
+            }
+        }
+        key
     }
 
     /// シンボリックリンクを辿らずに「実体がディレクトリか」を判定
@@ -1456,10 +1470,13 @@ mod tests {
         let statuses = checker.get_all_statuses().unwrap();
 
         // Clean, Modified, Untracked, Ignored が status に含まれる
-        assert_eq!(statuses.get("clean.txt"), Some(&FileStatus::Clean));
-        assert!(statuses.contains_key("modified.txt"));
-        assert!(statuses.contains_key("new.txt"));
-        assert!(statuses.contains_key("debug.log"));
+        assert_eq!(
+            statuses.get(b"clean.txt".as_slice()),
+            Some(&FileStatus::Clean)
+        );
+        assert!(statuses.contains_key(b"modified.txt".as_slice()));
+        assert!(statuses.contains_key(b"new.txt".as_slice()));
+        assert!(statuses.contains_key(b"debug.log".as_slice()));
     }
 
     #[test]
@@ -1648,7 +1665,7 @@ mod tests {
     fn test_to_git_relative_key_uses_forward_slash() {
         let nested = Path::new("subdir").join("file.txt");
         let key = GitChecker::to_git_relative_key(&nested);
-        assert_eq!(key, "subdir/file.txt");
+        assert_eq!(key.as_slice(), b"subdir/file.txt");
     }
 
     #[test]
@@ -1672,7 +1689,7 @@ mod tests {
 
         let checker = open_checker(&repo_path);
         let mut cache = HashMap::new();
-        cache.insert("nested/file.txt".to_string(), FileStatus::Untracked);
+        cache.insert(b"nested/file.txt".to_vec(), FileStatus::Untracked);
 
         let status = checker.get_file_status_from_cache(&nested_file, &cache);
         assert_eq!(status, FileStatus::Untracked);
@@ -1888,7 +1905,7 @@ mod tests {
         // 単一セグメント（ディレクトリなし）のパス
         let path = Path::new("file.txt");
         let key = GitChecker::to_git_relative_key(path);
-        assert_eq!(key, "file.txt");
+        assert_eq!(key.as_slice(), b"file.txt");
     }
 
     #[test]
@@ -2039,7 +2056,7 @@ mod tests {
         let statuses = checker.get_all_statuses().unwrap();
 
         assert_eq!(
-            statuses.get("debug.log"),
+            statuses.get(b"debug.log".as_slice()),
             Some(&FileStatus::Ignored),
             "get_all_statuses は Ignored ファイルを含むべき"
         );
@@ -2112,7 +2129,7 @@ mod tests {
         // ネストしたパスがスラッシュ区切りに正しく変換されることを確認
         let path = Path::new("src").join("components").join("App.tsx");
         let key = GitChecker::to_git_relative_key(&path);
-        assert_eq!(key, "src/components/App.tsx");
+        assert_eq!(key.as_slice(), b"src/components/App.tsx");
     }
 
     #[test]
@@ -2290,7 +2307,10 @@ mod tests {
             "追跡済み Clean ファイルは Clean を返すべき"
         );
 
-        assert_eq!(cache.get("tracked_clean.txt"), Some(&FileStatus::Clean));
+        assert_eq!(
+            cache.get(b"tracked_clean.txt".as_slice()),
+            Some(&FileStatus::Clean)
+        );
     }
 
     #[test]
@@ -2533,7 +2553,7 @@ mod tests {
         let statuses = checker.get_all_statuses().unwrap();
 
         assert_eq!(
-            statuses.get("new_file.txt"),
+            statuses.get(b"new_file.txt".as_slice()),
             Some(&FileStatus::Untracked),
             "空リポジトリの未追跡ファイルも取得されるべき"
         );
@@ -2669,11 +2689,26 @@ mod tests {
         let checker = open_checker(&repo_path);
         let statuses = checker.get_all_statuses().unwrap();
 
-        assert_eq!(statuses.get("modified.txt"), Some(&FileStatus::Modified));
-        assert_eq!(statuses.get("staged.txt"), Some(&FileStatus::Staged));
-        assert_eq!(statuses.get("new.txt"), Some(&FileStatus::Untracked));
-        assert_eq!(statuses.get("debug.log"), Some(&FileStatus::Ignored));
-        assert_eq!(statuses.get("clean.txt"), Some(&FileStatus::Clean));
+        assert_eq!(
+            statuses.get(b"modified.txt".as_slice()),
+            Some(&FileStatus::Modified)
+        );
+        assert_eq!(
+            statuses.get(b"staged.txt".as_slice()),
+            Some(&FileStatus::Staged)
+        );
+        assert_eq!(
+            statuses.get(b"new.txt".as_slice()),
+            Some(&FileStatus::Untracked)
+        );
+        assert_eq!(
+            statuses.get(b"debug.log".as_slice()),
+            Some(&FileStatus::Ignored)
+        );
+        assert_eq!(
+            statuses.get(b"clean.txt".as_slice()),
+            Some(&FileStatus::Clean)
+        );
     }
 
     #[test]
@@ -2693,7 +2728,7 @@ mod tests {
         // 空パスの変換
         let path = Path::new("");
         let key = GitChecker::to_git_relative_key(path);
-        assert_eq!(key, "");
+        assert!(key.is_empty(), "空パスのキーは空バイト列であるべき");
     }
 
     #[test]
@@ -2941,6 +2976,90 @@ mod tests {
             }
             Ok(Some(_)) => panic!("存在しないパスで Ok(Some) を返してはならない"),
             Err(other) => panic!("予期しないエラー種別: {:?}", other),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_all_statuses_preserves_non_utf8_path_key() {
+        // 非 UTF-8 のパスもキャッシュに登録され、`Vec<u8>` キーで取り出せること。
+        // 旧実装（`entry.path()` が UTF-8 でない場合に `None`/`Err`）ではキャッシュから
+        // 漏れていたが、`entry.path_bytes()` ベースに変更したことで保持される。
+        //
+        // macOS の APFS/HFS+ は UTF-8 強制のため非 UTF-8 ファイル名を作れない。
+        // `fs::write` が `Illegal byte sequence` で失敗した場合はテストをスキップする。
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        // 末尾バイトが 0xFF の非 UTF-8 ファイル名を作成
+        let non_utf8_name =
+            OsString::from_vec(vec![b'b', b'a', b'd', 0xff, b'.', b't', b'x', b't']);
+        let file_path = repo_path.join(&non_utf8_name);
+        if fs::write(&file_path, "untracked").is_err() {
+            eprintln!("非 UTF-8 ファイル名を許可しない FS のためテストをスキップ (macOS APFS 等)");
+            return;
+        }
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+
+        let expected_key: Vec<u8> = non_utf8_name.into_vec();
+        assert_eq!(
+            cache.get(expected_key.as_slice()),
+            Some(&FileStatus::Untracked),
+            "非 UTF-8 ファイル名でもキャッシュに Untracked として残るべき"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_with_cache_blocks_non_utf8_untracked_nested_file() {
+        // 非 UTF-8 名の未追跡ファイルが、未追跡ディレクトリ配下にあっても
+        // fail-closed でブロックされること。
+        // 旧実装では `get_all_statuses` でスキップ → cache miss →
+        // `status_file` が NotFound → `lookup_status_in_listing` でも非 UTF-8 を
+        // スキップ → `status_should_ignore.unwrap_or(false)` → `None` →
+        // `NotInRepo` (削除許可) という fail-open 経路があったが、ここでは
+        // `entry.path_bytes()` ベースに変えてその経路を塞いだことを検証する。
+        //
+        // macOS の APFS/HFS+ は UTF-8 強制のため非 UTF-8 ファイル名を作れない。
+        // `fs::write` が `Illegal byte sequence` で失敗した場合はテストをスキップする。
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        let nested_dir = repo_path.join("newdir").join("deep");
+        fs::create_dir_all(&nested_dir).unwrap();
+
+        let non_utf8_name = OsString::from_vec(vec![0xff, b'.', b't', b'x', b't']);
+        let file_path = nested_dir.join(&non_utf8_name);
+        if fs::write(&file_path, "untracked").is_err() {
+            eprintln!("非 UTF-8 ファイル名を許可しない FS のためテストをスキップ (macOS APFS 等)");
+            return;
+        }
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+
+        let result = checker.check_file_with_cache(&file_path, &cache);
+        match result {
+            Err(SafeRmError::DirtyFiles {
+                status: FileStatus::Untracked | FileStatus::Modified,
+                ..
+            }) => {
+                // 期待どおり: 未追跡または Modified としてブロック
+            }
+            other => panic!(
+                "非 UTF-8 の未追跡ファイルは fail-closed でブロックされるべき: {:?}",
+                other
+            ),
         }
     }
 }

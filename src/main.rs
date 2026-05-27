@@ -125,7 +125,8 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
     // Git ステータスは、厳格モードかつ allowed_paths 外の削除で初めて取得する。
     // allowed_paths は Git チェックをバイパスするため、現在のリポジトリに
     // Git API エラーがあっても allowed_paths の削除を巻き込まない。
-    let mut status_cache: Option<HashMap<String, FileStatus>> = None;
+    // キャッシュキーは非 UTF-8 パスにも対応するためバイト列で持つ。
+    let mut status_cache: Option<HashMap<Vec<u8>, FileStatus>> = None;
 
     let mut success_count = 0;
     let mut error_count = 0;
@@ -189,7 +190,7 @@ fn process_path(
     path: &Path,
     cwd: &Path,
     git_context: &mut GitContext,
-    status_cache: &mut Option<HashMap<String, FileStatus>>,
+    status_cache: &mut Option<HashMap<Vec<u8>, FileStatus>>,
     args: &CliArgs,
     config: &Config,
 ) -> Result<bool, SafeRmError> {
