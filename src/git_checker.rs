@@ -421,12 +421,28 @@ impl GitChecker {
             return status;
         }
 
-        // キャッシュにない場合: .gitignore チェック
-        if self.is_ignored_path(path) {
-            return FileStatus::Ignored;
+        // キャッシュにない場合: .gitignore チェック。
+        // Git API エラーは fail-closed で `Modified` 相当に倒し、
+        // `Err` を握りつぶして `false` → `status_file` が偶然 `Clean` を返すケースで
+        // 削除許可されてしまう経路を塞ぐ。
+        if let Some(status) = self.ignored_status_from_relative_path(&relative_path) {
+            return status;
         }
 
         self.resolve_status_from_relative_path(&relative_path)
+    }
+
+    /// 相対パスの ignore 判定をステータスとして返す（fail-closed 対応）。
+    ///
+    /// - `Ok(true)`: `.gitignore` 対象 → `Ignored`
+    /// - `Ok(false)`: ignore 対象外 → `None`（呼び出し元で次の判定に進む）
+    /// - `Err(_)`: 判定不能 → `Modified`（削除をブロック）
+    fn ignored_status_from_relative_path(&self, relative_path: &Path) -> Option<FileStatus> {
+        match self.repo.status_should_ignore(relative_path) {
+            Ok(true) => Some(FileStatus::Ignored),
+            Ok(false) => None,
+            Err(_) => Some(FileStatus::Modified),
+        }
     }
 
     /// ファイルの Git ステータスを取得
@@ -573,18 +589,6 @@ impl GitChecker {
         // ディレクトリ自体が ignored でも、配下に tracked な変更済みファイルが
         // 存在し得るため、早期許可せず各エントリを再帰的に検査する。
         self.check_directory_recursive(dir)
-    }
-
-    /// パスが .gitignore に含まれるかチェック
-    fn is_ignored_path(&self, path: &Path) -> bool {
-        let relative_path = match self.to_workdir_relative(path) {
-            Some(p) => p,
-            None => return false,
-        };
-
-        self.repo
-            .status_should_ignore(&relative_path)
-            .unwrap_or(false)
     }
 
     /// ディレクトリ内のファイルを再帰的にチェック
@@ -3061,5 +3065,41 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_file_status_from_cache_blocks_non_utf8_with_empty_cache() {
+        // 空キャッシュ経由でも、`lookup_status_in_listing` の path_bytes 比較が
+        // 動作することを検証する。
+        // 経路: cache miss → ignored_status_from_relative_path (Ok(false)) →
+        // resolve_status_from_relative_path → status_file (NotFound) →
+        // lookup_status_in_listing (path_bytes 比較で発見) → Untracked
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "initial.txt", "initial");
+
+        let nested_dir = repo_path.join("newdir").join("deep");
+        fs::create_dir_all(&nested_dir).unwrap();
+
+        let non_utf8_name = OsString::from_vec(vec![0xfe, b'.', b't', b'x', b't']);
+        let file_path = nested_dir.join(&non_utf8_name);
+        if fs::write(&file_path, "untracked").is_err() {
+            eprintln!("非 UTF-8 ファイル名を許可しない FS のためテストをスキップ (macOS APFS 等)");
+            return;
+        }
+
+        let checker = open_checker(&repo_path);
+        let empty_cache: HashMap<Vec<u8>, FileStatus> = HashMap::new();
+
+        let status = checker.get_file_status_from_cache(&file_path, &empty_cache);
+        assert!(
+            !status.is_deletable(),
+            "空キャッシュでも非 UTF-8 未追跡ファイルは削除不可と判定されるべき: {:?}",
+            status
+        );
     }
 }
