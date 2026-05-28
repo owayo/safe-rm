@@ -377,6 +377,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_reject_symlink_parent_traversal_blocks_nested_removed_symlink_component() {
+        // `link/child/../../victim.txt` は一度 symlink 配下へ下ってから
+        // `..` で symlink 成分自体を消すため、字句正規化後の削除対象と
+        // OS の path resolution が一致しない。
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        fs::create_dir_all(outside_dir.path().join("child")).unwrap();
+
+        std::os::unix::fs::symlink(outside_dir.path(), project_root.join("link")).unwrap();
+
+        let result = PathChecker::reject_symlink_parent_traversal(
+            &project_root,
+            Path::new("link/child/../../victim.txt"),
+        );
+
+        assert!(
+            matches!(result, Err(SafeRmError::UnsafeTraversal { .. })),
+            "ネストした `..` で symlink 成分が消える経路は拒否すべき"
+        );
+    }
+
+    #[test]
     fn test_reject_symlink_parent_traversal_blocks_missing_intermediate() {
         // `missing/../victim.txt` のように、`..` の直前成分が存在しないパスは
         // OS の path resolution では `ENOENT` で失敗する。
