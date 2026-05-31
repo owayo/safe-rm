@@ -28,9 +28,12 @@ fn run_safe_rm_with_config(
     let mut cmd = Command::new(&binary);
     cmd.args(args).current_dir(cwd);
 
-    if let Some(path) = config_path {
-        cmd.env("SAFE_RM_CONFIG", path);
-    }
+    // テスト実行ユーザーの実設定に左右されないよう、未指定時も明示的に未存在パスを使う。
+    let default_config_path = cwd.join(".safe-rm-test-missing-config.toml");
+    cmd.env(
+        "SAFE_RM_CONFIG",
+        config_path.unwrap_or(default_config_path.as_path()),
+    );
 
     let output = cmd.output().expect("Failed to execute safe-rm");
 
