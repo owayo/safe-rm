@@ -47,22 +47,37 @@ impl PathChecker {
         // 2. 字句的に正規化（.. を解決）
         let cleaned_path = absolute_path.clean();
 
-        // 3. 可能であればシンボリックリンクを解決
-        //    末尾が未作成でも、既存の親ディレクトリまで解決してエイリアス差異を吸収する
-        let canonical_path = Self::try_canonicalize(&cleaned_path);
-
-        // 4. プロジェクトルートも正規化
+        // 3. プロジェクトルートも正規化
         let canonical_root = Self::try_canonicalize(&project_root.clean());
 
-        // 5. 境界チェック
-        if !Self::is_contained(&canonical_root, &canonical_path) {
+        // 4. 削除対象エントリ（末尾コンポーネント）の位置で境界判定する。
+        //    `remove_file`/`remove_dir` は symlink を辿らず「リンクエントリ自体」を
+        //    削除するため、実際に削除されるエントリがプロジェクト内にあることを要求する。
+        //    末尾コンポーネントは canonicalize せず、中間 symlink（エイリアス）だけ解決する。
+        //    これにより、プロジェクト外の symlink がプロジェクト内の実体を指していても、
+        //    エントリ自体がプロジェクト外であれば確実にブロックできる（実体だけ見て
+        //    通過させてしまう包含バイパスを塞ぐ）。
+        let entry_path = Self::canonicalize_parent_keep_filename(&cleaned_path);
+        if !Self::is_contained(&canonical_root, &entry_path) {
             return Err(SafeRmError::OutsideProject {
                 path: target_path.to_path_buf(),
                 project_root: project_root.to_path_buf(),
             });
         }
 
-        Ok(canonical_path)
+        // 5. 末尾まで解決した実体パスもプロジェクト内であることを要求する。
+        //    プロジェクト内の symlink がプロジェクト外の実体を指すケースは、従来どおり
+        //    安全側でブロックし続ける。未作成パスは既存の親まで解決される。
+        let resolved_path = Self::try_canonicalize(&cleaned_path);
+        if !Self::is_contained(&canonical_root, &resolved_path) {
+            return Err(SafeRmError::OutsideProject {
+                path: target_path.to_path_buf(),
+                project_root: project_root.to_path_buf(),
+            });
+        }
+
+        // 削除対象エントリの位置を返す（後続の Git ステータス判定もこの位置で行う）
+        Ok(entry_path)
     }
 
     /// `..` の解決対象が「実体として存在する通常ディレクトリ」でないパスを拒否する。
@@ -169,6 +184,22 @@ impl PathChecker {
         }
 
         path.to_path_buf()
+    }
+
+    /// 親ディレクトリのみ canonicalize し、末尾コンポーネントは解決せず保持する。
+    ///
+    /// 削除対象が symlink の場合、`remove_file`/`remove_dir` はリンクを辿らず
+    /// リンクエントリ自体を削除する。境界判定を「実際に削除されるエントリ」の位置で
+    /// 行うために、末尾コンポーネントは canonicalize しない。中間 symlink（エイリアス）は
+    /// 解決して、中間 symlink 経由の境界脱出は引き続き防ぐ。
+    fn canonicalize_parent_keep_filename(path: &Path) -> PathBuf {
+        let Some(file_name) = path.file_name() else {
+            return Self::try_canonicalize(path);
+        };
+        let Some(parent) = path.parent() else {
+            return path.to_path_buf();
+        };
+        Self::try_canonicalize(parent).join(file_name)
     }
 
     /// パスがルート内に含まれているかチェック
@@ -353,8 +384,34 @@ mod tests {
         let link_path = project_root.join("evil_link.txt");
         std::os::unix::fs::symlink(&outside_file, &link_path).unwrap();
 
+        // プロジェクト内にある symlink でも、実体がプロジェクト外を指す場合は
+        // 従来どおり安全側でブロックする（実体位置チェック）。
         let result = PathChecker::verify_containment(&project_root, &link_path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_verify_containment_outside_symlink_pointing_inside_is_blocked() {
+        // プロジェクト外にある symlink が、プロジェクト内の実体を指すケース。
+        // `remove_file` はリンクを辿らず symlink エントリ自体（プロジェクト外）を
+        // 削除するため、実体が内側でも「削除されるエントリ」は境界外として
+        // 確実にブロックする（実体だけ見て通過させてしまう包含バイパスの回帰防止）。
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+        let inside_file = project_root.join("inside.txt");
+        fs::write(&inside_file, "inside").unwrap();
+
+        // プロジェクト外に、プロジェクト内を指す symlink を作成
+        let outside_dir = TempDir::new().unwrap();
+        let outside_link = outside_dir.path().join("link_into_project.txt");
+        std::os::unix::fs::symlink(&inside_file, &outside_link).unwrap();
+
+        let result = PathChecker::verify_containment(&project_root, &outside_link);
+        assert!(
+            result.is_err(),
+            "プロジェクト外の symlink はリンク先がプロジェクト内でもブロックされるべき"
+        );
     }
 
     #[test]

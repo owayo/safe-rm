@@ -212,6 +212,21 @@ impl Config {
         path.to_path_buf()
     }
 
+    /// 親ディレクトリのみ canonicalize し、末尾コンポーネントは解決せず保持する。
+    ///
+    /// 削除対象が symlink の場合、`remove_*` はリンクを辿らずリンクエントリ自体を
+    /// 削除する。許可判定を「実際に削除されるエントリ」の位置で行うために、末尾
+    /// コンポーネントは canonicalize しない。中間 symlink（エイリアス）は解決する。
+    fn canonicalize_parent_keep_filename(path: &Path) -> PathBuf {
+        let Some(file_name) = path.file_name() else {
+            return Self::try_canonicalize(path);
+        };
+        let Some(parent) = path.parent() else {
+            return path.to_path_buf();
+        };
+        Self::try_canonicalize(parent).join(file_name)
+    }
+
     /// パスが許可ディレクトリ内にあるかチェック
     ///
     /// 指定パスが allowed_paths のいずれかのエントリに一致する場合 true を返す。
@@ -231,27 +246,37 @@ impl Config {
                 .unwrap_or_else(|_| target.to_path_buf())
         };
 
-        // 既存親まで canonicalize して、未作成パスや symlink 別名も吸収する
-        let target_resolved = Self::try_canonicalize(&target_normalized);
+        // 削除対象エントリ（末尾 symlink を辿らない位置）と、末尾まで解決した実体の
+        // 両方を求める。削除は末尾エントリ自体に対して行われるため、エントリ位置が
+        // 許可範囲内であることを要求しつつ、許可ディレクトリ外の symlink が許可内を
+        // 指すバイパス（エントリは外なのに実体だけ内側）も塞ぐ。中間 symlink（別名）は
+        // 両者とも解決され、別名 cwd や /var→/private/var 差異は吸収される。
+        let entry_path = Self::canonicalize_parent_keep_filename(&target_normalized);
+        let resolved_path = Self::try_canonicalize(&target_normalized);
 
-        // 事前解決済みパスを使用（ここでは canonicalize を呼ばない — ロード時に完了済み）
-        for entry in &self.allowed_paths_resolved {
-            if entry.recursive {
-                // 再帰: ターゲットは許可パス配下の任意の場所に存在可能
-                if target_resolved.starts_with(&entry.canonical_path) {
-                    return true;
-                }
-            } else {
-                // 非再帰: ターゲットは許可パスの直接の子でなければならない
-                if let Some(parent) = target_resolved.parent() {
-                    if parent == entry.canonical_path {
-                        return true;
-                    }
-                }
-            }
+        let entry_allowed = self
+            .allowed_paths_resolved
+            .iter()
+            .any(|entry| Self::path_matches_allowed_entry(&entry_path, entry));
+        let resolved_allowed = self
+            .allowed_paths_resolved
+            .iter()
+            .any(|entry| Self::path_matches_allowed_entry(&resolved_path, entry));
+
+        entry_allowed && resolved_allowed
+    }
+
+    /// ターゲットパスが許可エントリに一致するか判定する（recursive フラグを考慮）。
+    fn path_matches_allowed_entry(path: &Path, entry: &AllowedPathResolved) -> bool {
+        if entry.recursive {
+            // 再帰: ターゲットは許可パス配下の任意の場所に存在可能
+            path.starts_with(&entry.canonical_path)
+        } else if let Some(parent) = path.parent() {
+            // 非再帰: ターゲットは許可パスの直接の子でなければならない
+            parent == entry.canonical_path
+        } else {
+            false
         }
-
-        false
     }
 }
 
@@ -959,6 +984,38 @@ recursive = true
         assert!(
             config.is_path_allowed(&nonexistent),
             "未作成ファイルでも symlink 別名経由なら許可パスとして一致するべき"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_is_path_allowed_rejects_outside_symlink_into_allowed_dir() {
+        // 許可ディレクトリ外にある symlink が、許可ディレクトリ内の実体を指すケース。
+        // `remove_*` はリンクを辿らず symlink エントリ自体（許可ディレクトリ外）を
+        // 削除するため、実体が許可内でも「削除されるエントリ」は許可範囲外として拒否する。
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+        let inside = allowed_dir.join("inside.txt");
+        fs::write(&inside, "x").unwrap();
+
+        // 許可ディレクトリ外に、許可ディレクトリ内を指す symlink を作成
+        let outside_link = canonical_tmp.join("outside-link.txt");
+        std::os::unix::fs::symlink(&inside, &outside_link).unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: true,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        assert!(
+            !config.is_path_allowed(&outside_link),
+            "許可ディレクトリ外の symlink はリンク先が許可内でも許可されないべき"
         );
     }
 

@@ -1945,6 +1945,38 @@ mod symlink_tests {
     }
 
     #[test]
+    fn test_outside_symlink_pointing_into_project_blocked() {
+        // プロジェクト外にある symlink が、プロジェクト内のコミット済みファイルを
+        // 指すケース。削除されるのは symlink エントリ自体（プロジェクト外）なので、
+        // 実体がプロジェクト内でも包含検証で exit 2 ブロックする
+        // （実体だけ見て境界を通過させてしまう包含バイパスの回帰防止）。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "inside.txt", "inside content");
+
+        // プロジェクト外に、プロジェクト内を指す symlink を作成
+        let outside_dir = TempDir::new().unwrap();
+        let outside_link = outside_dir.path().join("link_into_repo.txt");
+        std::os::unix::fs::symlink(repo_path.join("inside.txt"), &outside_link).unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm(&[outside_link.to_str().unwrap()], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "プロジェクト外の symlink はリンク先がプロジェクト内でもブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            outside_link.symlink_metadata().is_ok(),
+            "プロジェクト外の symlink は削除されないべき"
+        );
+        assert!(
+            repo_path.join("inside.txt").exists(),
+            "リンク先の実体ファイルも残るべき"
+        );
+    }
+
+    #[test]
     fn test_strict_mode_directory_symlink_does_not_traverse_target() {
         use std::os::unix::fs::PermissionsExt;
 
