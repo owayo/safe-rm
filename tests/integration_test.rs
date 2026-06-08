@@ -4560,6 +4560,36 @@ mod nested_git_metadata_tests {
         );
     }
 
+    #[test]
+    fn test_nested_uppercase_dot_git_recursive_delete_blocked() {
+        // 再帰削除の配下探索でも `.GIT` を Git 管理メタデータとして扱う。
+        // case-sensitive FS では通常ディレクトリでも、case-insensitive FS では
+        // `.git` と同じ実体を指し得るため安全側で拒否する。
+        let parent = TempDir::new().unwrap();
+        let parent_canonical = parent.path().canonicalize().unwrap();
+        let nested = parent_canonical.join("nested");
+        let uppercase_git = nested.join(".GIT");
+        fs::create_dir_all(&uppercase_git).unwrap();
+        fs::write(uppercase_git.join("config"), "git config").unwrap();
+
+        let (exit_code, _stdout, stderr) = run_safe_rm(&["-r", "nested"], &parent_canonical);
+
+        assert_eq!(
+            exit_code, 2,
+            "`.GIT` を含むディレクトリの再帰削除は拒否されるべき: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("Git 管理メタデータ"),
+            "Git 管理メタデータの保護エラーが必要: {}",
+            stderr
+        );
+        assert!(
+            uppercase_git.join("config").exists(),
+            ".GIT/config は保護されるべき"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_nested_dot_git_via_intermediate_symlink_blocked() {

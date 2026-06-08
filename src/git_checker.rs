@@ -900,6 +900,24 @@ mod tests {
     }
 
     #[test]
+    fn test_path_targets_dir_with_uppercase_dot_git_recursive() {
+        // case-insensitive FS では `.GIT` が `.git` と同じ実体を指し得るため、
+        // 再帰探索でも大文字バリアントを常に保護対象として扱う。
+        let temp_dir = TempDir::new().unwrap();
+        let nested = temp_dir.path().join("nested");
+        let dot_git = nested.join(".GIT");
+        fs::create_dir_all(&dot_git).unwrap();
+
+        assert!(GitChecker::path_targets_or_contains_git_metadata(
+            &nested, true
+        ));
+        // recursive=false なら配下は探索しない
+        assert!(!GitChecker::path_targets_or_contains_git_metadata(
+            &nested, false
+        ));
+    }
+
+    #[test]
     fn test_path_targets_bare_repo_recursive() {
         // bare リポジトリは `.git` コンポーネントを持たないが Git 管理メタデータ。
         let temp_dir = TempDir::new().unwrap();
