@@ -4497,6 +4497,52 @@ mod nested_git_metadata_tests {
     }
 
     #[test]
+    fn test_corrupted_config_bare_repo_head_delete_blocked() {
+        // config が壊れて open_bare() が失敗する bare リポジトリでも、
+        // HEAD 等の管理ファイル削除は構造マーカー検出でブロックされる（fail-closed 回帰防止）。
+        let parent = TempDir::new().unwrap();
+        let parent_canonical = parent.path().canonicalize().unwrap();
+        let bare_repo = parent_canonical.join("repo.git");
+        init_bare_repo(&bare_repo);
+
+        // 未終端セクションヘッダで config を破壊し、open_bare() を失敗させる
+        fs::write(bare_repo.join("config"), "[core\n").unwrap();
+
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["repo.git/HEAD"], &parent_canonical);
+
+        assert_ne!(
+            exit_code, 0,
+            "config 破損 bare リポジトリの HEAD 削除も拒否されるべき"
+        );
+        assert!(
+            bare_repo.join("HEAD").exists(),
+            "config 破損 bare リポジトリの HEAD は保護されるべき"
+        );
+    }
+
+    #[test]
+    fn test_corrupted_config_bare_repo_recursive_delete_blocked() {
+        // config 破損 bare リポジトリ全体の再帰削除もブロックされる。
+        let parent = TempDir::new().unwrap();
+        let parent_canonical = parent.path().canonicalize().unwrap();
+        let bare_repo = parent_canonical.join("cache.git");
+        init_bare_repo(&bare_repo);
+
+        fs::write(bare_repo.join("config"), "[core\n").unwrap();
+
+        let (exit_code, _stdout, _stderr) = run_safe_rm(&["-r", "cache.git"], &parent_canonical);
+
+        assert_ne!(
+            exit_code, 0,
+            "config 破損 bare リポジトリ全体の再帰削除も拒否されるべき"
+        );
+        assert!(
+            bare_repo.join("HEAD").exists(),
+            "config 破損 bare リポジトリは保護されるべき"
+        );
+    }
+
+    #[test]
     fn test_nested_repo_dot_git_direct_delete_blocked() {
         // 外側 repo から内側 .git を直接指定して削除しようとする
         let outer = create_test_repo();

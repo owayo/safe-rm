@@ -253,6 +253,13 @@ impl GitChecker {
     }
 
     /// 指定ディレクトリが bare リポジトリのルートか確認する。
+    ///
+    /// `Repository::open_bare()` は `config` が壊れていると失敗する。そのケースで
+    /// `false`（非 bare）に倒すと Git 管理メタデータ保護が fail-open になり、
+    /// 壊れた bare リポジトリの `HEAD` 等を削除できてしまう。これを防ぐため、
+    /// git 自身の is_git_directory() と同じ構造マーカー（`HEAD` ファイル +
+    /// `objects/` + `refs/`）が揃っていれば、`open_bare()` の成否に関わらず
+    /// bare リポジトリとみなして保護する（fail-closed）。
     fn is_bare_repository_root(path: &Path) -> bool {
         let Ok(metadata) = std::fs::symlink_metadata(path) else {
             return false;
@@ -262,7 +269,26 @@ impl GitChecker {
             return false;
         }
 
+        // 構造マーカーが揃っていれば config 破損でも bare リポジトリとして保護する。
+        if Self::has_bare_repository_markers(path) {
+            return true;
+        }
+
         Repository::open_bare(path).is_ok()
+    }
+
+    /// bare リポジトリの構造マーカー（`HEAD`・`objects/`・`refs/`）が
+    /// 揃っているか判定する。git の is_git_directory() と同じ判定基準で、
+    /// `config` 破損などで `open_bare()` が失敗しても bare リポジトリを検出できる。
+    ///
+    /// `HEAD` は通常テキストファイルだが、古い `core.preferSymlinkRefs` 環境では
+    /// symlink のこともある。リンク先 ref が未作成（unborn branch）だと `is_file()`
+    /// が `false` になり検出漏れするため、`symlink_metadata()` でリンクを辿らず
+    /// エントリ自体の存在のみを確認する（fail-closed）。
+    fn has_bare_repository_markers(path: &Path) -> bool {
+        std::fs::symlink_metadata(path.join("HEAD")).is_ok()
+            && path.join("objects").is_dir()
+            && path.join("refs").is_dir()
     }
 
     /// 指定ディレクトリ配下に Git 管理メタデータが存在するかを再帰的に確認する。
@@ -937,6 +963,71 @@ mod tests {
             &bare_repo_path.join("HEAD"),
             false
         ));
+    }
+
+    #[test]
+    fn test_path_targets_bare_repo_with_corrupted_config() {
+        // `config` が壊れて `Repository::open_bare()` が失敗する bare リポジトリでも、
+        // 構造マーカー（HEAD/objects/refs）で検出して Git 管理メタデータとして保護する。
+        // open_bare() の成否だけに依存すると fail-open で HEAD 等が削除可能になる回帰を防ぐ。
+        let temp_dir = TempDir::new().unwrap();
+        let bare_repo_path = temp_dir.path().join("broken.git");
+
+        Command::new("git")
+            .args(["init", "--bare", bare_repo_path.to_str().unwrap()])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+
+        // 未終端のセクションヘッダで config を壊し、open_bare() を失敗させる
+        fs::write(bare_repo_path.join("config"), "[core\n").unwrap();
+
+        // ルート・配下の管理ファイル・親ディレクトリ再帰削除のいずれも保護される
+        assert!(
+            GitChecker::path_targets_or_contains_git_metadata(&bare_repo_path, true),
+            "config 破損 bare リポジトリのルートは保護されるべき"
+        );
+        assert!(
+            GitChecker::path_targets_or_contains_git_metadata(&bare_repo_path.join("HEAD"), false),
+            "config 破損 bare リポジトリの HEAD は保護されるべき"
+        );
+        assert!(
+            GitChecker::path_targets_or_contains_git_metadata(temp_dir.path(), true),
+            "config 破損 bare リポジトリを配下に含む再帰削除は保護されるべき"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_targets_bare_repo_with_symlink_head_and_corrupted_config() {
+        // 古い core.preferSymlinkRefs 相当で HEAD が未作成 ref を指す symlink、
+        // かつ config 破損で open_bare() も失敗するケースでも、HEAD エントリの
+        // 存在を symlink_metadata で確認して bare リポジトリとして保護する。
+        // is_file() のままだと symlink 先未作成で検出漏れする回帰を防ぐ。
+        let temp_dir = TempDir::new().unwrap();
+        let bare_repo_path = temp_dir.path().join("symhead.git");
+
+        Command::new("git")
+            .args(["init", "--bare", bare_repo_path.to_str().unwrap()])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+
+        // HEAD を未作成 ref を指す symlink に置き換える
+        let head = bare_repo_path.join("HEAD");
+        fs::remove_file(&head).unwrap();
+        std::os::unix::fs::symlink("refs/heads/unborn", &head).unwrap();
+        // config も壊して open_bare() を失敗させる
+        fs::write(bare_repo_path.join("config"), "[core\n").unwrap();
+
+        assert!(
+            GitChecker::path_targets_or_contains_git_metadata(&bare_repo_path, true),
+            "symlink HEAD + config 破損の bare リポジトリも保護されるべき"
+        );
+        assert!(
+            GitChecker::path_targets_or_contains_git_metadata(&head, false),
+            "symlink HEAD 配下の管理ファイルも保護されるべき"
+        );
     }
 
     #[test]

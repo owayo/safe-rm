@@ -219,23 +219,10 @@ fn process_path(
             git_context.checker(),
         )?;
 
-        // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
-        let metadata = match std::fs::symlink_metadata(&normalized_path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if args.force {
-                    return Ok(false);
-                } else {
-                    return Err(SafeRmError::NotFound(normalized_path));
-                }
-            }
-            Err(e) => return Err(SafeRmError::IoError(e)),
+        let Some(metadata) = fetch_target_metadata(&normalized_path, args.force, args.recursive)?
+        else {
+            return Ok(false);
         };
-
-        // ディレクトリに -r フラグがない場合はエラー
-        if metadata.is_dir() && !args.recursive {
-            return Err(SafeRmError::IsDirectory(normalized_path));
-        }
 
         // 削除実行（またはドライラン）— 包含検証と Git チェックをスキップ
         if args.dry_run {
@@ -263,23 +250,10 @@ fn process_path(
             git_context.checker(),
         )?;
 
-        // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
-        let metadata = match std::fs::symlink_metadata(&normalized_path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if args.force {
-                    return Ok(false);
-                } else {
-                    return Err(SafeRmError::NotFound(normalized_path));
-                }
-            }
-            Err(e) => return Err(SafeRmError::IoError(e)),
+        let Some(metadata) = fetch_target_metadata(&normalized_path, args.force, args.recursive)?
+        else {
+            return Ok(false);
         };
-
-        // ディレクトリに -r フラグがない場合はエラー
-        if metadata.is_dir() && !args.recursive {
-            return Err(SafeRmError::IsDirectory(normalized_path));
-        }
 
         // 事前取得キャッシュを使用して Git ステータスをチェック（バッチ最適化）
         // allow_project_deletion 有効時はスキップ（包含検証は上記で完了）
@@ -352,6 +326,44 @@ fn ensure_git_metadata_not_targeted(
     }
 
     Ok(())
+}
+
+/// 削除対象のメタデータを取得し、削除前の共通検証を行う。
+///
+/// allowed_paths 分岐と標準チェック分岐で完全に同一だった処理を共通化したもの。
+/// 呼び出し側の安全チェック順序（包含検証・Git メタデータ保護）は変えず、
+/// メタデータ取得とディレクトリ判定の重複だけを排除する。
+///
+/// # 戻り値
+/// * `Ok(Some(metadata))` - 削除対象が存在し、削除を続行してよい
+/// * `Ok(None)` - 対象が存在せず `-f` 指定のためスキップ（呼び出し側は `Ok(false)` を返す）
+/// * `Err(SafeRmError::NotFound)` - 対象が存在せず `-f` 未指定
+/// * `Err(SafeRmError::IsDirectory)` - ディレクトリだが `-r` 未指定
+/// * `Err(SafeRmError::IoError)` - メタデータ取得時の I/O エラー
+fn fetch_target_metadata(
+    path: &Path,
+    force: bool,
+    recursive: bool,
+) -> Result<Option<std::fs::Metadata>, SafeRmError> {
+    // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return if force {
+                Ok(None)
+            } else {
+                Err(SafeRmError::NotFound(path.to_path_buf()))
+            };
+        }
+        Err(e) => return Err(SafeRmError::IoError(e)),
+    };
+
+    // ディレクトリに -r フラグがない場合はエラー
+    if metadata.is_dir() && !recursive {
+        return Err(SafeRmError::IsDirectory(path.to_path_buf()));
+    }
+
+    Ok(Some(metadata))
 }
 
 /// メタデータを使用してファイルまたはディレクトリを削除（追加 syscall を回避）
