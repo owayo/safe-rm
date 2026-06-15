@@ -624,4 +624,98 @@ mod tests {
             result
         );
     }
+
+    #[test]
+    fn test_fetch_target_metadata_returns_metadata_for_existing_file() {
+        // 既存の通常ファイルはメタデータを返す
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file = tmp_dir.path().join("note.txt");
+        std::fs::write(&file, "content").unwrap();
+
+        let result = super::fetch_target_metadata(&file, false, false);
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "既存ファイルはメタデータを返すべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fetch_target_metadata_missing_without_force_errors() {
+        // 存在しないパスは force なしで NotFound エラー
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let missing = tmp_dir.path().join("missing.txt");
+
+        let result = super::fetch_target_metadata(&missing, false, false);
+        assert!(
+            matches!(result, Err(super::SafeRmError::NotFound(_))),
+            "存在しないパスは force なしで NotFound を返すべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fetch_target_metadata_missing_with_force_is_none() {
+        // 存在しないパスは force ありで Ok(None)（スキップ対象）
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let missing = tmp_dir.path().join("missing.txt");
+
+        let result = super::fetch_target_metadata(&missing, true, false);
+        assert!(
+            matches!(result, Ok(None)),
+            "force 指定時は存在しないパスを Ok(None) でスキップすべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fetch_target_metadata_directory_without_recursive_errors() {
+        // ディレクトリは recursive なしで IsDirectory エラー
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().join("subdir");
+        std::fs::create_dir(&dir).unwrap();
+
+        let result = super::fetch_target_metadata(&dir, false, false);
+        assert!(
+            matches!(result, Err(super::SafeRmError::IsDirectory(_))),
+            "ディレクトリは -r なしで IsDirectory を返すべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fetch_target_metadata_directory_with_recursive_returns_metadata() {
+        // ディレクトリは recursive ありでメタデータを返す
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().join("subdir");
+        std::fs::create_dir(&dir).unwrap();
+
+        let metadata = super::fetch_target_metadata(&dir, false, true)
+            .expect("ディレクトリは -r ありで Ok を返すべき")
+            .expect("メタデータが存在するべき");
+        assert!(
+            metadata.is_dir(),
+            "返されたメタデータはディレクトリを示すべき"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fetch_target_metadata_symlink_to_dir_does_not_require_recursive() {
+        // ディレクトリへの symlink は symlink_metadata 上はディレクトリでないため、
+        // recursive なしでもメタデータを返す（リンクエントリ自体が削除対象）
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let target_dir = tmp_dir.path().join("target_dir");
+        std::fs::create_dir(&target_dir).unwrap();
+        let link = tmp_dir.path().join("link_to_dir");
+        std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+
+        let metadata = super::fetch_target_metadata(&link, false, false)
+            .expect("symlink は -r なしで Ok を返すべき")
+            .expect("メタデータが存在するべき");
+        assert!(
+            metadata.file_type().is_symlink(),
+            "返されたメタデータは symlink を示すべき"
+        );
+    }
 }

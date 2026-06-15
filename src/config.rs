@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 /// allow_project_deletion = true
 ///
 /// [[allowed_paths]]
-/// path = "/Users/owa/.claude/skills"
+/// path = "~/.claude/skills"
 /// recursive = true
 ///
 /// [[allowed_paths]]

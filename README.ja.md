@@ -167,10 +167,10 @@ recursive = true
 
 # 現在のプロジェクト外でも動作:
 safe-rm ~/.claude/skills/my-skill/rules.md
-# removed: /Users/owa/.claude/skills/my-skill/rules.md (allowed by config)
+# removed: /Users/you/.claude/skills/my-skill/rules.md (allowed by config)
 
 safe-rm -r ~/.claude/skills/old-skill/
-# removed: /Users/owa/.claude/skills/old-skill/ (allowed by config)
+# removed: /Users/you/.claude/skills/old-skill/ (allowed by config)
 ```
 
 ## アーキテクチャ
