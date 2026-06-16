@@ -4,6 +4,7 @@
 
 use crate::config::Config;
 use std::fs;
+use std::path::PathBuf;
 
 /// ~/.claude/skills と /tmp を有効にしたデフォルト設定テンプレート
 const CONFIG_TEMPLATE: &str = r#"# safe-rm の設定
@@ -31,8 +32,12 @@ recursive = true
 
 /// init サブコマンドを実行
 pub fn run_init() -> Result<(), String> {
-    let config_path =
-        Config::config_path().ok_or_else(|| "Cannot determine config directory".to_string())?;
+    run_init_at(Config::config_path())
+}
+
+/// 指定された設定パスに初期設定を書き込む。
+fn run_init_at(config_path: Option<PathBuf>) -> Result<(), String> {
+    let config_path = config_path.ok_or_else(|| "Cannot determine config directory".to_string())?;
 
     let config_dir = config_path
         .parent()
@@ -106,10 +111,7 @@ recursive = false
         let tmp_dir = tempfile::tempdir().unwrap();
         let config_path = tmp_dir.path().join("safe-rm").join("config.toml");
 
-        // 作成ロジックを簡易的に検証
-        let config_dir = config_path.parent().unwrap();
-        fs::create_dir_all(config_dir).unwrap();
-        fs::write(&config_path, CONFIG_TEMPLATE).unwrap();
+        run_init_at(Some(config_path.clone())).unwrap();
 
         assert!(config_path.exists());
         let content = fs::read_to_string(&config_path).unwrap();
@@ -135,13 +137,19 @@ recursive = false
         let existing_content = "# 既存設定\n";
         fs::write(&config_path, existing_content).unwrap();
 
-        // run_init 相当のロジックを検証（既存ファイルの内容が保持されること）
-        assert!(config_path.exists());
+        run_init_at(Some(config_path.clone())).unwrap();
+
         let content = fs::read_to_string(&config_path).unwrap();
         assert_eq!(
             content, existing_content,
             "既存ファイルの内容が変更されてはならない"
         );
+    }
+
+    #[test]
+    fn test_run_init_errors_without_config_path() {
+        let error = run_init_at(None).unwrap_err();
+        assert_eq!(error, "Cannot determine config directory");
     }
 
     #[test]
