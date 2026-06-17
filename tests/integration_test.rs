@@ -1641,6 +1641,52 @@ recursive = false
             "直接の子のファイルは削除されているべき"
         );
     }
+
+    #[test]
+    fn test_allowed_paths_non_recursive_subdir_falls_through_to_strict_git_check() {
+        // strict mode + 非再帰 allowed エントリ配下のディレクトリ `-r` 削除は
+        // allowed バイパスされず、標準分岐の Git status 検査でブロックされる回帰テスト。
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        // プロジェクト内に subdir を作成し、untracked ファイルを入れる（dirty）
+        let subdir = project_path.join("workdir");
+        fs::create_dir(&subdir).unwrap();
+        fs::write(subdir.join("untracked.txt"), "uncommitted").unwrap();
+
+        // プロジェクト内ディレクトリを recursive=false の allowed に登録 + strict mode
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+allow_project_deletion = false
+
+[[allowed_paths]]
+path = "{}"
+recursive = false
+"#,
+            project_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // -r で project_path 配下の subdir を削除しようとする
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["-r", subdir.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        // strict mode の Git status 検査で untracked がブロックされる（exit 2）
+        // allowed バイパスされていれば exit 0 になってしまうので、ここで回帰を検出する
+        assert_eq!(
+            exit_code, 2,
+            "非再帰 allowed の subdir -r は strict Git 検査に落ちて untracked でブロックされるべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            subdir.exists() && subdir.join("untracked.txt").exists(),
+            "削除はブロックされ subdir と untracked ファイルは残るべき"
+        );
+    }
 }
 
 // =============================================================================

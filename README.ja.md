@@ -151,8 +151,8 @@ recursive = true
 - **`allow_project_deletion = false`**: クリーン（コミット済み）または無視された作業ツリーファイルのみ削除可能。ignored な親ディレクトリ配下にある場合でも未コミットの変更は保護され、Git 管理パスも引き続きブロック。`allowed_paths` にマッチするパスは、現在のリポジトリの index を読めない場合や cwd の Git 管理情報を開けない場合でも Git ステータスチェックをバイパス。
 - `allowed_paths` にマッチするパスは、プロジェクト境界チェックと Git ステータスチェックをバイパスするが、任意リポジトリの Git 管理メタデータ保護はバイパスできない。現在リポジトリの Git 管理メタデータは Git 検出に成功した場合に追加で確認し、cwd の Git 検出失敗だけでは許可パス削除を止めない。中間 symlink が `.git` や bare リポジトリ管理領域へ解決される場合は引き続きブロックし、symlink 自身の削除はリンクだけを消すため許可する。未作成パスでも既存親ディレクトリまで canonicalize して別名パス差異を吸収
 - `recursive` フラグでサブディレクトリの扱いを制御:
-  - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可
-  - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可
+  - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可。`safe-rm -r /path/to/dir/sub` は allowed バイパス経由で配下を再帰削除する
+  - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可。直下のサブディレクトリも `-r` で削除できる場合があるが、その場合は allowed バイパスではなく**標準分岐（プロジェクト境界検証 + 厳格モードでは Git ステータス検査）に落ちる**。非再帰エントリ配下のディレクトリへの `-r` は意図しない子孫まで削除しうるため、allowed バイパスとしては明示的に拒否し、必ず標準チェックを経由させる
 - 設定ファイルが**存在しない**場合は permissive デフォルト（`allow_project_deletion = true`、許可パスなし）にフォールバック。設定ファイルが**存在するが読み込み/パースに失敗**した場合は、利用者が意図した strict 設定が構文エラーで無効化されないよう、fail-closed で strict モード（`allow_project_deletion = false`、許可パスなし）にフォールバック
 - 設定で許可された削除には `(allowed by config)` の注釈が出力に表示
 
