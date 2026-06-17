@@ -1548,6 +1548,99 @@ recursive = true
         );
         assert!(!subdir.exists(), "Directory should be deleted");
     }
+
+    #[test]
+    fn test_allowed_paths_non_recursive_blocks_recursive_subdir_deletion() {
+        // `recursive = false` の allowed エントリ配下のディレクトリに対する `-r` は、
+        // 直接の子の範囲を超える削除になるためバイパスを許可しない。
+        // 標準分岐に落とし、cwd がプロジェクト境界として動作することで
+        // 包含検証や Git ステータスチェックを経由させる。
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        // プロジェクト外の許可ディレクトリ
+        let allowed_dir = TempDir::new().unwrap();
+        let allowed_path = allowed_dir.path().canonicalize().unwrap();
+        let subdir = allowed_path.join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        let nested = subdir.join("nested.txt");
+        fs::write(&nested, "secret").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+[[allowed_paths]]
+path = "{}"
+recursive = false
+"#,
+            allowed_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        // cwd はプロジェクト内、対象はプロジェクト外。
+        // allowed エントリは非再帰なので `-r` ではバイパスされず、
+        // 標準分岐の包含検証でプロジェクト外として拒否される。
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["-r", subdir.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_ne!(
+            exit_code, 0,
+            "非再帰エントリ配下のディレクトリへの -r は allowed バイパスされるべきではない。stderr: {}",
+            stderr
+        );
+        assert!(
+            subdir.exists() && nested.exists(),
+            "削除はブロックされ subdir/nested ファイルは残るべき"
+        );
+    }
+
+    #[test]
+    fn test_allowed_paths_non_recursive_allows_direct_child_file() {
+        // `recursive = false` の allowed エントリでは、直接の子の通常ファイル削除は
+        // 引き続き許可される（バイパス）。
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+
+        let allowed_dir = TempDir::new().unwrap();
+        let allowed_path = allowed_dir.path().canonicalize().unwrap();
+        let direct_file = allowed_path.join("direct.txt");
+        fs::write(&direct_file, "content").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            r#"
+[[allowed_paths]]
+path = "{}"
+recursive = false
+"#,
+            allowed_path.display()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &[direct_file.to_str().unwrap()],
+            &project_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 0,
+            "直接の子の通常ファイルは非再帰エントリでも削除可能であるべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            stdout.contains("allowed by config"),
+            "allowed by config の注釈が必要: {}",
+            stdout
+        );
+        assert!(
+            !direct_file.exists(),
+            "直接の子のファイルは削除されているべき"
+        );
+    }
 }
 
 // =============================================================================

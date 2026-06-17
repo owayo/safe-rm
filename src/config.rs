@@ -233,6 +233,22 @@ impl Config {
     /// 各エントリの `recursive` フラグを考慮。
     /// パフォーマンスのため事前解決済みパスを使用。
     pub fn is_path_allowed(&self, target: &Path) -> bool {
+        self.is_path_allowed_for_removal(target, false, false)
+    }
+
+    /// 削除対象として許可されるかをチェックする。
+    ///
+    /// `is_path_allowed` と同じパス一致判定に加えて、`target_is_dir` かつ
+    /// `recursive_delete` 指定時は、非再帰の allowed エントリにマッチするだけでは
+    /// 許可しない。`recursive = false` のエントリは「直接の子のみ削除可能」という
+    /// 設計のため、その配下のディレクトリを `-r` で再帰削除すると意図しない
+    /// 子孫まで削除できてしまう。これを fail-closed でブロックする。
+    pub fn is_path_allowed_for_removal(
+        &self,
+        target: &Path,
+        target_is_dir: bool,
+        recursive_delete: bool,
+    ) -> bool {
         if self.allowed_paths_resolved.is_empty() {
             return false;
         }
@@ -254,14 +270,23 @@ impl Config {
         let entry_path = Self::canonicalize_parent_keep_filename(&target_normalized);
         let resolved_path = Self::try_canonicalize(&target_normalized);
 
-        let entry_allowed = self
-            .allowed_paths_resolved
-            .iter()
-            .any(|entry| Self::path_matches_allowed_entry(&entry_path, entry));
-        let resolved_allowed = self
-            .allowed_paths_resolved
-            .iter()
-            .any(|entry| Self::path_matches_allowed_entry(&resolved_path, entry));
+        // ディレクトリの再帰削除では `recursive = true` のエントリのみ対象とする。
+        // これにより `recursive = false` のエントリ配下の subdir に対する `-r` で
+        // 直接の子の範囲を超えた削除が起きるバイパスを塞ぐ。
+        let requires_recursive_entry = target_is_dir && recursive_delete;
+
+        let entry_allowed = self.allowed_paths_resolved.iter().any(|entry| {
+            if requires_recursive_entry && !entry.recursive {
+                return false;
+            }
+            Self::path_matches_allowed_entry(&entry_path, entry)
+        });
+        let resolved_allowed = self.allowed_paths_resolved.iter().any(|entry| {
+            if requires_recursive_entry && !entry.recursive {
+                return false;
+            }
+            Self::path_matches_allowed_entry(&resolved_path, entry)
+        });
 
         entry_allowed && resolved_allowed
     }
@@ -1155,5 +1180,130 @@ recursive = true
 
         // どのエントリにもマッチしないパス
         assert!(!config.is_path_allowed(Path::new("/completely/unrelated/path")));
+    }
+
+    #[test]
+    fn test_is_path_allowed_for_removal_blocks_recursive_delete_on_subdir() {
+        // recursive = false エントリ配下の直接の子ディレクトリは
+        // 通常ファイル削除としては許可されるが、`-r` 付きディレクトリ削除では
+        // 直接の子の範囲を超えてしまうため拒否される
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+        let subdir = allowed_dir.join("subdir");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: false,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        // 通常ファイル扱い（target_is_dir = false）なら recursive_delete とは無関係
+        assert!(
+            config.is_path_allowed_for_removal(&subdir, false, false),
+            "通常ファイル扱いの判定では直接の子は許可されるべき"
+        );
+
+        // ディレクトリだが -r なし: 削除自体は失敗するが allowed 判定は通る
+        assert!(
+            config.is_path_allowed_for_removal(&subdir, true, false),
+            "ディレクトリでも -r なしなら直接の子は判定上許可されるべき"
+        );
+
+        // ディレクトリかつ -r 付き: 直接の子の範囲を超えるため拒否
+        assert!(
+            !config.is_path_allowed_for_removal(&subdir, true, true),
+            "非再帰エントリ配下のディレクトリへの -r は拒否されるべき"
+        );
+    }
+
+    #[test]
+    fn test_is_path_allowed_for_removal_allows_recursive_delete_on_recursive_entry() {
+        // recursive = true エントリ配下のサブディレクトリは `-r` 付き削除も許可される
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+        let subdir = allowed_dir.join("subdir");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: true,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        assert!(
+            config.is_path_allowed_for_removal(&subdir, true, true),
+            "再帰エントリ配下のディレクトリへの -r は許可されるべき"
+        );
+    }
+
+    #[test]
+    fn test_is_path_allowed_for_removal_prefers_recursive_entry_when_overlap() {
+        // 同じパスに非再帰と再帰の両方のエントリがある場合、
+        // 再帰削除では再帰エントリでマッチすれば通る
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let parent = canonical_tmp.join("parent");
+        let recursive_inner = parent.join("recursive_inner");
+        fs::create_dir_all(&recursive_inner).unwrap();
+        let subdir = recursive_inner.join("sub");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![
+                AllowedPathEntry {
+                    path: parent.to_string_lossy().to_string(),
+                    recursive: false,
+                },
+                AllowedPathEntry {
+                    path: recursive_inner.to_string_lossy().to_string(),
+                    recursive: true,
+                },
+            ],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        // recursive_inner 配下の subdir は再帰エントリでマッチするので -r 許可
+        assert!(
+            config.is_path_allowed_for_removal(&subdir, true, true),
+            "再帰エントリと非再帰エントリの両方が候補にある場合、再帰エントリ経由で -r が許可されるべき"
+        );
+    }
+
+    #[test]
+    fn test_is_path_allowed_compat_with_for_removal() {
+        // 互換性確認: 既存の is_path_allowed は target_is_dir = false /
+        // recursive_delete = false の is_path_allowed_for_removal と等価
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+        let file = allowed_dir.join("file.txt");
+        fs::write(&file, b"x").unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: false,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        assert_eq!(
+            config.is_path_allowed(&file),
+            config.is_path_allowed_for_removal(&file, false, false)
+        );
     }
 }

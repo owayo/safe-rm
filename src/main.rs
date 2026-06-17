@@ -209,8 +209,22 @@ fn process_path(
     // 以降のメタデータ取得・削除・許可判定はすべて clean 済みパスで行う。
     let normalized_path = abs_path.clean();
 
+    // allowed_paths 判定のために削除対象のディレクトリ性質を事前確認する。
+    // 取得失敗（NotFound や I/O エラー）はここでは握りつぶし、後続の
+    // fetch_target_metadata 側で正規のエラーパスに委ねる。
+    // symlink-to-directory は symlink_metadata 上 is_dir = false となるため、
+    // ディレクトリの再帰削除制約は実体ディレクトリのみに適用される
+    // （リンクエントリ自体は単一エントリの削除として扱われる）。
+    let target_is_dir = std::fs::symlink_metadata(&normalized_path)
+        .ok()
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+
     // allowed_paths 内のパスか確認（包含検証と Git チェックをバイパス）
-    if config.is_path_allowed(&normalized_path) {
+    // `recursive = false` エントリ配下のディレクトリへの `-r` は、直接の子の範囲を
+    // 超えた削除になるため非再帰エントリのみマッチした場合はバイパスを許可しない
+    // （`is_path_allowed_for_removal` が fail-closed で拒否する）。
+    if config.is_path_allowed_for_removal(&normalized_path, target_is_dir, args.recursive) {
         git_context.try_open_optional(cwd);
         ensure_git_metadata_not_targeted(
             &normalized_path,
