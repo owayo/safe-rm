@@ -1306,4 +1306,91 @@ recursive = true
             config.is_path_allowed_for_removal(&file, false, false)
         );
     }
+
+    #[test]
+    fn test_is_path_allowed_for_removal_file_with_recursive_flag_in_non_recursive_entry() {
+        // 通常ファイル（target_is_dir=false）に `-r` を指定するケース。
+        // 実害は無いが allowed 判定が拒否側に倒れると、非再帰 allowed エントリ配下の
+        // ファイルへの `safe-rm -r file.txt` がバイパスから外れて、後段の標準分岐で
+        // 誤ってブロックされる可能性がある。`requires_recursive_entry` は
+        // `target_is_dir && recursive_delete` で立つため、ファイル指定では従来通り
+        // 非再帰エントリでもマッチして許可される必要がある。
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+        let file = allowed_dir.join("file.txt");
+        fs::write(&file, b"x").unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: false,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        assert!(
+            config.is_path_allowed_for_removal(&file, false, true),
+            "ファイルへの -r は target_is_dir = false のため非再帰エントリでも許可されるべき"
+        );
+    }
+
+    #[test]
+    fn test_path_matches_allowed_entry_recursive_entry_matches_root_itself() {
+        // 再帰エントリは「エントリ自身（=ルート）」もマッチさせる仕様。
+        // ディレクトリ自体を `-r` で削除するシナリオで重要。
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        let entry = AllowedPathResolved {
+            canonical_path: allowed_dir.clone(),
+            recursive: true,
+        };
+        assert!(
+            Config::path_matches_allowed_entry(&allowed_dir, &entry),
+            "再帰エントリはエントリ自身のパスにマッチするべき"
+        );
+    }
+
+    #[test]
+    fn test_path_matches_allowed_entry_non_recursive_does_not_match_root_itself() {
+        // 非再帰エントリは「直接の子のみ」許可するため、エントリ自身は除外される。
+        // ルート自体を削除しようとすると、非再帰エントリ単独では許可されない。
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        let entry = AllowedPathResolved {
+            canonical_path: allowed_dir.clone(),
+            recursive: false,
+        };
+        assert!(
+            !Config::path_matches_allowed_entry(&allowed_dir, &entry),
+            "非再帰エントリはエントリ自身にマッチしない（直接の子のみ許可）"
+        );
+    }
+
+    #[test]
+    fn test_path_matches_allowed_entry_non_recursive_does_not_match_grandchild() {
+        // 非再帰エントリは直接の子のみ許可し、孫以下のパスはマッチさせない。
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+        let grandchild = allowed_dir.join("subdir").join("inner.txt");
+
+        let entry = AllowedPathResolved {
+            canonical_path: allowed_dir.clone(),
+            recursive: false,
+        };
+        assert!(
+            !Config::path_matches_allowed_entry(&grandchild, &entry),
+            "非再帰エントリは孫以下のパスにマッチしないべき"
+        );
+    }
 }
