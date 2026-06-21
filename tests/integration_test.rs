@@ -4887,3 +4887,277 @@ recursive = true
         );
     }
 }
+
+// =============================================================================
+// cwd と削除対象が別 Git リポジトリに属する場合の strict mode 検証
+//
+// cwd 非 Git 配下にサブディレクトリとして Git リポジトリがある場合や、
+// cwd の Git と削除対象の Git が別リポジトリの場合、strict mode の Git ステータス
+// チェックは「対象側の repo」で行わないと未コミット変更を素通りで削除してしまう
+// 不具合（cwd 由来の checker が None または別 repo で空ヒットになる）を防ぐ回帰テスト。
+// =============================================================================
+
+mod cross_repo_strict_tests {
+    use super::*;
+
+    /// allow_project_deletion = false の設定ファイルを作成
+    fn create_strict_config() -> tempfile::NamedTempFile {
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+        config
+    }
+
+    /// cwd が非 Git、その配下に独立した Git リポジトリがある状態を作る。
+    /// 戻り値: (TempDir guard, nested_repo の canonical パス)
+    /// TempDir は drop されると一時ディレクトリを削除するため、caller がスコープ内で保持する必要がある。
+    fn setup_non_git_parent_with_nested_repo() -> (TempDir, std::path::PathBuf) {
+        let parent_dir = TempDir::new().unwrap();
+        let cwd_root = parent_dir.path().canonicalize().unwrap();
+
+        let nested_repo = cwd_root.join("repo");
+        fs::create_dir(&nested_repo).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&nested_repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&nested_repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&nested_repo)
+            .output()
+            .unwrap();
+
+        (parent_dir, nested_repo)
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_modified_file_when_cwd_is_non_git_parent() {
+        // cwd は非 Git、削除対象は配下の Git リポジトリ内の modified ファイル
+        // 修正前は cwd 由来の GitChecker が None で strict チェックがスキップされ、
+        // 未コミット変更を素通りで削除していた。
+        let (_parent, nested_repo) = setup_non_git_parent_with_nested_repo();
+        let cwd_root = nested_repo.parent().unwrap().to_path_buf();
+        let config = create_strict_config();
+
+        commit_file(&nested_repo, "tracked.txt", "initial");
+        // tracked ファイルを未コミット変更状態にする
+        fs::write(nested_repo.join("tracked.txt"), "dirty content").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["repo/tracked.txt"], &cwd_root, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "cwd 非 Git でも対象側の Git status で modified を検出してブロックするべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            nested_repo.join("tracked.txt").exists(),
+            "ブロックされた modified ファイルは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_untracked_file_when_cwd_is_non_git_parent() {
+        // cwd 非 Git、対象側 repo に untracked ファイルがある場合もブロックされる
+        let (_parent, nested_repo) = setup_non_git_parent_with_nested_repo();
+        let cwd_root = nested_repo.parent().unwrap().to_path_buf();
+        let config = create_strict_config();
+
+        fs::write(nested_repo.join("untracked.txt"), "untracked").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["repo/untracked.txt"], &cwd_root, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "cwd 非 Git でも対象側の Git status で untracked を検出してブロックするべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            nested_repo.join("untracked.txt").exists(),
+            "ブロックされた untracked ファイルは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_staged_file_when_cwd_is_non_git_parent() {
+        // cwd 非 Git、対象側 repo に staged ファイルがある場合もブロックされる
+        let (_parent, nested_repo) = setup_non_git_parent_with_nested_repo();
+        let cwd_root = nested_repo.parent().unwrap().to_path_buf();
+        let config = create_strict_config();
+
+        fs::write(nested_repo.join("staged.txt"), "staged").unwrap();
+        Command::new("git")
+            .args(["add", "staged.txt"])
+            .current_dir(&nested_repo)
+            .output()
+            .unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["repo/staged.txt"], &cwd_root, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "cwd 非 Git でも対象側の Git status で staged を検出してブロックするべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            nested_repo.join("staged.txt").exists(),
+            "ブロックされた staged ファイルは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_allows_clean_file_when_cwd_is_non_git_parent() {
+        // cwd 非 Git、対象側 repo のコミット済みクリーンファイルは削除可能
+        // strict mode の境界判定が「対象側 repo」に切り替わっても、Clean なファイルは
+        // 引き続き削除許可されるべき（過剰防御の検出）。
+        let (_parent, nested_repo) = setup_non_git_parent_with_nested_repo();
+        let cwd_root = nested_repo.parent().unwrap().to_path_buf();
+        let config = create_strict_config();
+
+        commit_file(&nested_repo, "clean.txt", "committed");
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["repo/clean.txt"], &cwd_root, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "Clean ファイルは strict mode でも削除可能であるべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            !nested_repo.join("clean.txt").exists(),
+            "Clean ファイルは削除されているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_modified_file_when_cwd_repo_differs_from_target_repo() {
+        // cwd が Git リポジトリ A、削除対象が別の Git リポジトリ B 内にある場合
+        // B 側の status で strict チェックを行う必要がある（A の status で見ると
+        // B のファイルは NotInRepo になり、素通りで削除される）。
+        let parent_dir = TempDir::new().unwrap();
+        let parent_root = parent_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // repo A: cwd
+        let repo_a = parent_root.join("repo_a");
+        fs::create_dir(&repo_a).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_a)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&repo_a)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&repo_a)
+            .output()
+            .unwrap();
+        commit_file(&repo_a, "a.txt", "a content");
+
+        // repo B: 削除対象側（並列に置く）
+        let repo_b = parent_root.join("repo_b");
+        fs::create_dir(&repo_b).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_b)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&repo_b)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&repo_b)
+            .output()
+            .unwrap();
+        commit_file(&repo_b, "tracked.txt", "initial");
+        fs::write(repo_b.join("tracked.txt"), "dirty").unwrap();
+
+        // cwd は repo_a、削除対象は repo_b 内の modified ファイル（絶対パス指定）
+        let target_abs = repo_b.join("tracked.txt");
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &[target_abs.to_str().unwrap()],
+            &repo_a,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 2,
+            "cwd と別 repo の modified ファイルも strict mode でブロックされるべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            target_abs.exists(),
+            "ブロックされたファイルは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_across_multiple_repos_in_batch() {
+        // バッチ内で複数の repo にまたがる削除でも、それぞれの repo の status で
+        // 正しく strict チェックされることを検証（キャッシュ切り替えの回帰テスト）。
+        let (_parent, repo_a) = setup_non_git_parent_with_nested_repo();
+        let cwd_root = repo_a.parent().unwrap().to_path_buf();
+        let config = create_strict_config();
+
+        // repo_a に modified ファイル
+        commit_file(&repo_a, "a_tracked.txt", "a initial");
+        fs::write(repo_a.join("a_tracked.txt"), "a dirty").unwrap();
+
+        // repo_b（並列に置く）にクリーンファイル
+        let repo_b = cwd_root.join("repo_b");
+        fs::create_dir(&repo_b).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_b)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&repo_b)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&repo_b)
+            .output()
+            .unwrap();
+        commit_file(&repo_b, "b_clean.txt", "b clean");
+
+        // バッチ: repo_b/b_clean.txt（成功）→ repo/a_tracked.txt（ブロック）
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["repo_b/b_clean.txt", "repo/a_tracked.txt"],
+            &cwd_root,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 2,
+            "バッチ内に modified が含まれれば exit 2 を返すべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            !repo_b.join("b_clean.txt").exists(),
+            "Clean ファイルは削除されているべき"
+        );
+        assert!(
+            repo_a.join("a_tracked.txt").exists(),
+            "Modified ファイルは残っているべき"
+        );
+    }
+}

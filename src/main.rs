@@ -125,8 +125,11 @@ fn run(args: CliArgs) -> Result<(), SafeRmError> {
     // Git ステータスは、厳格モードかつ allowed_paths 外の削除で初めて取得する。
     // allowed_paths は Git チェックをバイパスするため、現在のリポジトリに
     // Git API エラーがあっても allowed_paths の削除を巻き込まない。
+    // キャッシュは「最後に使った repo workdir」をキーに持ち、同じ repo の連続
+    // 削除では再利用しつつ、cwd と異なる repo の対象でも正しく status を引ける
+    // ようにする（cwd 非 Git で対象側だけ Git の場合の strict バイパスを塞ぐ）。
     // キャッシュキーは非 UTF-8 パスにも対応するためバイト列で持つ。
-    let mut status_cache: Option<HashMap<Vec<u8>, FileStatus>> = None;
+    let mut status_cache: Option<(PathBuf, HashMap<Vec<u8>, FileStatus>)> = None;
 
     let mut success_count = 0;
     let mut error_count = 0;
@@ -190,7 +193,7 @@ fn process_path(
     path: &Path,
     cwd: &Path,
     git_context: &mut GitContext,
-    status_cache: &mut Option<HashMap<Vec<u8>, FileStatus>>,
+    status_cache: &mut Option<(PathBuf, HashMap<Vec<u8>, FileStatus>)>,
     args: &CliArgs,
     config: &Config,
 ) -> Result<bool, SafeRmError> {
@@ -272,34 +275,78 @@ fn process_path(
         // 事前取得キャッシュを使用して Git ステータスをチェック（バッチ最適化）
         // allow_project_deletion 有効時はスキップ（包含検証は上記で完了）
         if !config.allow_project_deletion {
-            if let Some(checker) = git_context.checker() {
-                // シンボリックリンクの場合、親ディレクトリのみ canonicalize し
-                // リンク名自体は保持。「リンク自体をチェック」するセマンティクスを
-                // 維持しつつ、リポジトリエイリアスパスを解決する。
-                let symlink_git_check_path: Option<std::path::PathBuf> =
-                    if metadata.file_type().is_symlink() {
-                        Some(
-                            normalized_path
-                                .file_name()
-                                .and_then(|name| {
-                                    normalized_path
-                                        .parent()
-                                        .and_then(|parent| parent.canonicalize().ok())
-                                        .map(|canonical_parent| canonical_parent.join(name))
-                                })
-                                .unwrap_or_else(|| normalized_path.clone()),
-                        )
+            // シンボリックリンクの場合、親ディレクトリのみ canonicalize し
+            // リンク名自体は保持。「リンク自体をチェック」するセマンティクスを
+            // 維持しつつ、リポジトリエイリアスパスを解決する。
+            let symlink_git_check_path: Option<std::path::PathBuf> =
+                if metadata.file_type().is_symlink() {
+                    Some(
+                        normalized_path
+                            .file_name()
+                            .and_then(|name| {
+                                normalized_path
+                                    .parent()
+                                    .and_then(|parent| parent.canonicalize().ok())
+                                    .map(|canonical_parent| canonical_parent.join(name))
+                            })
+                            .unwrap_or_else(|| normalized_path.clone()),
+                    )
+                } else {
+                    None
+                };
+            let git_check_path = symlink_git_check_path.as_deref().unwrap_or(&canonical_path);
+
+            // cwd の checker が対象を含まないとき、対象側で再 discover する。
+            // 例えば cwd が非 Git でも、配下のサブディレクトリが Git リポジトリ
+            // であれば、そちらの status で strict チェックを掛けないと
+            // 未コミット変更を素通りで削除してしまう。
+            let cwd_checker_covers_target = git_context
+                .checker()
+                .and_then(|c| c.workdir().map(|w| git_check_path.starts_with(&w)))
+                .unwrap_or(false);
+
+            // cwd の checker が対象を含まないときだけ、対象側で別途 discover する。
+            // ライフタイム制約のため、所有を持つ Option<GitChecker> を outer に置き、
+            // 参照として target_checker に渡す。
+            let target_checker_owned: Option<GitChecker> = if cwd_checker_covers_target {
+                None
+            } else {
+                // 対象がディレクトリならその場所から、ファイル/symlink なら親から discover。
+                // 親が取れない場合は対象自身を起点にする。
+                let discover_from: PathBuf =
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+                        git_check_path.to_path_buf()
                     } else {
-                        None
+                        git_check_path
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| git_check_path.to_path_buf())
                     };
-                let git_check_path = symlink_git_check_path.as_deref().unwrap_or(&canonical_path);
-                if status_cache.is_none() {
-                    *status_cache = Some(checker.get_all_statuses()?);
+                GitChecker::open(&discover_from)?
+            };
+            let target_checker: Option<&GitChecker> = if cwd_checker_covers_target {
+                git_context.checker()
+            } else {
+                target_checker_owned.as_ref()
+            };
+
+            if let Some(checker) = target_checker {
+                // bare リポジトリは workdir が None。bare の管理ファイル直接削除は
+                // Git 管理メタデータ保護で既にブロック済みなので、ここでは何もしない。
+                if let Some(workdir) = checker.workdir() {
+                    let cache_hit = status_cache
+                        .as_ref()
+                        .map(|(k, _)| k == &workdir)
+                        .unwrap_or(false);
+                    if !cache_hit {
+                        *status_cache = Some((workdir.clone(), checker.get_all_statuses()?));
+                    }
+                    let cache = &status_cache
+                        .as_ref()
+                        .expect("status_cache must be initialized before strict Git check")
+                        .1;
+                    checker.check_path_with_cache(git_check_path, cache)?;
                 }
-                let cache = status_cache
-                    .as_ref()
-                    .expect("status_cache must be initialized before strict Git check");
-                checker.check_path_with_cache(git_check_path, cache)?;
             }
         }
 
