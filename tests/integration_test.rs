@@ -5160,4 +5160,56 @@ mod cross_repo_strict_tests {
             "Modified ファイルは残っているべき"
         );
     }
+
+    #[test]
+    fn test_strict_mode_uses_nested_repo_status_when_outer_ignores_nested() {
+        // cwd が outer Git リポジトリ、配下に nested Git リポジトリがあり、
+        // outer 側では nested ディレクトリを .gitignore で除外しているケース。
+        // cwd checker（outer）の status だけで判定すると nested 配下のファイルは
+        // Ignored 扱いで削除許可されてしまう。修正後は対象側 (nested) で
+        // discover した checker の status で判定し、modified を正しく拾う。
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // outer に .gitignore を作成し、nested/ を除外
+        fs::write(outer_path.join(".gitignore"), "nested/\n").unwrap();
+        commit_file(&outer_path, ".gitignore", "nested/\n");
+
+        // nested Git リポジトリを outer 配下に作成
+        let nested = outer_path.join("nested");
+        fs::create_dir(&nested).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&nested)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&nested)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&nested)
+            .output()
+            .unwrap();
+        commit_file(&nested, "tracked.txt", "initial");
+        // nested 内で modified にする
+        fs::write(nested.join("tracked.txt"), "dirty content").unwrap();
+
+        // outer の cwd から nested/tracked.txt の削除を試みる
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["nested/tracked.txt"], &outer_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "outer の Ignored 判定ではなく nested 側 status で modified を検出してブロックするべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            nested.join("tracked.txt").exists(),
+            "modified ファイルは残っているべき"
+        );
+    }
 }

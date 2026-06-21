@@ -296,39 +296,52 @@ fn process_path(
                 };
             let git_check_path = symlink_git_check_path.as_deref().unwrap_or(&canonical_path);
 
-            // cwd の checker が対象を含まないとき、対象側で再 discover する。
-            // 例えば cwd が非 Git でも、配下のサブディレクトリが Git リポジトリ
-            // であれば、そちらの status で strict チェックを掛けないと
-            // 未コミット変更を素通りで削除してしまう。
-            let cwd_checker_covers_target = git_context
-                .checker()
-                .and_then(|c| c.workdir().map(|w| git_check_path.starts_with(&w)))
-                .unwrap_or(false);
+            // 対象を含む repo のうち最も深い workdir を strict チェックに使う。
+            // cwd の checker だけでは、cwd 側 repo の配下に nested repo がある場合に、
+            // 外側 repo の Ignored / NotInRepo 判定で内側 repo の modified/staged を
+            // 見落としてしまう。これを防ぐため、対象起点でも常に discover を試行する。
+            let discover_from: PathBuf =
+                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+                    git_check_path.to_path_buf()
+                } else {
+                    git_check_path
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| git_check_path.to_path_buf())
+                };
+            // ライフタイム制約のため、所有を持つ Option<GitChecker> を outer に置く。
+            let discovered_checker_owned: Option<GitChecker> = GitChecker::open(&discover_from)?;
 
-            // cwd の checker が対象を含まないときだけ、対象側で別途 discover する。
-            // ライフタイム制約のため、所有を持つ Option<GitChecker> を outer に置き、
-            // 参照として target_checker に渡す。
-            let target_checker_owned: Option<GitChecker> = if cwd_checker_covers_target {
-                None
-            } else {
-                // 対象がディレクトリならその場所から、ファイル/symlink なら親から discover。
-                // 親が取れない場合は対象自身を起点にする。
-                let discover_from: PathBuf =
-                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-                        git_check_path.to_path_buf()
-                    } else {
-                        git_check_path
-                            .parent()
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or_else(|| git_check_path.to_path_buf())
-                    };
-                GitChecker::open(&discover_from)?
-            };
-            let target_checker: Option<&GitChecker> = if cwd_checker_covers_target {
-                git_context.checker()
-            } else {
-                target_checker_owned.as_ref()
-            };
+            // 選択ロジック:
+            // - cwd checker と discovered が両方とも対象を含み、discovered の方が
+            //   深い workdir なら discovered（nested repo 優先）
+            // - 上記以外で cwd workdir が対象を含むなら cwd_checker
+            // - それ以外で discovered があるなら discovered
+            // - どちらも対象を含まない場合は None（strict チェック対象なし）
+            let target_checker: Option<&GitChecker> =
+                match (git_context.checker(), discovered_checker_owned.as_ref()) {
+                    (Some(cwd_checker), Some(discovered)) => {
+                        match (cwd_checker.workdir(), discovered.workdir()) {
+                            (Some(cwd_wd), Some(discovered_wd))
+                                if git_check_path.starts_with(&discovered_wd)
+                                    && discovered_wd.starts_with(&cwd_wd)
+                                    && discovered_wd != cwd_wd =>
+                            {
+                                Some(discovered)
+                            }
+                            (Some(cwd_wd), _) if git_check_path.starts_with(&cwd_wd) => {
+                                Some(cwd_checker)
+                            }
+                            _ => Some(discovered),
+                        }
+                    }
+                    (Some(cwd_checker), None) => cwd_checker
+                        .workdir()
+                        .filter(|wd| git_check_path.starts_with(wd))
+                        .map(|_| cwd_checker),
+                    (None, Some(discovered)) => Some(discovered),
+                    (None, None) => None,
+                };
 
             if let Some(checker) = target_checker {
                 // bare リポジトリは workdir が None。bare の管理ファイル直接削除は
