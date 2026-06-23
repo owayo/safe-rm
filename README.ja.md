@@ -112,6 +112,8 @@ safe-rm init
 # デフォルトでは ~/.claude/skills と /tmp を再帰的に許可
 ```
 
+`safe-rm init` は既存の設定ファイルパスを上書きしません。既存ファイルだけでなく、dangling symlink を含む既存 symlink も「既に存在する設定エントリ」として扱い、さらに新規作成専用の書き込みを使うため、競合時にもテンプレートが別パスへ書き込まれません。
+
 ### 設定ファイル形式
 
 ```toml
@@ -154,6 +156,7 @@ recursive = true
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可。`safe-rm -r /path/to/dir/sub` は allowed バイパス経由で配下を再帰削除する
   - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可。直下のサブディレクトリも `-r` で削除できる場合があるが、その場合は allowed バイパスではなく**標準分岐（プロジェクト境界検証 + 厳格モードでは Git ステータス検査）に落ちる**。非再帰エントリ配下のディレクトリへの `-r` は意図しない子孫まで削除しうるため、allowed バイパスとしては明示的に拒否し、必ず標準チェックを経由させる
 - 設定ファイルが**存在しない**場合は permissive デフォルト（`allow_project_deletion = true`、許可パスなし）にフォールバック。設定ファイルが**存在するが読み込み/パースに失敗**した場合は、利用者が意図した strict 設定が構文エラーで無効化されないよう、fail-closed で strict モード（`allow_project_deletion = false`、許可パスなし）にフォールバック
+- `safe-rm init` は設定ファイルパス自体も保護する。`~/.config/safe-rm/config.toml` が dangling symlink の場合も既存エントリとして扱ってリンク先を辿らないため、生成テンプレートが symlink のリンク先へ書き込まれない。
 - 設定で許可された削除には `(allowed by config)` の注釈が出力に表示
 
 ### 例

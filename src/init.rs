@@ -3,7 +3,8 @@
 //! ~/.config/safe-rm/config.toml にデフォルト設定ファイルを生成する。
 
 use crate::config::Config;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 
 /// ~/.claude/skills と /tmp を有効にしたデフォルト設定テンプレート
@@ -44,21 +45,46 @@ fn run_init_at(config_path: Option<PathBuf>) -> Result<(), String> {
         .ok_or_else(|| "Cannot determine config directory".to_string())?;
 
     // 必要に応じて設定ディレクトリを作成
-    if !config_dir.exists() {
-        fs::create_dir_all(config_dir)
-            .map_err(|e| format!("Cannot create directory {}: {}", config_dir.display(), e))?;
+    fs::create_dir_all(config_dir)
+        .map_err(|e| format!("Cannot create directory {}: {}", config_dir.display(), e))?;
+
+    // dangling symlink も既存エントリとして扱い、リンク先へ書き込まない。
+    match fs::symlink_metadata(&config_path) {
+        Ok(_) => {
+            print_existing_config_message(&config_path);
+            return Ok(());
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "Cannot inspect config file {}: {}",
+                config_path.display(),
+                e
+            ));
+        }
     }
 
-    // 設定ファイルが既に存在するか確認
-    if config_path.exists() {
-        eprintln!("Config file already exists: {}", config_path.display());
-        eprintln!("To regenerate, delete the file first and run `safe-rm init` again.");
-        return Ok(());
+    // race で既存ファイルを上書きしないよう create_new で新規作成する。
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&config_path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            print_existing_config_message(&config_path);
+            return Ok(());
+        }
+        Err(e) => return Err(format!("Cannot write config file: {}", e)),
+    };
+
+    if let Err(e) = file.write_all(CONFIG_TEMPLATE.as_bytes()) {
+        return Err(format!("Cannot write config file: {}", e));
     }
 
-    // テンプレートを書き出し
-    fs::write(&config_path, CONFIG_TEMPLATE)
-        .map_err(|e| format!("Cannot write config file: {}", e))?;
+    if let Err(e) = file.sync_all() {
+        return Err(format!("Cannot write config file: {}", e));
+    }
 
     println!("Created config file: {}", config_path.display());
     println!();
@@ -66,6 +92,12 @@ fn run_init_at(config_path: Option<PathBuf>) -> Result<(), String> {
     println!("Edit the file to add more allowed paths.");
 
     Ok(())
+}
+
+/// 設定ファイルが既に存在する場合のメッセージを出力する。
+fn print_existing_config_message(config_path: &std::path::Path) {
+    eprintln!("Config file already exists: {}", config_path.display());
+    eprintln!("To regenerate, delete the file first and run `safe-rm init` again.");
 }
 
 /// 表示用の設定パスを取得
@@ -143,6 +175,34 @@ recursive = false
         assert_eq!(
             content, existing_content,
             "既存ファイルの内容が変更されてはならない"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_init_skips_dangling_symlink() {
+        // dangling symlink は Path::exists() では false になるが、既存エントリとして
+        // 扱わないとリンク先へ新規設定を書き込んでしまう。
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let config_dir = tmp_dir.path().join("safe-rm");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        let dangling_target = tmp_dir.path().join("outside-target.toml");
+
+        std::os::unix::fs::symlink(&dangling_target, &config_path).unwrap();
+
+        run_init_at(Some(config_path.clone())).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "既存の symlink エントリは残るべき"
+        );
+        assert!(
+            !dangling_target.exists(),
+            "dangling symlink のリンク先を作成してはならない"
         );
     }
 

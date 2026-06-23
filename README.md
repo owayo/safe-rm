@@ -112,6 +112,8 @@ safe-rm init
 # Defaults allow ~/.claude/skills and /tmp recursively
 ```
 
+`safe-rm init` does not overwrite an existing config path entry. Existing files and existing symlinks, including dangling symlinks, are treated as already present, and the file is created with create-new semantics so a race cannot redirect the template into another path.
+
 ### Config File Format
 
 ```toml
@@ -154,6 +156,7 @@ recursive = true
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` is allowed, and `safe-rm -r /path/to/dir/sub` recursively deletes everything under it through the allowed bypass
   - `recursive = false`: Only direct children such as `/path/to/dir/file.txt` are allowed; a direct-child subdirectory may still be removed via `-r`, but only by falling through to the **standard safety branch** (project containment + strict Git status checks). The allowed bypass intentionally rejects `-r` on a direct-child directory under a non-recursive entry so that nested contents are never deleted without the standard checks running.
 - If the config file is **missing**, `safe-rm` falls back to permissive default (`allow_project_deletion = true`, no allowed paths). If the config file **exists but cannot be read or parsed**, `safe-rm` falls back to fail-closed strict mode (`allow_project_deletion = false`, no allowed paths) so that a user who intended strict mode is not silently downgraded by a syntax error
+- `safe-rm init` protects the config path itself: a dangling symlink at `~/.config/safe-rm/config.toml` is treated as an existing entry and is not followed, so the generated template is never written through the symlink target.
 - Output includes `(allowed by config)` annotation for config-permitted deletions
 
 ### Example
