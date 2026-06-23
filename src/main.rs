@@ -792,4 +792,72 @@ mod tests {
             "返されたメタデータは symlink を示すべき"
         );
     }
+
+    #[test]
+    fn test_ensure_git_metadata_not_targeted_blocks_via_current_repo_checker() {
+        // git_checker が Some で、削除対象が現在のリポジトリの `.git` を指している場合に
+        // touches_git_metadata_path 経由でブロックされることを検証する。
+        // None 引数のテストでは `path_has_dot_git_component` の経路のみがカバーされ、
+        // checker 経由の保護経路がカバーされない。
+        use safe_rm::git_checker::GitChecker;
+        use std::process::Command;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let repo_path = tmp_dir.path().canonicalize().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let checker = GitChecker::open(&repo_path)
+            .expect("Git API エラーは想定外")
+            .expect("Git リポジトリが存在すべき");
+
+        // リポジトリのルートを再帰削除しようとすると、配下の `.git` が含まれるためブロック
+        let result =
+            super::ensure_git_metadata_not_targeted(&repo_path, &repo_path, true, Some(&checker));
+
+        assert!(
+            matches!(result, Err(super::SafeRmError::ProtectedGitPath { .. })),
+            "現在の repo の `.git` を含む再帰削除は ProtectedGitPath で拒否されるべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_git_metadata_not_targeted_allows_clean_path_in_repo() {
+        // git_checker が Some でも、`.git` メタデータに触れない通常パスは許可される。
+        use safe_rm::git_checker::GitChecker;
+        use std::process::Command;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let repo_path = tmp_dir.path().canonicalize().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let checker = GitChecker::open(&repo_path)
+            .expect("Git API エラーは想定外")
+            .expect("Git リポジトリが存在すべき");
+
+        // 通常ファイルの単体削除は Git 管理メタデータ保護を通過する
+        let plain_file = repo_path.join("note.txt");
+        std::fs::write(&plain_file, "content").unwrap();
+
+        let result = super::ensure_git_metadata_not_targeted(
+            &plain_file,
+            &plain_file,
+            false,
+            Some(&checker),
+        );
+
+        assert!(
+            result.is_ok(),
+            "通常パスは現在の repo の checker 経由でも Git 管理メタデータ判定を通すべき: {:?}",
+            result
+        );
+    }
 }
