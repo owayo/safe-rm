@@ -1208,6 +1208,69 @@ mod env_config_tests {
         assert!(untracked_file.exists(), "Untracked file should remain");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_env_config_dangling_symlink_falls_back_to_strict_mode() {
+        // 設定パスが dangling symlink の場合、read_to_string はリンクを辿って NotFound を
+        // 返すがエントリ自体は実在する。真の不在（permissive default）と区別して strict
+        // モードへ倒れることを E2E で検証する。未追跡ファイルがブロックされれば strict 確定。
+        use std::os::unix::fs::symlink;
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let untracked_file = repo_path.join("untracked.txt");
+        fs::write(&untracked_file, "untracked content").unwrap();
+
+        // dangling symlink の設定パスを作成（リンク先は存在しない）
+        let link_dir = tempfile::tempdir().unwrap();
+        let config_link = link_dir.path().join("config.toml");
+        symlink(link_dir.path().join("missing.toml"), &config_link).unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["untracked.txt"], &repo_path, Some(config_link.as_path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "dangling symlink の設定パスは strict モードへ倒れ、未追跡ファイルをブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("warning") && stderr.contains("未コミットの変更"),
+            "Should warn about unreadable config and block untracked file: {}",
+            stderr
+        );
+        assert!(untracked_file.exists(), "Untracked file should remain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_env_config_intermediate_dangling_symlink_falls_back_to_strict_mode() {
+        // 中間コンポーネントが dangling symlink の設定パス（cfg_link/config.toml で
+        // cfg_link -> 不在ディレクトリ）でも strict モードへ倒れることを E2E で検証する。
+        // symlink_metadata(&path) では真の不在と区別できないケースの回帰防止。
+        use std::os::unix::fs::symlink;
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let untracked_file = repo_path.join("untracked.txt");
+        fs::write(&untracked_file, "untracked content").unwrap();
+
+        let link_dir = tempfile::tempdir().unwrap();
+        let cfg_link = link_dir.path().join("cfg_link");
+        symlink(link_dir.path().join("missing_dir"), &cfg_link).unwrap();
+        let config_path = cfg_link.join("config.toml");
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["untracked.txt"], &repo_path, Some(config_path.as_path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "中間 dangling symlink の設定パスは strict モードへ倒れるべき. stderr: {}",
+            stderr
+        );
+        assert!(untracked_file.exists(), "Untracked file should remain");
+    }
+
     #[test]
     fn test_env_config_applies_allowed_paths() {
         // プロジェクト外のディレクトリを作成
@@ -2875,6 +2938,99 @@ mod strict_mode_nested_tests {
         assert!(
             repo_path.join("parent/child/untracked_nested.txt").exists(),
             "ネストされた未追跡ファイルは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_directory_with_staged_deletion() {
+        // 配下に staged deletion（git rm 済み・ディスク上には存在しない）を含む
+        // ディレクトリの -r 削除をブロックする回帰テスト。削除済みファイルは read_dir に
+        // 現れないため、以前は未コミットの削除が素通りしていた fail-open。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        commit_file(&repo_path, "dir/a.txt", "a");
+        commit_file(&repo_path, "dir/keep.txt", "keep");
+
+        // dir/a.txt を git rm（staged deletion、ディスクからも消える）
+        Command::new("git")
+            .args(["rm", "dir/a.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "dir"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "staged deletion を含むディレクトリの削除はブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("dir").exists(),
+            "ディレクトリは削除されていないべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_directory_with_worktree_deletion() {
+        // worktree からのみ削除された tracked ファイル（WT_DELETED）を含む
+        // ディレクトリの -r 削除をブロックする回帰テスト。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        commit_file(&repo_path, "dir/a.txt", "a");
+        commit_file(&repo_path, "dir/keep.txt", "keep");
+
+        // worktree からのみ削除（unstaged） = WT_DELETED
+        fs::remove_file(repo_path.join("dir/a.txt")).unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "dir"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "worktree deletion を含むディレクトリの削除はブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("dir").exists(),
+            "ディレクトリは削除されていないべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_allows_clean_directory_with_staged_deletion_elsewhere() {
+        // 別ディレクトリに staged deletion があっても、対象ディレクトリ自体が clean なら
+        // 従来通り削除できること（過剰ブロックの回帰防止 / prefix 衝突の確認）。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        commit_file(&repo_path, "dir/keep.txt", "keep");
+        commit_file(&repo_path, "other/x.txt", "x");
+
+        // other/x.txt を git rm（dir とは無関係）
+        Command::new("git")
+            .args(["rm", "other/x.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "dir"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "clean なディレクトリは別ディレクトリの削除に影響されず削除できるべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            !repo_path.join("dir").exists(),
+            "clean なディレクトリは削除されるべき"
         );
     }
 }

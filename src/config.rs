@@ -138,8 +138,30 @@ impl Config {
                     Self::fail_closed_default()
                 }
             },
-            // ファイル不在のみ permissive default にフォールバック
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            // `read_to_string` が NotFound を返すケースを切り分ける。
+            // `read_to_string` は symlink を辿るため、dangling symlink でも NotFound に
+            // なる。エントリ自体が実在する（= 設定は置かれているが読めない）場合は、
+            // 真の不在と区別して fail-closed で strict モードへ倒す。これは init.rs が
+            // `symlink_metadata` で dangling symlink を既存エントリ扱いするのと対称で、
+            // 設定を symlink 管理している環境でリンク先が消えた瞬間に strict 保護が
+            // 静かに無効化されるのを防ぐ。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // dangling symlink（リンク先が解決できない symlink）が最終・中間どちらの
+                // コンポーネントに絡んでも「設定は置かれているが読めない」状態とみなし、
+                // fail-closed で strict モードへ倒す。純粋にファイルが未作成なだけなら
+                // 従来どおり permissive default を維持する。中間 dangling symlink は
+                // `symlink_metadata(&path)` がパス全体で NotFound を返し真の不在と
+                // 区別できないため、コンポーネントを個別に辿って判定する。
+                if Self::has_dangling_symlink_component(&path) {
+                    eprintln!(
+                        "safe-rm: warning: config path exists but could not be read ({}); falling back to strict mode (allow_project_deletion = false)",
+                        path.display()
+                    );
+                    Self::fail_closed_default()
+                } else {
+                    Self::default()
+                }
+            }
             // 権限エラー等のその他の I/O エラーは fail-closed
             Err(e) => {
                 eprintln!(
@@ -150,6 +172,46 @@ impl Config {
                 Self::fail_closed_default()
             }
         }
+    }
+
+    /// パス内のいずれかのコンポーネントが dangling symlink（実体を解決できない
+    /// symlink）かどうかを判定する。
+    ///
+    /// `read_to_string` も `symlink_metadata(&path)` も、中間コンポーネントが壊れた
+    /// symlink の場合はパス全体で NotFound を返し「真の不在」と区別できない。
+    /// そこでルートからコンポーネントを 1 つずつ確認し、symlink を見つけたら実体解決を
+    /// 試みる。最終コンポーネントが dangling symlink のケースもこの走査で検出できる。
+    ///
+    /// - 解決できない symlink を見つけたら `true`（設定はあるが読めない → strict）
+    /// - 途中のコンポーネントが symlink ですらなく単に存在しない場合は `false`
+    ///   （真の不在 → permissive default を維持。未設定の通常運用に影響しない）
+    /// - stat 自体が想定外のエラー（権限等）なら信頼できないので `true`（fail-closed）
+    fn has_dangling_symlink_component(path: &Path) -> bool {
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    // symlink を辿って実体を解決できなければ dangling とみなす。
+                    if std::fs::metadata(&current).is_err() {
+                        return true;
+                    }
+                }
+                // 通常のディレクトリ/ファイル → 次のコンポーネントへ
+                Ok(_) => {}
+                // このコンポーネントが symlink ですらなく存在しない（真の不在）。
+                // NotADirectory（中間が通常ファイル）も dangling symlink ではない。
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.kind() == std::io::ErrorKind::NotADirectory =>
+                {
+                    return false;
+                }
+                // stat 自体が別エラー（権限等）で信頼できない → fail-closed
+                Err(_) => return true,
+            }
+        }
+        false
     }
 
     /// allowed_paths をロード時に事前解決する（性能最適化）
@@ -414,6 +476,66 @@ mod tests {
         assert!(
             config.allow_project_deletion,
             "存在しない設定ファイルは permissive default にフォールバックすべき"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_dangling_symlink_falls_back_to_strict_mode() {
+        // 設定パスが dangling symlink（リンク先が存在しない）の場合、read_to_string は
+        // リンクを辿って NotFound を返すが、エントリ自体は実在する。真の不在と区別して
+        // fail-closed で strict モード (allow_project_deletion = false) に倒すことを検証する
+        // （init.rs が symlink_metadata で dangling symlink を既存扱いするのと対称）。
+        use std::os::unix::fs::symlink;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let link_path = tmp_dir.path().join("config.toml");
+        let missing_target = tmp_dir.path().join("does_not_exist.toml");
+        symlink(&missing_target, &link_path).unwrap();
+
+        let config = Config::load_from_path(Some(link_path));
+        assert!(
+            !config.allow_project_deletion,
+            "dangling symlink の設定パスは strict モードにフォールバックすべき"
+        );
+        assert!(config.allowed_paths.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_intermediate_dangling_symlink_falls_back_to_strict_mode() {
+        // 中間コンポーネントが dangling symlink の場合（cfg_link -> missing_dir で
+        // パスが cfg_link/config.toml）、symlink_metadata(&path) もパス全体で NotFound に
+        // なり真の不在と区別できないが、コンポーネント走査で dangling を検出して strict に倒す。
+        use std::os::unix::fs::symlink;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let link_dir = tmp_dir.path().join("cfg_link");
+        symlink(tmp_dir.path().join("missing_dir"), &link_dir).unwrap();
+        let config_path = link_dir.join("config.toml");
+
+        let config = Config::load_from_path(Some(config_path));
+        assert!(
+            !config.allow_project_deletion,
+            "中間 dangling symlink の設定パスは strict モードにフォールバックすべき"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_via_resolving_symlink_dir_missing_file_stays_permissive() {
+        // 中間 symlink が正常に解決し、その先の config ファイルが未作成なだけの場合は
+        // 「設定未作成」とみなして permissive default を維持する（過剰 strict 化の回帰防止）。
+        use std::os::unix::fs::symlink;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let real_dir = tmp_dir.path().join("real_dir");
+        fs::create_dir(&real_dir).unwrap();
+        let link_dir = tmp_dir.path().join("cfg_link");
+        symlink(&real_dir, &link_dir).unwrap(); // 解決できる symlink
+        let config_path = link_dir.join("config.toml"); // ファイルは未作成
+
+        let config = Config::load_from_path(Some(config_path));
+        assert!(
+            config.allow_project_deletion,
+            "解決可能な symlink 配下の未作成 config は permissive default を維持すべき"
         );
     }
 

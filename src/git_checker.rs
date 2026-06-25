@@ -559,9 +559,15 @@ impl GitChecker {
             return FileStatus::Staged;
         }
 
-        // Worktree 変更（Modified）
+        // Worktree 変更（Modified）。
+        // WT_UNREADABLE（libgit2 が作業ツリーのファイルを読み取れない状態）も
+        // 未確定の変更とみなし、fail-closed で削除をブロックする。
         if status.intersects(
-            Status::WT_MODIFIED | Status::WT_DELETED | Status::WT_RENAMED | Status::WT_TYPECHANGE,
+            Status::WT_MODIFIED
+                | Status::WT_DELETED
+                | Status::WT_RENAMED
+                | Status::WT_TYPECHANGE
+                | Status::WT_UNREADABLE,
         ) {
             return FileStatus::Modified;
         }
@@ -571,8 +577,15 @@ impl GitChecker {
             return FileStatus::Untracked;
         }
 
-        // 上記以外（稀なケース）は Clean として扱う
-        FileStatus::Clean
+        // 変更なし（CURRENT = 空ビット）のときだけ Clean とする。
+        // 上記いずれにも該当しないのにビットが立っている場合（将来 git2 に
+        // 追加されるフラグ等）は、未知の状態として fail-closed で Modified に倒し、
+        // 削除許可へ素通りさせない。
+        if status.is_empty() {
+            FileStatus::Clean
+        } else {
+            FileStatus::Modified
+        }
     }
 
     /// ステータスが削除許可かどうかを判定
@@ -587,7 +600,12 @@ impl GitChecker {
     /// * `Err(SafeRmError::DirtyFiles)` - 変更のあるファイルが存在
     pub fn check_path(&self, path: &Path) -> Result<(), SafeRmError> {
         if Self::is_real_directory(path) {
-            self.check_directory(path)
+            // まず read_dir ベースの再帰検査でディスク上のファイルを個別に検査する
+            // （ダーティなファイルはその具体パスでブロックメッセージを出す）。
+            self.check_directory(path)?;
+            // 続いて、read_dir では拾えない削除済みエントリ（ディスク上に無い未コミット
+            // 削除）を一括取得結果から検査する。
+            self.check_cached_statuses_under_directory(path, &self.get_all_statuses()?)
         } else {
             self.check_file(path)
         }
@@ -724,10 +742,58 @@ impl GitChecker {
         cache: &HashMap<Vec<u8>, FileStatus>,
     ) -> Result<(), SafeRmError> {
         if Self::is_real_directory(path) {
-            self.check_directory_with_cache(path, cache)
+            // まず read_dir ベースの再帰検査でディスク上のファイルを個別に検査する
+            // （ダーティなファイルはその具体パスでブロックメッセージを出す）。
+            self.check_directory_with_cache(path, cache)?;
+            // 続いて、read_dir では拾えない削除済みエントリ（ディスク上に無い未コミット
+            // 削除）をキャッシュから検査する。この走査は最上位エントリで 1 回だけ行い、
+            // サブツリー全体（任意の深さ）をカバーするため、再帰のたびに再走査して
+            // O(深さ×件数) になるのを避ける。
+            self.check_cached_statuses_under_directory(path, cache)
         } else {
             self.check_file_with_cache(path, cache)
         }
+    }
+
+    /// ステータスキャッシュ内で、指定ディレクトリ配下に削除不可なステータス
+    /// （Modified / Staged / Untracked / コンフリクト中）のエントリが無いか走査する。
+    ///
+    /// `read_dir` ベースの再帰検査は「ワークツリー上に実在するファイル」しか
+    /// 列挙できないため、`git rm` 済み（INDEX_DELETED → Staged）や worktree から
+    /// 消えた（WT_DELETED → Modified）ファイルのように、ステータスには載るが
+    /// ディスク上には存在しないエントリを取りこぼす。strict モードで、配下に
+    /// 未コミットの削除を含むディレクトリの削除が素通りしてしまう fail-open を、
+    /// この一括走査で塞ぐ。
+    ///
+    /// キャッシュは `include_unmodified` でリポジトリ配下の全ファイルを保持するため、
+    /// 最上位ディレクトリで 1 回走査すれば任意の深さの配下まで網羅できる。
+    fn check_cached_statuses_under_directory(
+        &self,
+        dir: &Path,
+        cache: &HashMap<Vec<u8>, FileStatus>,
+    ) -> Result<(), SafeRmError> {
+        // ワークディレクトリ外（NotInRepo 相当）はこの検査の対象外。
+        let Some(relative_dir) = self.to_workdir_relative(dir) else {
+            return Ok(());
+        };
+        let dir_key = Self::to_git_relative_key(&relative_dir);
+
+        for (key, &status) in cache {
+            // dir_key が空（ワークディレクトリのルート）なら全エントリが配下。
+            // それ以外は「完全一致」または「dir_key + '/' で始まる」ものだけを配下とみなし、
+            // `dir` と `dir2` のような prefix 衝突で別ディレクトリを巻き込まないようにする。
+            let under_dir = dir_key.is_empty()
+                || key.as_slice() == dir_key.as_slice()
+                || (key.starts_with(&dir_key) && key.get(dir_key.len()) == Some(&b'/'));
+            if under_dir && !Self::is_deletable(status) {
+                return Err(SafeRmError::DirtyFiles {
+                    path: dir.to_path_buf(),
+                    status,
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Git status のキー形式（スラッシュ区切り、バイト列）に揃える。
@@ -2131,6 +2197,31 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_status_wt_unreadable_fails_closed() {
+        // WT_UNREADABLE（libgit2 が作業ツリーのファイルを読み取れない状態）は、
+        // 未処理のまま Clean に落とさず fail-closed で Modified に倒し削除をブロックする。
+        let status = GitChecker::convert_status(Status::WT_UNREADABLE);
+        assert_eq!(
+            status,
+            FileStatus::Modified,
+            "WT_UNREADABLE は削除をブロックすべき"
+        );
+        assert!(!status.is_deletable());
+    }
+
+    #[test]
+    fn test_convert_status_unknown_flag_fails_closed() {
+        // どの分類にも該当しないビット（将来 git2 に追加されるフラグ等）が立っている
+        // 場合は、変更なし（空ビット）ではないため fail-closed で Modified に倒す。
+        let unknown = Status::from_bits_retain(0x4000_0000);
+        assert_eq!(
+            GitChecker::convert_status(unknown),
+            FileStatus::Modified,
+            "未知のフラグは fail-closed で Modified に倒すべき"
+        );
+    }
+
+    #[test]
     fn test_check_path_file_vs_directory() {
         // check_path がファイルとディレクトリを正しく振り分けることを確認
         let temp_dir = create_test_repo();
@@ -3209,6 +3300,127 @@ mod tests {
             !status.is_deletable(),
             "空キャッシュでも非 UTF-8 未追跡ファイルは削除不可と判定されるべき: {:?}",
             status
+        );
+    }
+
+    #[test]
+    fn test_check_path_with_cache_blocks_staged_deletion_in_directory() {
+        // strict モードのディレクトリ削除で、配下の staged deletion（git rm 済みで
+        // ディスク上には存在しないが index に削除がステージされたファイル）を
+        // read_dir では拾えないため、ステータスキャッシュ走査でブロックする回帰テスト。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        fs::create_dir(repo_path.join("dir")).unwrap();
+        fs::write(repo_path.join("dir/a.txt"), "a").unwrap();
+        fs::write(repo_path.join("dir/keep.txt"), "keep").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        // dir/a.txt を git rm（staged deletion、ディスクからも消える）
+        Command::new("git")
+            .args(["rm", "dir/a.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+        let result = checker.check_path_with_cache(&repo_path.join("dir"), &cache);
+        assert!(
+            matches!(
+                result,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Staged,
+                    ..
+                })
+            ),
+            "staged deletion を含むディレクトリの削除はブロックすべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_check_path_with_cache_blocks_worktree_deletion_in_directory() {
+        // worktree からのみ削除された tracked ファイル（WT_DELETED → Modified）も、
+        // ディスク上に存在しないため read_dir では拾えない。キャッシュ走査でブロックする。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        fs::create_dir(repo_path.join("dir")).unwrap();
+        fs::write(repo_path.join("dir/a.txt"), "a").unwrap();
+        fs::write(repo_path.join("dir/keep.txt"), "keep").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        // worktree からのみ削除（unstaged） = WT_DELETED
+        fs::remove_file(repo_path.join("dir/a.txt")).unwrap();
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+        let result = checker.check_path_with_cache(&repo_path.join("dir"), &cache);
+        assert!(
+            matches!(
+                result,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Modified,
+                    ..
+                })
+            ),
+            "worktree deletion を含むディレクトリの削除はブロックすべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_check_path_with_cache_deletion_in_sibling_does_not_block() {
+        // prefix が重なる別ディレクトリ（dir2）の staged deletion が、clean な dir の
+        // 削除を誤ってブロックしないこと（dir vs dir2 の prefix 衝突回帰テスト）。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        fs::create_dir(repo_path.join("dir")).unwrap();
+        fs::create_dir(repo_path.join("dir2")).unwrap();
+        fs::write(repo_path.join("dir/keep.txt"), "keep").unwrap();
+        fs::write(repo_path.join("dir2/x.txt"), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        // dir2/x.txt を git rm（dir とは prefix が重なる別ディレクトリ）
+        Command::new("git")
+            .args(["rm", "dir2/x.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+        let result = checker.check_path_with_cache(&repo_path.join("dir"), &cache);
+        assert!(
+            result.is_ok(),
+            "別ディレクトリ(dir2)の削除は clean な dir の削除をブロックしないべき: {:?}",
+            result
         );
     }
 }
