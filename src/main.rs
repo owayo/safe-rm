@@ -246,7 +246,14 @@ fn process_path(
             println!("would remove: {} (allowed by config)", path.display());
             Ok(true)
         } else {
-            delete_path_with_metadata(&normalized_path, args.recursive, &metadata)?;
+            let delete_result =
+                delete_path_with_metadata(&normalized_path, args.recursive, &metadata);
+            // 実削除でワークツリーが変化するため、後続パスの strict 判定が削除前の
+            // 古い status を再利用しないよう status キャッシュを破棄する。allowed_paths
+            // のファイルでも repo 内にあれば後続パスの status に影響し得る。remove_dir_all
+            // は途中まで進んでから失敗し得るので `?` より前に無効化する。
+            *status_cache = None;
+            delete_result?;
             println!("removed: {} (allowed by config)", path.display());
             Ok(true)
         }
@@ -368,7 +375,13 @@ fn process_path(
             println!("would remove: {}", path.display());
             Ok(true)
         } else {
-            delete_path_with_metadata(&normalized_path, args.recursive, &metadata)?;
+            let delete_result =
+                delete_path_with_metadata(&normalized_path, args.recursive, &metadata);
+            // 実削除でワークツリーが変化するため、後続パスの strict 判定が削除前の
+            // 古い status を再利用しないよう status キャッシュを破棄する。remove_dir_all
+            // は途中まで進んでから失敗し得るので `?` より前に無効化する。
+            *status_cache = None;
+            delete_result?;
             println!("removed: {}", path.display());
             Ok(true)
         }

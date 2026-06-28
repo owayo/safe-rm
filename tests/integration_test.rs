@@ -3033,6 +3033,46 @@ mod strict_mode_nested_tests {
             "clean なディレクトリは削除されるべき"
         );
     }
+
+    #[test]
+    fn test_strict_mode_batch_delete_then_dir_blocks_resulting_worktree_deletion() {
+        // バッチ削除で前段が clean tracked file を削除すると、その時点で
+        // ワークツリーに WT_DELETED（未コミットの削除）が生じる。後段で同じファイルを
+        // 含むディレクトリを削除するとき、削除後に status キャッシュを破棄していないと、
+        // 削除前の Clean を保持した stale cache を再利用して未コミット削除を見逃す
+        // fail-open に倒れる（git rm 等で外部削除した場合はブロックされるのに、safe-rm
+        // 自身の前段削除ではすり抜ける非一貫性）。これを防ぐ回帰テスト。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        commit_file(&repo_path, "dir/a.txt", "a");
+        commit_file(&repo_path, "dir/keep.txt", "keep");
+
+        // 同一バッチで dir/a.txt（Clean）を削除してから dir を削除する。
+        // 1 つ目で dir/a.txt が WT_DELETED になるため、2 つ目の dir 削除は
+        // 未コミット削除を含むディレクトリとしてブロックされるべき。
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "dir/a.txt", "dir"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "前段削除で生じた worktree deletion を後段の dir 削除で検出しブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("dir").exists(),
+            "dir は削除されていないべき（後段がブロックされる）"
+        );
+        assert!(
+            !repo_path.join("dir/a.txt").exists(),
+            "dir/a.txt は 1 つ目の処理で削除されているべき（Clean なので削除自体は許可）"
+        );
+        assert!(
+            repo_path.join("dir/keep.txt").exists(),
+            "dir/keep.txt は dir 削除がブロックされたため残っているべき"
+        );
+    }
 }
 
 // =============================================================================
