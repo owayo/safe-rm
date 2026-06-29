@@ -204,6 +204,7 @@ fn process_path(
         cwd.join(path)
     };
     PathChecker::reject_symlink_parent_traversal(cwd, path)?;
+    PathChecker::reject_dangling_intermediate_symlink(cwd, path)?;
 
     // 字句的に `..` を解決した正規化パス。
     // OS の path resolution は symlink を辿った後で `..` を解決するため、

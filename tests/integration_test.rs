@@ -2179,6 +2179,74 @@ mod symlink_tests {
     }
 
     #[test]
+    fn test_dangling_intermediate_symlink_target_blocked() {
+        // 中間コンポーネントが dangling symlink（リンク先がプロジェクト外の存在しない
+        // パス）の場合、その配下のパス（dlink/secret.txt）は検証時点では NotFound でも、
+        // 後からリンク先が実体化されると境界外削除に化け得る。中間 symlink の実体を
+        // 解決できない時点で fail-closed にブロックする。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        // プロジェクト外に実ファイルを作成
+        let outside_dir = TempDir::new().unwrap();
+        let outside_root = outside_dir.path().canonicalize().unwrap();
+        fs::write(outside_root.join("secret.txt"), "secret").unwrap();
+
+        // プロジェクト内に、プロジェクト外の存在しないディレクトリを指す dangling symlink
+        let absent_dir = outside_root.join("absent_dir");
+        std::os::unix::fs::symlink(&absent_dir, repo_path.join("dlink")).unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm(&["dlink/secret.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "dangling 中間 symlink 経由の削除対象は安全のためブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            outside_root.join("secret.txt").exists(),
+            "プロジェクト外の実ファイルは削除されてはならない"
+        );
+        assert!(
+            repo_path.join("dlink").symlink_metadata().is_ok(),
+            "dangling symlink 自体は削除対象ではないため残るべき"
+        );
+    }
+
+    #[test]
+    fn test_live_intermediate_symlink_to_outside_blocks_containment() {
+        // 中間コンポーネントが live な symlink でプロジェクト外の実在ディレクトリを指す
+        // 場合、その配下のパス（elink/secret.txt）の削除は包含検証でプロジェクト外
+        // （OutsideProject）として exit 2 ブロックされる。中間 symlink を canonicalize して
+        // 実体位置を解決するため、エイリアス経由の境界脱出を防ぐ。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "init.txt", "init");
+
+        // プロジェクト外に実在ディレクトリとファイルを作成
+        let outside_dir = TempDir::new().unwrap();
+        let outside_real = outside_dir.path().canonicalize().unwrap().join("realdir");
+        fs::create_dir(&outside_real).unwrap();
+        fs::write(outside_real.join("secret.txt"), "secret").unwrap();
+
+        // プロジェクト内に、プロジェクト外の実在ディレクトリを指す live symlink
+        std::os::unix::fs::symlink(&outside_real, repo_path.join("elink")).unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm(&["elink/secret.txt"], &repo_path);
+
+        assert_eq!(
+            exit_code, 2,
+            "live な中間 symlink 経由でプロジェクト外を指す削除はブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            outside_real.join("secret.txt").exists(),
+            "プロジェクト外の実ファイルは削除されてはならない"
+        );
+    }
+
+    #[test]
     fn test_strict_mode_directory_symlink_does_not_traverse_target() {
         use std::os::unix::fs::PermissionsExt;
 

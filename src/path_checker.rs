@@ -147,6 +147,58 @@ impl PathChecker {
         Ok(())
     }
 
+    /// 中間コンポーネントに解決不能な symlink があるパスを拒否する。
+    ///
+    /// `dangling/child.txt` のようなパスは、検証時点では `NotFound` で止まるが、
+    /// 検証後から実削除前までにリンク先が作成されると OS の path resolution が
+    /// symlink の先へ進み、境界外のファイル削除に化け得る。末尾 symlink 自体の削除は
+    /// リンクエントリだけを消す操作なので許可し、中間 symlink が解決できない場合だけ
+    /// fail-closed でブロックする。
+    pub fn reject_dangling_intermediate_symlink(
+        resolve_base: &Path,
+        target_path: &Path,
+    ) -> Result<(), SafeRmError> {
+        let absolute_path = Self::to_absolute(resolve_base, target_path).clean();
+        let components: Vec<_> = absolute_path.components().collect();
+        let last_normal_index = components
+            .iter()
+            .rposition(|component| matches!(component, std::path::Component::Normal(_)));
+
+        let mut current = PathBuf::new();
+        for (index, component) in components.iter().enumerate() {
+            match component {
+                std::path::Component::Prefix(prefix) => {
+                    current.push(prefix.as_os_str());
+                }
+                std::path::Component::RootDir => {
+                    current.push(component.as_os_str());
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    current.pop();
+                }
+                std::path::Component::Normal(name) => {
+                    current.push(name);
+                    if Some(index) == last_normal_index {
+                        continue;
+                    }
+
+                    let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+                        continue;
+                    };
+                    if metadata.file_type().is_symlink() && std::fs::metadata(&current).is_err() {
+                        return Err(SafeRmError::DanglingIntermediateSymlink {
+                            path: target_path.to_path_buf(),
+                            symlink: current.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// 相対パスを絶対パスに変換
     fn to_absolute(base: &Path, path: &Path) -> PathBuf {
         if path.is_absolute() {
@@ -510,6 +562,48 @@ mod tests {
         );
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_reject_dangling_intermediate_symlink_blocks_child_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(
+            "/definitely/missing/safe-rm-target",
+            project_root.join("link"),
+        )
+        .unwrap();
+
+        let result = PathChecker::reject_dangling_intermediate_symlink(
+            &project_root,
+            Path::new("link/child.txt"),
+        );
+
+        assert!(
+            matches!(result, Err(SafeRmError::DanglingIntermediateSymlink { .. })),
+            "dangling 中間 symlink 配下の削除は fail-closed で拒否すべき"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_reject_dangling_intermediate_symlink_allows_final_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(
+            "/definitely/missing/safe-rm-target",
+            project_root.join("link"),
+        )
+        .unwrap();
+
+        let result =
+            PathChecker::reject_dangling_intermediate_symlink(&project_root, Path::new("link"));
+
+        assert!(
+            result.is_ok(),
+            "末尾の dangling symlink 自体の削除はリンクエントリだけを消すため許可する"
+        );
     }
 
     #[test]

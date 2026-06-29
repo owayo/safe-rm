@@ -69,6 +69,8 @@ pub enum SafeRmError {
     DirectoryReadError { path: PathBuf },
     /// シンボリックリンク経由の親ディレクトリ参照
     UnsafeTraversal { path: PathBuf },
+    /// 解決不能な中間シンボリックリンクを含むパス
+    DanglingIntermediateSymlink { path: PathBuf, symlink: PathBuf },
     /// Git 管理メタデータへのアクセス
     ProtectedGitPath { path: PathBuf },
     /// プロジェクト外へのアクセス
@@ -95,6 +97,7 @@ impl SafeRmError {
             | Self::DangerousOption { .. }
             | Self::DirectoryReadError { .. }
             | Self::UnsafeTraversal { .. }
+            | Self::DanglingIntermediateSymlink { .. }
             | Self::ProtectedGitPath { .. }
             | Self::OutsideProject { .. }
             | Self::DirtyFiles { .. } => 2,
@@ -154,6 +157,13 @@ impl SafeRmError {
                 format!(
                     "`..` で消える成分が通常ディレクトリでないパスは許可されていません。\nPath: {}\nシンボリックリンク・ファイル・存在しない/読み取り不能な中間成分を含むパスは、字句正規化で別の削除対象に化ける可能性があるため、実体パスを直接指定してください。",
                     path.display()
+                )
+            }
+            Self::DanglingIntermediateSymlink { path, symlink } => {
+                format!(
+                    "解決できない中間シンボリックリンクを含むパスは許可されていません。\nPath: {}\nSymlink: {}\nリンク先を作成するか、実体パスを直接指定してください。",
+                    path.display(),
+                    symlink.display()
                 )
             }
             Self::ProtectedGitPath { path } => {
@@ -243,6 +253,14 @@ mod tests {
         assert_eq!(
             SafeRmError::UnsafeTraversal {
                 path: PathBuf::from("link/../victim.txt")
+            }
+            .exit_code(),
+            2
+        );
+        assert_eq!(
+            SafeRmError::DanglingIntermediateSymlink {
+                path: PathBuf::from("link/child.txt"),
+                symlink: PathBuf::from("/project/link")
             }
             .exit_code(),
             2
@@ -439,6 +457,18 @@ mod tests {
             msg
         );
         assert!(msg.contains("link/../victim.txt"));
+    }
+
+    #[test]
+    fn test_user_message_dangling_intermediate_symlink() {
+        let err = SafeRmError::DanglingIntermediateSymlink {
+            path: PathBuf::from("link/child.txt"),
+            symlink: PathBuf::from("/project/link"),
+        };
+        let msg = err.user_message();
+        assert!(msg.contains("解決できない中間シンボリックリンク"));
+        assert!(msg.contains("link/child.txt"));
+        assert!(msg.contains("/project/link"));
     }
 
     #[test]
