@@ -320,6 +320,24 @@ fn process_path(
             // ライフタイム制約のため、所有を持つ Option<GitChecker> を outer に置く。
             let discovered_checker_owned: Option<GitChecker> = GitChecker::open(&discover_from)?;
 
+            // core.worktree 等で論理ワークツリーがリダイレクトされた repo を検出する。
+            // git2 の workdir() は core.worktree のリダイレクト先を返すため、対象起点で
+            // discover した repo の workdir が git_check_path を含まないと、
+            // to_workdir_relative が None → NotInRepo（削除可能）に落ちる fail-open が生じる。
+            // git は実際この対象をダーティと報告するため、安全側で Modified 扱いにして
+            // fail-closed でブロックする。bare リポジトリ（workdir None）は Git 管理
+            // メタデータ保護で別途守られるため対象外。
+            if let Some(discovered) = discovered_checker_owned.as_ref() {
+                if let Some(discovered_wd) = discovered.workdir() {
+                    if !git_check_path.starts_with(&discovered_wd) {
+                        return Err(SafeRmError::DirtyFiles {
+                            path: path.to_path_buf(),
+                            status: FileStatus::Modified,
+                        });
+                    }
+                }
+            }
+
             // 選択ロジック:
             // - cwd checker と discovered が両方とも対象を含み、discovered の方が
             //   深い workdir なら discovered（nested repo 優先）

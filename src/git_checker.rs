@@ -447,15 +447,22 @@ impl GitChecker {
             return status;
         }
 
-        // キャッシュにない場合: .gitignore チェック。
-        // Git API エラーは fail-closed で `Modified` 相当に倒し、
-        // `Err` を握りつぶして `false` → `status_file` が偶然 `Clean` を返すケースで
-        // 削除許可されてしまう経路を塞ぐ。
+        // キャッシュにない場合の判定。
+        // status_should_ignore() は tracked かどうかを考慮しないため、ignore 判定を
+        // 先に評価すると `git add -f` された .gitignore 一致の tracked+dirty ファイルを
+        // Ignored（削除可能）と誤判定する fail-open が生じる。まず status_file ベースで
+        // 確定させ、NotInRepo のときだけ ignore 判定で補完する。
+        // Git API エラーは resolve_status_from_relative_path / ignored_status_from_relative_path
+        // 双方が fail-closed で `Modified` に倒し、`Err` を握りつぶして偶発的に削除許可
+        // されてしまう経路を塞ぐ。
+        let resolved = self.resolve_status_from_relative_path(&relative_path);
+        if resolved != FileStatus::NotInRepo {
+            return resolved;
+        }
         if let Some(status) = self.ignored_status_from_relative_path(&relative_path) {
             return status;
         }
-
-        self.resolve_status_from_relative_path(&relative_path)
+        resolved
     }
 
     /// 相対パスの ignore 判定をステータスとして返す（fail-closed 対応）。
@@ -2076,6 +2083,98 @@ mod tests {
             status,
             FileStatus::Untracked,
             "キャッシュミス時でも未追跡ディレクトリ配下のファイルは Untracked を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_get_file_status_from_cache_blocks_force_added_gitignored_tracked_dirty() {
+        // `git add -f` で .gitignore 一致ファイルを追跡下に入れてから未コミット変更した場合、
+        // status_should_ignore() は tracked を考慮せず true を返すため、ignore 判定を
+        // tracked 判定より先に評価すると Ignored（削除可能）と誤判定する fail-open があった。
+        // 修正後は status_file ベースの判定を優先し、Modified（削除不可）を返すべき。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        // .gitignore で *.log を除外してコミット
+        fs::write(repo_path.join(".gitignore"), "*.log\n").unwrap();
+        Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add .gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // .gitignore に一致する forced.log を `git add -f` で強制追跡＆コミット
+        fs::write(repo_path.join("forced.log"), "tracked log").unwrap();
+        Command::new("git")
+            .args(["add", "-f", "forced.log"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Force add forced.log"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // tracked な forced.log を未コミット変更状態にする
+        fs::write(repo_path.join("forced.log"), "dirty log content").unwrap();
+
+        let checker = open_checker(&repo_path);
+        // 空キャッシュ（意図的にキャッシュミスさせ、ignore 判定経路を通す）
+        let empty_cache = HashMap::new();
+
+        let status =
+            checker.get_file_status_from_cache(&repo_path.join("forced.log"), &empty_cache);
+        assert_eq!(
+            status,
+            FileStatus::Modified,
+            "`git add -f` された .gitignore 一致の tracked+dirty ファイルは Modified を返すべき（Ignored 誤判定の防止）"
+        );
+        assert!(
+            !GitChecker::is_deletable(status),
+            "force-add された tracked+dirty ファイルは削除不可であるべき"
+        );
+    }
+
+    #[test]
+    fn test_get_file_status_from_cache_pure_ignored_untracked_still_ignored() {
+        // 純粋に .gitignore で無視される未追跡ファイルは、修正後も従来どおり
+        // Ignored（削除可能）を返すべき（force-add 対策で過剰防御にならないことの検証）。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        fs::write(repo_path.join(".gitignore"), "*.log\n").unwrap();
+        Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add .gitignore"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // 追跡下に入れていない、純粋に無視される未追跡ファイル
+        fs::write(repo_path.join("debug.log"), "log data").unwrap();
+
+        let checker = open_checker(&repo_path);
+        let empty_cache = HashMap::new();
+
+        let status = checker.get_file_status_from_cache(&repo_path.join("debug.log"), &empty_cache);
+        assert_eq!(
+            status,
+            FileStatus::Ignored,
+            "純粋な ignored 未追跡ファイルは従来どおり Ignored を返すべき"
+        );
+        assert!(
+            GitChecker::is_deletable(status),
+            "純粋な ignored 未追跡ファイルは削除可能であるべき"
         );
     }
 

@@ -30,13 +30,13 @@
 ## 機能
 
 - **パス境界チェック**: プロジェクトディレクトリ外のファイル削除をブロック
-- **厳格モードの Git ステータス保護**: `allow_project_deletion = false` のとき、変更済み・ステージング済み・未追跡ファイルの削除を防止。判定には削除対象を実際に所有する Git リポジトリを使用し、cwd 由来の checker と対象起点で discover した checker の両方を評価して、対象を含む最も深い workdir を持つ checker を選択する。これにより (a) cwd が非 Git でも対象が配下のネスト Git リポジトリ内にあるケース、(b) cwd 側 repo が `.gitignore` 等でネスト repo を除外していて本来 `Ignored` として素通りするケース、(c) cwd と対象が別の Git リポジトリに属するケースの三種類のバイパスをいずれも fail-closed で塞ぐ
+- **厳格モードの Git ステータス保護**: `allow_project_deletion = false` のとき、変更済み・ステージング済み・未追跡ファイルの削除を防止。判定には削除対象を実際に所有する Git リポジトリを使用し、cwd 由来の checker と対象起点で discover した checker の両方を評価して、対象を含む最も深い workdir を持つ checker を選択する。これにより (a) cwd が非 Git でも対象が配下のネスト Git リポジトリ内にあるケース、(b) cwd 側 repo が `.gitignore` 等でネスト repo を除外していて本来 `Ignored` として素通りするケース、(c) cwd と対象が別の Git リポジトリに属するケースの三種類のバイパスをいずれも fail-closed で塞ぐ。さらに、対象を所有するリポジトリが `core.worktree` 等でワークツリーを別の場所へリダイレクトしていて `workdir()` が対象を含まない場合も、`NotInRepo` への素通りを防ぐため `Modified` 扱いで fail-closed にブロックする
 - **Git 管理メタデータ保護**: `.git`、gitdir 参照ファイル、bare リポジトリの管理パス、現在のリポジトリの Git 管理メタデータを含む再帰削除に加え、削除対象自身・パスの任意の中間コンポーネント・再帰削除時に配下に存在する任意階層の Git 管理メタデータを常時ブロック。ネストした `.git` ファイル/ディレクトリだけでなく、`.git` コンポーネントを持たない bare リポジトリも検出。コンポーネント比較は ASCII case-insensitive で、macOS APFS などの大文字小文字を区別しないファイルシステムでの `.GIT` 経由バイパスも防止。中間 symlink が `.git` ディレクトリや bare リポジトリを指している場合（例: `gitlink -> nested/.git` のもとで `gitlink/config` を削除）も、親ディレクトリのみを canonicalize して末尾コンポーネントを保持する判定でブロック（symlink 自身の削除はリンクのみを消すため引き続き許可される）
 - **コンフリクト対応のステータス判定**: `Status::CONFLICTED` フラグが立ったファイルは、他の index/worktree フラグが立っていない場合でも厳格モードで `Modified` として扱い、未解決のマージコンフリクトが黙って削除されることを防止
 - **ネストしたダーティファイル保護**: 厳格モードでは未追跡ディレクトリ配下、ignored/未追跡が混在するディレクトリ配下、ignored ディレクトリ配下の tracked 変更済みファイルも Git 管理外扱いにせず、正しくブロック
 - **ディレクトリトラバーサル防止**: `../` の直前成分が「実体として存在する通常ディレクトリ」でないパスは fail-closed で拒否。`link/../victim`（symlink 中間成分）、`missing/../victim`（存在しない中間成分）、`file/../victim`（通常ファイル中間成分）はいずれも OS の path resolution では失敗するが、字句正規化で `victim` に化けてしまう経路をブロック
 - **dangling 中間 symlink ガード**: `dangling/child.txt` のように中間コンポーネントが解決不能な symlink のパスは、メタデータ取得前に fail-closed でブロック。末尾の dangling symlink 自体はリンクエントリだけを削除するため引き続き許可
-- **無視ファイルの許可**: `.gitignore` で指定されたファイル（ビルド成果物など）の削除を許可
+- **無視ファイルの許可**: `.gitignore` で指定されたファイル（ビルド成果物など）の削除を許可。ただし `.gitignore` に一致していても `git add -f` で強制追跡された（tracked な）ファイルは、未コミット変更があれば保護される — ignore 判定より先にステータスを解決するため、追跡済みの dirty ファイルが `Ignored` と誤判定されることはない
 - **シンボリックリンク安全なGitチェック**: ディレクトリ symlink は辿らず、リンク自体として判定
 - **非UTF-8パス対応**: Git ステータスキャッシュは生バイト列をキー (`HashMap<Vec<u8>, FileStatus>`) として持ち、`entry.path_bytes()` を直接使うため、非 UTF-8 名のファイルも正しく登録される。これがないと、未追跡ディレクトリ配下の非 UTF-8 未追跡ファイルが `NotInRepo` に落ちて厳格モードでも削除可能になってしまう。`status_should_ignore()` のエラーも握りつぶさずに `Modified` 相当として fail-closed でブロック
 - **エイリアスパス耐性（包含検証 + allowed_paths + 厳格モード）**: 包含検証と `allowed_paths` 判定では「既存親ディレクトリまで canonicalize + 未作成部分を再結合」、厳格モードの Git チェックでは「非 symlink パスを canonicalize、symlink パスは親ディレクトリのみ canonicalize + リンク自体を判定」として、別名絶対パス経由のバイパスを防止

@@ -572,6 +572,57 @@ mod block_flow_tests {
     }
 
     #[test]
+    fn test_force_added_gitignored_dirty_file_blocked() {
+        // `git add -f` で .gitignore 一致ファイルを追跡下に入れてから未コミット変更した場合、
+        // status_should_ignore() は tracked を考慮せず true を返すため、ignore 判定を
+        // status_file 判定より先に評価すると Ignored（削除可能）と誤判定する fail-open が
+        // あった。ユニットテストは空キャッシュのフォールバック経路のみを検証しているため、
+        // 実際の削除フロー（get_all_statuses キャッシュ経由）でも Modified としてブロック
+        // されることを end-to-end で補完検証する。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // .gitignore で *.log を除外してコミット
+        commit_file(&repo_path, ".gitignore", "*.log\n");
+
+        // .gitignore に一致する forced.log を `git add -f` で強制追跡＆コミット。
+        // tracked になった時点で ignore ルールは適用されなくなる。
+        fs::write(repo_path.join("forced.log"), "tracked log").unwrap();
+        Command::new("git")
+            .args(["add", "-f", "forced.log"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Force add forced.log"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // tracked な forced.log を未コミット変更状態にする
+        fs::write(repo_path.join("forced.log"), "dirty log content").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["forced.log"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "`git add -f` された .gitignore 一致の tracked+dirty ファイルはブロックされるべき（Ignored 誤判定の防止）。stderr: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("Modified") || stderr.contains("未コミット"),
+            "変更済みファイルのエラーが必要: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("forced.log").exists(),
+            "force-add された tracked+dirty ファイルは削除されてはならない"
+        );
+    }
+
+    #[test]
     fn test_git_metadata_directory_blocked_in_strict_mode() {
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();
@@ -5474,6 +5525,117 @@ mod cross_repo_strict_tests {
         assert!(
             nested.join("tracked.txt").exists(),
             "modified ファイルは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_dirty_file_when_worktree_redirected() {
+        // core.worktree で論理ワークツリーを別ディレクトリへリダイレクトした repo。
+        // git2 の workdir() はリダイレクト先を返すため、対象起点で discover した
+        // checker の workdir が削除対象を含まず、to_workdir_relative が None →
+        // NotInRepo（削除可能）に落ちる fail-open があった。修正後は workdir が
+        // 対象を含まない場合に Modified 扱いで fail-closed でブロックする。
+        let parent_dir = TempDir::new().unwrap();
+        let cwd_root = parent_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        // gitdirhost = 物理的に tracked.txt を含む Git リポジトリ
+        let gitdirhost = cwd_root.join("gitdirhost");
+        fs::create_dir(&gitdirhost).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&gitdirhost)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&gitdirhost)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&gitdirhost)
+            .output()
+            .unwrap();
+        commit_file(&gitdirhost, "tracked.txt", "initial");
+        // tracked ファイルを未コミット変更状態にする
+        fs::write(gitdirhost.join("tracked.txt"), "dirty content").unwrap();
+
+        // core.worktree を別の空ディレクトリへリダイレクト
+        let realwt = cwd_root.join("realwt");
+        fs::create_dir(&realwt).unwrap();
+        Command::new("git")
+            .args(["config", "core.worktree", realwt.to_str().unwrap()])
+            .current_dir(&gitdirhost)
+            .output()
+            .unwrap();
+
+        // cwd は非 Git の親。gitdirhost 配下のダーティな tracked ファイル削除を試みる。
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["gitdirhost/tracked.txt"], &cwd_root, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "core.worktree でリダイレクトされた repo のダーティ tracked ファイルは fail-closed でブロックするべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            gitdirhost.join("tracked.txt").exists(),
+            "ブロックされた tracked ファイルは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_clean_file_when_worktree_redirected() {
+        // core.worktree リダイレクトの検出は「対象が workdir 配下に無い」ことだけを根拠に
+        // 無条件で fail-closed ブロックする。対象がコミット済みクリーンでも、workdir が
+        // 対象を含まない以上 to_workdir_relative が None→NotInRepo（削除可能）に落ちる
+        // fail-open を防ぐため、ブロックされ続けなければならない。この不変条件を緩めると
+        // fail-open が再発するため回帰ガードとして固定する。
+        let parent_dir = TempDir::new().unwrap();
+        let cwd_root = parent_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+
+        let gitdirhost = cwd_root.join("gitdirhost");
+        fs::create_dir(&gitdirhost).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&gitdirhost)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&gitdirhost)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&gitdirhost)
+            .output()
+            .unwrap();
+        // コミット済みでクリーンな tracked ファイル（未コミット変更なし）
+        commit_file(&gitdirhost, "clean.txt", "committed");
+
+        // core.worktree を別ディレクトリへリダイレクト
+        let realwt = cwd_root.join("realwt");
+        fs::create_dir(&realwt).unwrap();
+        Command::new("git")
+            .args(["config", "core.worktree", realwt.to_str().unwrap()])
+            .current_dir(&gitdirhost)
+            .output()
+            .unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["gitdirhost/clean.txt"], &cwd_root, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "core.worktree リダイレクト時は対象がクリーンでも fail-closed でブロックするべき（NotInRepo 素通りの防止）。stderr: {}",
+            stderr
+        );
+        assert!(
+            gitdirhost.join("clean.txt").exists(),
+            "ブロックされたファイルは残っているべき"
         );
     }
 }
