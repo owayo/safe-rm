@@ -4212,6 +4212,63 @@ mod symlink_to_directory_no_recursive_tests {
             "リンク先ディレクトリ内のファイルも残っているべき"
         );
     }
+
+    #[test]
+    fn test_symlink_to_directory_with_trailing_slash_removes_link_only() {
+        // OS は末尾スラッシュ付き symlink をリンク先ディレクトリとして解決し得る。
+        // safe-rm は字句正規化後のリンクエントリを削除し、リンク先を消してはならない。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "dummy.txt", "content");
+
+        let target_dir = repo_path.join("target_dir");
+        fs::create_dir(&target_dir).unwrap();
+        fs::write(target_dir.join("inner.txt"), "content").unwrap();
+
+        std::process::Command::new("git")
+            .args(["add", "target_dir/inner.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "Add target_dir"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let link_path = repo_path.join("link_to_dir");
+        std::os::unix::fs::symlink(&target_dir, &link_path).unwrap();
+        std::process::Command::new("git")
+            .args(["add", "link_to_dir"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "Add symlink"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let (exit_code, stdout, _) = run_safe_rm(&["link_to_dir/"], &repo_path);
+        assert_eq!(
+            exit_code, 0,
+            "末尾スラッシュ付きのディレクトリ symlink もリンクだけ削除されるべき"
+        );
+        assert!(
+            stdout.contains("removed"),
+            "削除成功メッセージが出力されるべき"
+        );
+        assert!(
+            link_path.symlink_metadata().is_err(),
+            "シンボリックリンク自体が削除されているべき"
+        );
+        assert!(target_dir.exists(), "リンク先ディレクトリは残っているべき");
+        assert!(
+            target_dir.join("inner.txt").exists(),
+            "リンク先ディレクトリ内のファイルも残っているべき"
+        );
+    }
 }
 
 // =============================================================================
