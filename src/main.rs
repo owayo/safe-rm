@@ -283,110 +283,14 @@ fn process_path(
         // 事前取得キャッシュを使用して Git ステータスをチェック（バッチ最適化）
         // allow_project_deletion 有効時はスキップ（包含検証は上記で完了）
         if !config.allow_project_deletion {
-            // シンボリックリンクの場合、親ディレクトリのみ canonicalize し
-            // リンク名自体は保持。「リンク自体をチェック」するセマンティクスを
-            // 維持しつつ、リポジトリエイリアスパスを解決する。
-            let symlink_git_check_path: Option<std::path::PathBuf> =
-                if metadata.file_type().is_symlink() {
-                    Some(
-                        normalized_path
-                            .file_name()
-                            .and_then(|name| {
-                                normalized_path
-                                    .parent()
-                                    .and_then(|parent| parent.canonicalize().ok())
-                                    .map(|canonical_parent| canonical_parent.join(name))
-                            })
-                            .unwrap_or_else(|| normalized_path.clone()),
-                    )
-                } else {
-                    None
-                };
-            let git_check_path = symlink_git_check_path.as_deref().unwrap_or(&canonical_path);
-
-            // 対象を含む repo のうち最も深い workdir を strict チェックに使う。
-            // cwd の checker だけでは、cwd 側 repo の配下に nested repo がある場合に、
-            // 外側 repo の Ignored / NotInRepo 判定で内側 repo の modified/staged を
-            // 見落としてしまう。これを防ぐため、対象起点でも常に discover を試行する。
-            let discover_from: PathBuf =
-                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-                    git_check_path.to_path_buf()
-                } else {
-                    git_check_path
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| git_check_path.to_path_buf())
-                };
-            // ライフタイム制約のため、所有を持つ Option<GitChecker> を outer に置く。
-            let discovered_checker_owned: Option<GitChecker> = GitChecker::open(&discover_from)?;
-
-            // core.worktree 等で論理ワークツリーがリダイレクトされた repo を検出する。
-            // git2 の workdir() は core.worktree のリダイレクト先を返すため、対象起点で
-            // discover した repo の workdir が git_check_path を含まないと、
-            // to_workdir_relative が None → NotInRepo（削除可能）に落ちる fail-open が生じる。
-            // git は実際この対象をダーティと報告するため、安全側で Modified 扱いにして
-            // fail-closed でブロックする。bare リポジトリ（workdir None）は Git 管理
-            // メタデータ保護で別途守られるため対象外。
-            if let Some(discovered) = discovered_checker_owned.as_ref() {
-                if let Some(discovered_wd) = discovered.workdir() {
-                    if !git_check_path.starts_with(&discovered_wd) {
-                        return Err(SafeRmError::DirtyFiles {
-                            path: path.to_path_buf(),
-                            status: FileStatus::Modified,
-                        });
-                    }
-                }
-            }
-
-            // 選択ロジック:
-            // - cwd checker と discovered が両方とも対象を含み、discovered の方が
-            //   深い workdir なら discovered（nested repo 優先）
-            // - 上記以外で cwd workdir が対象を含むなら cwd_checker
-            // - それ以外で discovered があるなら discovered
-            // - どちらも対象を含まない場合は None（strict チェック対象なし）
-            let target_checker: Option<&GitChecker> =
-                match (git_context.checker(), discovered_checker_owned.as_ref()) {
-                    (Some(cwd_checker), Some(discovered)) => {
-                        match (cwd_checker.workdir(), discovered.workdir()) {
-                            (Some(cwd_wd), Some(discovered_wd))
-                                if git_check_path.starts_with(&discovered_wd)
-                                    && discovered_wd.starts_with(&cwd_wd)
-                                    && discovered_wd != cwd_wd =>
-                            {
-                                Some(discovered)
-                            }
-                            (Some(cwd_wd), _) if git_check_path.starts_with(&cwd_wd) => {
-                                Some(cwd_checker)
-                            }
-                            _ => Some(discovered),
-                        }
-                    }
-                    (Some(cwd_checker), None) => cwd_checker
-                        .workdir()
-                        .filter(|wd| git_check_path.starts_with(wd))
-                        .map(|_| cwd_checker),
-                    (None, Some(discovered)) => Some(discovered),
-                    (None, None) => None,
-                };
-
-            if let Some(checker) = target_checker {
-                // bare リポジトリは workdir が None。bare の管理ファイル直接削除は
-                // Git 管理メタデータ保護で既にブロック済みなので、ここでは何もしない。
-                if let Some(workdir) = checker.workdir() {
-                    let cache_hit = status_cache
-                        .as_ref()
-                        .map(|(k, _)| k == &workdir)
-                        .unwrap_or(false);
-                    if !cache_hit {
-                        *status_cache = Some((workdir.clone(), checker.get_all_statuses()?));
-                    }
-                    let cache = &status_cache
-                        .as_ref()
-                        .expect("status_cache must be initialized before strict Git check")
-                        .1;
-                    checker.check_path_with_cache(git_check_path, cache)?;
-                }
-            }
+            check_strict_git_status(
+                path,
+                &normalized_path,
+                &canonical_path,
+                &metadata,
+                git_context,
+                status_cache,
+            )?;
         }
 
         // 削除実行（またはドライラン）
@@ -405,6 +309,159 @@ fn process_path(
             Ok(true)
         }
     }
+}
+
+/// 対象を管理する最も深い Git リポジトリで strict モードの削除可否を検査する。
+fn check_strict_git_status(
+    path: &Path,
+    normalized_path: &Path,
+    canonical_path: &Path,
+    metadata: &std::fs::Metadata,
+    git_context: &GitContext,
+    status_cache: &mut Option<(PathBuf, HashMap<Vec<u8>, FileStatus>)>,
+) -> Result<(), SafeRmError> {
+    // シンボリックリンクの場合、親ディレクトリのみ canonicalize し
+    // リンク名自体は保持。「リンク自体をチェック」するセマンティクスを
+    // 維持しつつ、リポジトリエイリアスパスを解決する。
+    let symlink_git_check_path: Option<PathBuf> = if metadata.file_type().is_symlink() {
+        match (normalized_path.file_name(), normalized_path.parent()) {
+            (Some(name), Some(parent)) => Some(
+                parent
+                    .canonicalize()
+                    .map_err(SafeRmError::IoError)?
+                    .join(name),
+            ),
+            _ => Some(normalized_path.to_path_buf()),
+        }
+    } else {
+        None
+    };
+    let git_check_path = symlink_git_check_path.as_deref().unwrap_or(canonical_path);
+
+    // 対象を含む repo のうち最も深い workdir を strict チェックに使う。
+    // cwd の checker だけでは、cwd 側 repo の配下に nested repo がある場合に、
+    // 外側 repo の Ignored / NotInRepo 判定で内側 repo の modified/staged を
+    // 見落としてしまう。これを防ぐため、対象起点でも常に discover を試行する。
+    let discover_from: PathBuf =
+        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            git_check_path.to_path_buf()
+        } else {
+            git_check_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| git_check_path.to_path_buf())
+        };
+    // ライフタイム制約のため、所有を持つ Option<GitChecker> を外側に置く。
+    let discovered_checker_owned: Option<GitChecker> = GitChecker::open(&discover_from)?;
+
+    // core.worktree 等で論理ワークツリーがリダイレクトされた repo を検出する。
+    // git2 の workdir() は core.worktree のリダイレクト先を返すため、対象起点で
+    // discover した repo の workdir が git_check_path を含まないと、
+    // to_workdir_relative が None → NotInRepo（削除可能）に落ちる fail-open が生じる。
+    // git は実際この対象をダーティと報告するため、安全側で Modified 扱いにして
+    // fail-closed でブロックする。bare リポジトリ（workdir None）は Git 管理
+    // メタデータ保護で別途守られるため対象外。
+    ensure_discovered_workdir_contains_target(
+        path,
+        git_check_path,
+        discovered_checker_owned.as_ref(),
+    )?;
+
+    let target_checker = select_target_checker(
+        git_check_path,
+        git_context.checker(),
+        discovered_checker_owned.as_ref(),
+    );
+
+    if let Some(checker) = target_checker {
+        check_path_with_status_cache(checker, git_check_path, status_cache)?;
+    }
+
+    Ok(())
+}
+
+/// discover したリポジトリの論理ワークツリーが対象を含むことを検証する。
+fn ensure_discovered_workdir_contains_target(
+    original_path: &Path,
+    git_check_path: &Path,
+    discovered_checker: Option<&GitChecker>,
+) -> Result<(), SafeRmError> {
+    let Some(discovered) = discovered_checker else {
+        return Ok(());
+    };
+    let Some(discovered_workdir) = discovered.workdir() else {
+        return Ok(());
+    };
+    if git_check_path.starts_with(&discovered_workdir) {
+        return Ok(());
+    }
+
+    Err(SafeRmError::DirtyFiles {
+        path: original_path.to_path_buf(),
+        status: FileStatus::Modified,
+    })
+}
+
+/// 対象を管理する Git リポジトリのうち、最も深い workdir の checker を選ぶ。
+fn select_target_checker<'a>(
+    git_check_path: &Path,
+    cwd_checker: Option<&'a GitChecker>,
+    discovered_checker: Option<&'a GitChecker>,
+) -> Option<&'a GitChecker> {
+    // 選択ロジック:
+    // - cwd checker と discovered が両方とも対象を含み、discovered の方が
+    //   深い workdir なら discovered（nested repo 優先）
+    // - 上記以外で cwd workdir が対象を含むなら cwd_checker
+    // - それ以外で discovered があるなら discovered
+    // - どちらも対象を含まない場合は None（strict チェック対象なし）
+    match (cwd_checker, discovered_checker) {
+        (Some(cwd_checker), Some(discovered)) => {
+            match (cwd_checker.workdir(), discovered.workdir()) {
+                (Some(cwd_workdir), Some(discovered_workdir))
+                    if git_check_path.starts_with(&discovered_workdir)
+                        && discovered_workdir.starts_with(&cwd_workdir)
+                        && discovered_workdir != cwd_workdir =>
+                {
+                    Some(discovered)
+                }
+                (Some(cwd_workdir), _) if git_check_path.starts_with(&cwd_workdir) => {
+                    Some(cwd_checker)
+                }
+                _ => Some(discovered),
+            }
+        }
+        (Some(cwd_checker), None) => cwd_checker
+            .workdir()
+            .filter(|workdir| git_check_path.starts_with(workdir))
+            .map(|_| cwd_checker),
+        (None, Some(discovered)) => Some(discovered),
+        (None, None) => None,
+    }
+}
+
+/// Git ステータスキャッシュを必要に応じて更新し、対象の削除可否を検査する。
+fn check_path_with_status_cache(
+    checker: &GitChecker,
+    git_check_path: &Path,
+    status_cache: &mut Option<(PathBuf, HashMap<Vec<u8>, FileStatus>)>,
+) -> Result<(), SafeRmError> {
+    // bare リポジトリは workdir が None。bare の管理ファイル直接削除は
+    // Git 管理メタデータ保護で既にブロック済みなので、ここでは何もしない。
+    let Some(workdir) = checker.workdir() else {
+        return Ok(());
+    };
+    let cache_hit = status_cache
+        .as_ref()
+        .map(|(cache_workdir, _)| cache_workdir == &workdir)
+        .unwrap_or(false);
+    if !cache_hit {
+        *status_cache = Some((workdir, checker.get_all_statuses()?));
+    }
+    let cache = &status_cache
+        .as_ref()
+        .expect("strict Git チェック前に status_cache が初期化されている必要がある")
+        .1;
+    checker.check_path_with_cache(git_check_path, cache)
 }
 
 /// Git 管理メタデータの削除対象化を検査する。
@@ -889,6 +946,101 @@ mod tests {
         assert!(
             result.is_ok(),
             "通常パスは現在の repo の checker 経由でも Git 管理メタデータ判定を通すべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_select_target_checker_prefers_deepest_containing_repository() {
+        use safe_rm::git_checker::GitChecker;
+        use std::process::Command;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outer_path = temp_dir.path().canonicalize().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&outer_path)
+            .output()
+            .unwrap();
+
+        let nested_path = outer_path.join("nested");
+        std::fs::create_dir(&nested_path).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&nested_path)
+            .output()
+            .unwrap();
+
+        let outer_checker = GitChecker::open(&outer_path)
+            .expect("外側リポジトリの検出に成功すべき")
+            .expect("外側リポジトリが存在すべき");
+        let nested_checker = GitChecker::open(&nested_path)
+            .expect("内側リポジトリの検出に成功すべき")
+            .expect("内側リポジトリが存在すべき");
+
+        let nested_target = nested_path.join("file.txt");
+        let selected = super::select_target_checker(
+            &nested_target,
+            Some(&outer_checker),
+            Some(&nested_checker),
+        )
+        .expect("対象を含むリポジトリが選択されるべき");
+        assert!(
+            std::ptr::eq(selected, &nested_checker),
+            "対象を含む最も深い nested repo が優先されるべき"
+        );
+
+        let outer_target = outer_path.join("outer.txt");
+        let selected = super::select_target_checker(&outer_target, Some(&outer_checker), None)
+            .expect("cwd リポジトリが対象を含む場合は選択されるべき");
+        assert!(
+            std::ptr::eq(selected, &outer_checker),
+            "discover 結果がない場合は対象を含む cwd repo が選択されるべき"
+        );
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_target = outside_dir.path().join("outside.txt");
+        assert!(
+            super::select_target_checker(&outside_target, Some(&outer_checker), None).is_none(),
+            "対象を含まない cwd repo は選択されるべきでない"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_strict_git_status_fails_closed_when_symlink_parent_disappears() {
+        use std::io::ErrorKind;
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parent = temp_dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let symlink_path = parent.join("link");
+        symlink("target", &symlink_path).unwrap();
+        let metadata = std::fs::symlink_metadata(&symlink_path).unwrap();
+
+        // metadata 取得後に親が消える競合状態でも、未解決パスへフォールバックしない。
+        std::fs::remove_file(&symlink_path).unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+
+        let git_context = super::GitContext::new(temp_dir.path());
+        let mut status_cache = None;
+        let result = super::check_strict_git_status(
+            &symlink_path,
+            &symlink_path,
+            &symlink_path,
+            &metadata,
+            &git_context,
+            &mut status_cache,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(super::SafeRmError::IoError(ref error))
+                    if error.kind() == ErrorKind::NotFound
+            ),
+            "symlink 親の canonicalize 失敗は I/O エラーとして伝播すべき: {:?}",
             result
         );
     }

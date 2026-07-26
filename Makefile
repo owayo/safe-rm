@@ -45,8 +45,8 @@ fmt: ## コードをフォーマット
 	cargo fmt
 
 check: ## clippy と cargo check を実行
-	cargo clippy -- -D warnings
-	cargo check
+	cargo clippy --locked --all-targets --all-features -- -D warnings
+	cargo check --locked --all-targets --all-features
 
 clean: ## ビルド成果物を削除
 	cargo clean

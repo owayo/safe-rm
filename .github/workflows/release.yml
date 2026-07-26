@@ -51,7 +51,7 @@ jobs:
             OLD_MONTH=$(echo "${CURRENT}" | cut -d. -f2)
             OLD_COUNTER=$(echo "${CURRENT}" | cut -d. -f3)
             # 2桁年と4桁年の両方の形式に対応
-            OLD_YEAR_2DIGIT=$(echo "${OLD_YEAR}" | sed 's/^20//')
+            OLD_YEAR_2DIGIT="${OLD_YEAR#20}"
             if [ "${OLD_YEAR_2DIGIT}" = "${YEAR}" ] && [ "${OLD_MONTH}" = "${MONTH}" ]; then
               NEW_COUNTER=$((OLD_COUNTER + 1))
             else
@@ -67,11 +67,11 @@ jobs:
           sed -i "s/^version = \"[^\"]*\"/version = \"${NEW_VERSION}\"/" Cargo.toml
 
           if [ -f "Cargo.lock" ]; then
-            cargo generate-lockfile 2>/dev/null || true
+            cargo generate-lockfile
           fi
 
-          echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=v${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${NEW_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${NEW_VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Commit and tag
         if: ${{ inputs.dry_run != true }}
@@ -122,7 +122,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6

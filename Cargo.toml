@@ -2,7 +2,7 @@
 name = "safe-rm"
 version = "26.5.101"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["owayo <yoheiowa@gmail.com>"]
 description = "Secure deletion proxy for Claude Code PreToolUse hooks with spatial containment and VCS safety"
 license = "MIT"

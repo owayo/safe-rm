@@ -10,6 +10,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: Minimum Rust 1.87
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install minimum Rust toolchain
+        uses: dtolnay/rust-toolchain@1.87.0
+
+      - name: Check with minimum Rust version
+        run: cargo check --locked --all-targets --all-features
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -31,10 +43,10 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -62,4 +74,4 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
