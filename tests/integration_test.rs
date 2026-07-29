@@ -4071,6 +4071,88 @@ mod allowed_paths_directory_self_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_allowed_paths_rejects_inside_symlink_pointing_outside_project() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let allowed_dir = repo_path.join("allowed");
+        fs::create_dir(&allowed_dir).unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("outside.txt");
+        fs::write(&outside_file, "outside").unwrap();
+        let inside_link = allowed_dir.join("outside-link.txt");
+        std::os::unix::fs::symlink(&outside_file, &inside_link).unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            "allow_project_deletion = true\n\n[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n",
+            allowed_dir.to_string_lossy()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &[inside_link.to_str().unwrap()],
+            &repo_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 2,
+            "リンク先がプロジェクト外ならブロックされるべき: {stderr}"
+        );
+        assert!(
+            !stdout.contains("allowed by config"),
+            "allowed_paths バイパスを通ってはならない"
+        );
+        assert!(inside_link.symlink_metadata().is_ok(), "symlink は残るべき");
+        assert!(outside_file.exists(), "リンク先ファイルは残るべき");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_allowed_paths_rejects_outside_symlink_pointing_inside() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "tracked.txt", "tracked");
+
+        let allowed_dir = repo_path.join("allowed");
+        fs::create_dir(&allowed_dir).unwrap();
+        let inside_file = allowed_dir.join("inside.txt");
+        fs::write(&inside_file, "inside").unwrap();
+        let outside_link = repo_path.join("outside-link.txt");
+        std::os::unix::fs::symlink(&inside_file, &outside_link).unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let config_content = format!(
+            "allow_project_deletion = false\n\n[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n",
+            allowed_dir.to_string_lossy()
+        );
+        fs::write(config.path(), config_content).unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &[outside_link.to_str().unwrap()],
+            &repo_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(
+            exit_code, 2,
+            "許可外の未追跡 symlink は strict 検査でブロックされるべき: {stderr}"
+        );
+        assert!(
+            !stdout.contains("allowed by config"),
+            "allowed_paths バイパスを通ってはならない"
+        );
+        assert!(
+            outside_link.symlink_metadata().is_ok(),
+            "symlink は残るべき"
+        );
+        assert!(inside_file.exists(), "リンク先ファイルは残るべき");
+    }
+
     /// 非再帰 allowed_paths で許可ディレクトリ自体は削除不可であることを検証
     #[test]
     fn test_non_recursive_allowed_path_directory_itself_blocked() {

@@ -1167,6 +1167,36 @@ recursive = true
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_is_path_allowed_rejects_inside_symlink_pointing_outside() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("outside.txt");
+        fs::write(&outside_file, "outside").unwrap();
+
+        let inside_link = allowed_dir.join("inside-link.txt");
+        std::os::unix::fs::symlink(&outside_file, &inside_link).unwrap();
+
+        let mut config = Config {
+            allowed_paths: vec![AllowedPathEntry {
+                path: allowed_dir.to_string_lossy().to_string(),
+                recursive: true,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        assert!(
+            !config.is_path_allowed(&inside_link),
+            "許可ディレクトリ内の symlink でもリンク先が許可外なら許可されないべき"
+        );
+    }
+
+    #[test]
     fn test_is_path_allowed_relative_path() {
         // 相対パス指定時に cwd と結合して許可判定される
         let tmp_dir = tempfile::tempdir().unwrap();
