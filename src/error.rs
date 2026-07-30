@@ -71,6 +71,8 @@ pub enum SafeRmError {
     UnsafeTraversal { path: PathBuf },
     /// 解決不能な中間シンボリックリンクを含むパス
     DanglingIntermediateSymlink { path: PathBuf, symlink: PathBuf },
+    /// 末尾成分が `.` / `..` の operand（POSIX rm が拒否する形式）
+    DotOrDotDotOperand { path: PathBuf },
     /// Git 管理メタデータへのアクセス
     ProtectedGitPath { path: PathBuf },
     /// プロジェクト外へのアクセス
@@ -98,6 +100,7 @@ impl SafeRmError {
             | Self::DirectoryReadError { .. }
             | Self::UnsafeTraversal { .. }
             | Self::DanglingIntermediateSymlink { .. }
+            | Self::DotOrDotDotOperand { .. }
             | Self::ProtectedGitPath { .. }
             | Self::OutsideProject { .. }
             | Self::DirtyFiles { .. } => 2,
@@ -164,6 +167,12 @@ impl SafeRmError {
                     "解決できない中間シンボリックリンクを含むパスは許可されていません。\nPath: {}\nSymlink: {}\nリンク先を作成するか、実体パスを直接指定してください。",
                     path.display(),
                     symlink.display()
+                )
+            }
+            Self::DotOrDotDotOperand { path } => {
+                format!(
+                    "末尾が '.' または '..' のパスは削除できません。\nPath: {}\nPOSIX の rm も同じ operand を拒否します。削除したいディレクトリ名を明示的に指定してください。",
+                    path.display()
                 )
             }
             Self::ProtectedGitPath { path } => {
@@ -261,6 +270,13 @@ mod tests {
             SafeRmError::DanglingIntermediateSymlink {
                 path: PathBuf::from("link/child.txt"),
                 symlink: PathBuf::from("/project/link")
+            }
+            .exit_code(),
+            2
+        );
+        assert_eq!(
+            SafeRmError::DotOrDotDotOperand {
+                path: PathBuf::from(".")
             }
             .exit_code(),
             2
@@ -469,6 +485,16 @@ mod tests {
         assert!(msg.contains("解決できない中間シンボリックリンク"));
         assert!(msg.contains("link/child.txt"));
         assert!(msg.contains("/project/link"));
+    }
+
+    #[test]
+    fn test_user_message_dot_or_dotdot_operand() {
+        let err = SafeRmError::DotOrDotDotOperand {
+            path: PathBuf::from("sub/.."),
+        };
+        let msg = err.user_message();
+        assert!(msg.contains("末尾が '.' または '..'"), "msg: {}", msg);
+        assert!(msg.contains("sub/.."), "msg: {}", msg);
     }
 
     #[test]

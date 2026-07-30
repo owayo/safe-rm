@@ -197,6 +197,12 @@ fn process_path(
     args: &CliArgs,
     config: &Config,
 ) -> Result<bool, SafeRmError> {
+    // POSIX の rm は operand の basename が `.` / `..` のとき何も削除しない。
+    // safe-rm でも同じ operand を拒否しないと `safe-rm -r .` で cwd 自体が、
+    // `safe-rm -r ..` で親ディレクトリが消えてしまう。allowed_paths のバイパスや
+    // `-f` に先んじて拒否するため、正規化・許可判定より前に評価する。
+    PathChecker::reject_dot_or_dotdot_operand(path)?;
+
     // 絶対パスに変換（相対パスは cwd から解決、git root からではない）
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
@@ -1003,6 +1009,182 @@ mod tests {
         assert!(
             super::select_target_checker(&outside_target, Some(&outer_checker), None).is_none(),
             "対象を含まない cwd repo は選択されるべきでない"
+        );
+    }
+
+    #[test]
+    fn test_select_target_checker_falls_back_to_discovered_and_none() {
+        use safe_rm::git_checker::GitChecker;
+        use std::process::Command;
+
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let cwd_path = cwd_dir.path().canonicalize().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&cwd_path)
+            .output()
+            .unwrap();
+
+        // cwd とは無関係な別リポジトリ（sibling）に削除対象がある構成。
+        let other_dir = tempfile::tempdir().unwrap();
+        let other_path = other_dir.path().canonicalize().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&other_path)
+            .output()
+            .unwrap();
+
+        let cwd_checker = GitChecker::open(&cwd_path)
+            .expect("cwd リポジトリの検出に成功すべき")
+            .expect("cwd リポジトリが存在すべき");
+        let other_checker = GitChecker::open(&other_path)
+            .expect("別リポジトリの検出に成功すべき")
+            .expect("別リポジトリが存在すべき");
+
+        let other_target = other_path.join("file.txt");
+
+        // cwd 非 Git（checker なし）でも、対象側 repo が見つかればそれを使う。
+        let selected = super::select_target_checker(&other_target, None, Some(&other_checker))
+            .expect("cwd checker が無くても discover 結果を使うべき");
+        assert!(
+            std::ptr::eq(selected, &other_checker),
+            "cwd checker が None のときは discover した repo を選ぶべき"
+        );
+
+        // cwd repo が対象を含まない場合も、対象側 repo を優先する。
+        let selected =
+            super::select_target_checker(&other_target, Some(&cwd_checker), Some(&other_checker))
+                .expect("対象を含む repo が選択されるべき");
+        assert!(
+            std::ptr::eq(selected, &other_checker),
+            "cwd repo が対象を含まないときは別 repo の checker を選ぶべき"
+        );
+
+        // どちらの checker も無ければ strict チェック対象なし。
+        assert!(
+            super::select_target_checker(&other_target, None, None).is_none(),
+            "checker が 1 つも無ければ None を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_ensure_discovered_workdir_contains_target() {
+        use safe_rm::git_checker::GitChecker;
+        use std::process::Command;
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path().canonicalize().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        let checker = GitChecker::open(&repo_path)
+            .expect("リポジトリの検出に成功すべき")
+            .expect("リポジトリが存在すべき");
+
+        // discover 結果が無い場合は検査対象外。
+        assert!(
+            super::ensure_discovered_workdir_contains_target(
+                std::path::Path::new("file.txt"),
+                &repo_path.join("file.txt"),
+                None,
+            )
+            .is_ok(),
+            "discover 結果が無い場合は素通りすべき"
+        );
+
+        // workdir が対象を含むなら通す。
+        assert!(
+            super::ensure_discovered_workdir_contains_target(
+                std::path::Path::new("file.txt"),
+                &repo_path.join("file.txt"),
+                Some(&checker),
+            )
+            .is_ok(),
+            "workdir が対象を含む場合は通すべき"
+        );
+
+        // workdir が対象を含まない（core.worktree リダイレクト相当）なら fail-closed。
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_target = outside_dir.path().join("outside.txt");
+        let result = super::ensure_discovered_workdir_contains_target(
+            std::path::Path::new("outside.txt"),
+            &outside_target,
+            Some(&checker),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(super::SafeRmError::DirtyFiles {
+                    status: super::FileStatus::Modified,
+                    ..
+                })
+            ),
+            "workdir が対象を含まない場合は Modified 扱いでブロックすべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_check_path_with_status_cache_swaps_cache_between_repositories() {
+        use safe_rm::git_checker::GitChecker;
+        use std::process::Command;
+
+        fn init_repo_with_untracked(dir: &std::path::Path, name: &str) {
+            Command::new("git")
+                .args(["init"])
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            std::fs::write(dir.join(name), "content").unwrap();
+        }
+
+        let first_dir = tempfile::tempdir().unwrap();
+        let first_path = first_dir.path().canonicalize().unwrap();
+        init_repo_with_untracked(&first_path, "first.txt");
+
+        let second_dir = tempfile::tempdir().unwrap();
+        let second_path = second_dir.path().canonicalize().unwrap();
+        init_repo_with_untracked(&second_path, "second.txt");
+
+        let first_checker = GitChecker::open(&first_path).unwrap().unwrap();
+        let second_checker = GitChecker::open(&second_path).unwrap().unwrap();
+
+        let mut status_cache = None;
+
+        // 1 つ目の repo で未追跡ファイルがブロックされ、キャッシュが張られる。
+        let result = super::check_path_with_status_cache(
+            &first_checker,
+            &first_path.join("first.txt"),
+            &mut status_cache,
+        );
+        assert!(
+            matches!(result, Err(super::SafeRmError::DirtyFiles { .. })),
+            "未追跡ファイルはブロックされるべき: {:?}",
+            result
+        );
+        assert_eq!(
+            status_cache.as_ref().map(|(workdir, _)| workdir.clone()),
+            Some(first_path.clone()),
+            "1 つ目の repo の workdir がキャッシュキーになるべき"
+        );
+
+        // 別 repo に切り替わったら、古いキャッシュを流用せず入れ替える。
+        let result = super::check_path_with_status_cache(
+            &second_checker,
+            &second_path.join("second.txt"),
+            &mut status_cache,
+        );
+        assert!(
+            matches!(result, Err(super::SafeRmError::DirtyFiles { .. })),
+            "別 repo の未追跡ファイルもブロックされるべき: {:?}",
+            result
+        );
+        assert_eq!(
+            status_cache.as_ref().map(|(workdir, _)| workdir.clone()),
+            Some(second_path.clone()),
+            "キャッシュキーが 2 つ目の repo の workdir に入れ替わるべき"
         );
     }
 

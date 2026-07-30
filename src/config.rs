@@ -519,6 +519,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_load_regular_file_intermediate_falls_back_to_strict_mode() {
+        // 中間コンポーネントが通常ファイルの場合、read_to_string は NotFound ではなく
+        // NotADirectory（ENOTDIR）を返す。真の不在ではないため permissive default に
+        // 倒さず、fail-closed で strict モードにフォールバックすることを固定する。
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let regular_file = tmp_dir.path().join("regular_file");
+        fs::write(&regular_file, "not a directory").unwrap();
+        let config_path = regular_file.join("config.toml");
+
+        let config = Config::load_from_path(Some(config_path));
+        assert!(
+            !config.allow_project_deletion,
+            "中間成分が通常ファイルの設定パスは strict モードにフォールバックすべき"
+        );
+    }
+
+    #[test]
+    fn test_load_missing_intermediate_directory_stays_permissive() {
+        // 中間ディレクトリごと未作成なだけのケースは「設定未作成」とみなし、
+        // 従来どおり permissive default を維持する（過剰 strict 化の回帰防止）。
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let config_path = tmp_dir.path().join("missing_dir").join("config.toml");
+
+        let config = Config::load_from_path(Some(config_path));
+        assert!(
+            config.allow_project_deletion,
+            "未作成の設定パスは permissive default を維持すべき"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_load_via_resolving_symlink_dir_missing_file_stays_permissive() {

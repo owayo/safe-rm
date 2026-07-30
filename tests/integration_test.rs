@@ -3461,7 +3461,10 @@ mod default_mode_security_tests {
         let repo_path = temp_dir.path().canonicalize().unwrap();
         commit_file(&repo_path, "tracked.txt", "tracked");
 
-        let (exit_code, _, stderr) = run_safe_rm(&["-r", "."], &repo_path);
+        // `.` は末尾成分が dot の operand として別途拒否されるため、
+        // ここでは Git 管理メタデータ保護そのものを検証できる絶対パスを渡す。
+        let repo_path_arg = repo_path.to_string_lossy().to_string();
+        let (exit_code, _, stderr) = run_safe_rm(&["-r", &repo_path_arg], &repo_path);
 
         assert_eq!(
             exit_code, 2,
@@ -3829,6 +3832,156 @@ mod relative_path_tests {
 }
 
 // =============================================================================
+// `.` / `..` operand のテスト（POSIX rm 互換の安全側挙動）
+// =============================================================================
+
+mod dot_operand_tests {
+    use super::*;
+
+    /// 非 Git ディレクトリでも `-r .` でカレントディレクトリ自体を消してはならない。
+    #[test]
+    fn test_dot_operand_does_not_delete_current_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let work_dir = temp_dir.path().canonicalize().unwrap().join("work");
+        fs::create_dir_all(work_dir.join("sub")).unwrap();
+        fs::write(work_dir.join("keep.txt"), "keep").unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm(&["-r", "."], &work_dir);
+
+        assert_eq!(exit_code, 2, "`.` operand はブロックされるべき: {}", stderr);
+        assert!(
+            stderr.contains("末尾が '.' または '..'"),
+            "dot operand 拒否のエラーが必要: {}",
+            stderr
+        );
+        assert!(
+            work_dir.join("keep.txt").exists(),
+            "カレントディレクトリの中身は残っているべき"
+        );
+        assert!(work_dir.exists(), "カレントディレクトリ自体も残るべき");
+    }
+
+    /// `-r ..` で親ディレクトリを消してはならない（Git 管理下でも同じ）。
+    #[test]
+    fn test_dotdot_operand_does_not_delete_parent_directory() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, "x/y/tracked.txt", "tracked");
+
+        let grandchild = repo_path.join("x").join("y");
+        let (exit_code, _, stderr) = run_safe_rm(&["-r", ".."], &grandchild);
+
+        assert_eq!(
+            exit_code, 2,
+            "`..` operand はブロックされるべき: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("x").exists(),
+            "親ディレクトリは残っているべき"
+        );
+        assert!(
+            repo_path.join("x").join("y").join("tracked.txt").exists(),
+            "配下のファイルも残っているべき"
+        );
+    }
+
+    /// `-f` は「存在しない operand を無視する」フラグであり、危険 operand の許可ではない。
+    #[test]
+    fn test_force_flag_does_not_bypass_dot_operand() {
+        let temp_dir = TempDir::new().unwrap();
+        let work_dir = temp_dir.path().canonicalize().unwrap().join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+        fs::write(work_dir.join("keep.txt"), "keep").unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm(&["-rf", "."], &work_dir);
+
+        assert_eq!(
+            exit_code, 2,
+            "-f を付けても `.` operand は拒否されるべき: {}",
+            stderr
+        );
+        assert!(
+            work_dir.join("keep.txt").exists(),
+            "ファイルは残っているべき"
+        );
+    }
+
+    /// allowed_paths のバイパスでも `sub/..` で許可ディレクトリ全体を消せてはならない。
+    #[test]
+    fn test_allowed_paths_cannot_bypass_dot_operand() {
+        let temp_dir = TempDir::new().unwrap();
+        let allowed_dir = temp_dir.path().canonicalize().unwrap().join("allowed");
+        fs::create_dir_all(allowed_dir.join("sub")).unwrap();
+        fs::write(allowed_dir.join("keep.txt"), "keep").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            config.path(),
+            format!(
+                "[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n",
+                allowed_dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "sub/.."], &allowed_dir, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "allowed_paths でも dot-dot operand は拒否されるべき: {}",
+            stderr
+        );
+        assert!(
+            allowed_dir.join("keep.txt").exists(),
+            "許可ディレクトリの中身は残っているべき"
+        );
+        assert!(allowed_dir.exists(), "許可ディレクトリ自体も残るべき");
+    }
+
+    /// dot で始まる通常のファイル名（`.hidden` / `...`）は従来どおり削除できる。
+    #[test]
+    fn test_dot_prefixed_names_are_still_deletable() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        commit_file(&repo_path, ".hidden", "hidden");
+        commit_file(&repo_path, "...", "triple dot");
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&[".hidden", "..."], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "dot で始まる通常ファイルは削除できるべき: {} {}",
+            stdout, stderr
+        );
+        assert!(!repo_path.join(".hidden").exists());
+        assert!(!repo_path.join("...").exists());
+    }
+
+    /// ディレクトリ名を明示すれば従来どおり削除できる（回避手段があることの確認）。
+    #[test]
+    fn test_explicit_directory_name_still_deletable() {
+        let temp_dir = TempDir::new().unwrap();
+        let work_dir = temp_dir.path().canonicalize().unwrap().join("work");
+        fs::create_dir_all(work_dir.join("sub")).unwrap();
+        fs::write(work_dir.join("sub").join("f.txt"), "x").unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&["-r", "sub"], &work_dir);
+
+        assert_eq!(
+            exit_code, 0,
+            "ディレクトリ名の明示指定は許可されるべき: {} {}",
+            stdout, stderr
+        );
+        assert!(
+            !work_dir.join("sub").exists(),
+            "指定したディレクトリは削除されるべき"
+        );
+    }
+}
+
+// =============================================================================
 // 厳格モードでバッチ全ダーティのテスト
 // =============================================================================
 
@@ -3945,8 +4098,12 @@ mod allowed_paths_directory_self_tests {
         );
         fs::write(config.path(), config_content).unwrap();
 
+        // `.` は末尾成分が dot の operand として先に拒否されるため、
+        // allowed_paths バイパスと Git 管理メタデータ保護の関係を検証できる
+        // 絶対パスを渡す。
+        let repo_path_arg = repo_path.to_string_lossy().to_string();
         let (exit_code, _, stderr) =
-            run_safe_rm_with_config(&["-r", "."], &repo_path, Some(config.path()));
+            run_safe_rm_with_config(&["-r", &repo_path_arg], &repo_path, Some(config.path()));
 
         assert_eq!(
             exit_code, 2,

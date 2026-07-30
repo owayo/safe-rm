@@ -147,6 +147,81 @@ impl PathChecker {
         Ok(())
     }
 
+    /// 末尾成分が `.` または `..` の operand を拒否する。
+    ///
+    /// POSIX の rm は operand の basename が dot / dot-dot の場合、診断メッセージを
+    /// 出して**その operand を一切処理しない**（GNU coreutils も
+    /// `refusing to remove '.' or '..' directory` として skip する）。
+    /// safe-rm がこれを実装しないと、`safe-rm -r .` がカレントディレクトリ自体を、
+    /// `safe-rm -r ..` が親ディレクトリを実際に削除してしまい、置き換え対象である
+    /// rm よりも危険側へ倒れる。削除したい対象はディレクトリ名で明示させる。
+    ///
+    /// allowed_paths のバイパスや `-f` より前に評価する必要があるため、正規化前の
+    /// 生 operand に対して呼ぶ。
+    pub fn reject_dot_or_dotdot_operand(target_path: &Path) -> Result<(), SafeRmError> {
+        if Self::last_component_is_dot_or_dotdot(target_path) {
+            return Err(SafeRmError::DotOrDotDotOperand {
+                path: target_path.to_path_buf(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// 末尾セパレータを除いた最後の成分が `.` / `..` かを判定する。
+    ///
+    /// `Path::components()` は `foo/.` の末尾 `.` を字句正規化で落として
+    /// `Normal("foo")` にしてしまい、`foo/.`（basename は `.`）を検出できない。
+    /// そのため生の文字列から末尾成分を切り出して比較する。
+    /// 非 UTF-8 パスでも、`.` / `..` は ASCII なので `to_string_lossy()` の
+    /// 置換文字（U+FFFD）と取り違えることはなく、判定は正確に行える。
+    fn last_component_is_dot_or_dotdot(path: &Path) -> bool {
+        let raw = path.as_os_str().to_string_lossy();
+        // `./` や `foo/../` のような末尾スラッシュ付きも対象にする。
+        let trimmed = raw.trim_end_matches(std::path::is_separator);
+        if trimmed.is_empty() {
+            // ルート（`/`）や空文字は末尾成分を持たないため対象外。
+            return false;
+        }
+
+        let last_component = match trimmed.rfind(std::path::is_separator) {
+            // セパレータは ASCII 1 バイトなので `+ 1` は必ず char 境界になる。
+            Some(separator_index) => &trimmed[separator_index + 1..],
+            None => trimmed,
+        };
+
+        if last_component == "." || last_component == ".." {
+            return true;
+        }
+
+        // Windows の drive-relative 形式（`C:.` / `C:..`）はセパレータを含まないため
+        // 上の比較に掛からないが、実質はドライブのカレント/親ディレクトリを指す
+        // dot / dot-dot operand なので同様に拒否する。Unix では `C:.` が正当な
+        // ファイル名になり得るため、この判定は Windows 限定にする。
+        #[cfg(windows)]
+        if Self::is_drive_relative_dot_component(last_component) {
+            return true;
+        }
+
+        false
+    }
+
+    /// `C:.` / `C:..` のような Windows の drive-relative な dot / dot-dot 成分か判定する。
+    ///
+    /// 拒否に使うのは Windows のみだが、ロジックは全プラットフォームでコンパイル・
+    /// テストできるようにしておく（Windows 環境でしか検証できない分岐を作らないため）。
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn is_drive_relative_dot_component(component: &str) -> bool {
+        let Some(rest) = component.strip_prefix(|c: char| c.is_ascii_alphabetic()) else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix(':') else {
+            return false;
+        };
+
+        rest == "." || rest == ".."
+    }
+
     /// 中間コンポーネントに解決不能な symlink があるパスを拒否する。
     ///
     /// `dangling/child.txt` のようなパスは、検証時点では `NotFound` で止まるが、
@@ -604,6 +679,112 @@ mod tests {
             result.is_ok(),
             "末尾の dangling symlink 自体の削除はリンクエントリだけを消すため許可する"
         );
+    }
+
+    #[test]
+    fn test_reject_dot_or_dotdot_operand_blocks_dot_forms() {
+        // POSIX の rm が operand ごと無視する形式はすべて拒否する。
+        for operand in [
+            ".",
+            "./",
+            "..",
+            "../",
+            "sub/.",
+            "sub/..",
+            "sub/./",
+            "sub/../",
+            "/tmp/sub/.",
+            "/tmp/sub/..",
+            "a/b/c/..",
+        ] {
+            let result = PathChecker::reject_dot_or_dotdot_operand(Path::new(operand));
+            assert!(
+                matches!(result, Err(SafeRmError::DotOrDotDotOperand { .. })),
+                "末尾成分が dot/dot-dot の operand は拒否されるべき: {} -> {:?}",
+                operand,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_reject_dot_or_dotdot_operand_allows_normal_paths() {
+        // 末尾成分が dot/dot-dot でなければ、途中に `.` や `..` があっても
+        // このチェックでは通す（包含検証と `..` トラバーサル検査に委ねる）。
+        for operand in [
+            "sub",
+            "sub/deep.txt",
+            "./sub/deep.txt",
+            "../sibling/file.txt",
+            "/tmp/sub/file.txt",
+            "/",
+            // dot で始まる/終わる通常のファイル名は削除できなければならない
+            ".git",
+            ".hidden",
+            "...",
+            "..foo",
+            "foo..",
+            "sub/...",
+        ] {
+            let result = PathChecker::reject_dot_or_dotdot_operand(Path::new(operand));
+            assert!(
+                result.is_ok(),
+                "通常の operand は許可されるべき: {} -> {:?}",
+                operand,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_drive_relative_dot_component() {
+        // Windows の drive-relative な dot / dot-dot 形式だけを true にする。
+        for component in ["C:.", "C:..", "z:.", "z:.."] {
+            assert!(
+                PathChecker::is_drive_relative_dot_component(component),
+                "drive-relative な dot/dot-dot は検出されるべき: {}",
+                component
+            );
+        }
+        // ドライブ文字でない・区切りが `:` でない・`.`/`..` 以外は対象外。
+        // 素の `.` / `..` は呼び出し元の比較で先に拾うため、ここでは false でよい。
+        for component in ["C:", "C:foo", "C:...", "1:.", ":.", "Cx.", ".", ".."] {
+            assert!(
+                !PathChecker::is_drive_relative_dot_component(component),
+                "drive-relative でない成分は検出されるべきでない: {}",
+                component
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_reject_dot_or_dotdot_operand_blocks_drive_relative_forms() {
+        for operand in ["C:.", "C:..", "z:.", "z:.."] {
+            let result = PathChecker::reject_dot_or_dotdot_operand(Path::new(operand));
+            assert!(
+                matches!(result, Err(SafeRmError::DotOrDotDotOperand { .. })),
+                "drive-relative な dot/dot-dot operand は拒否されるべき: {} -> {:?}",
+                operand,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_reject_dot_or_dotdot_operand_error_carries_original_path() {
+        let result = PathChecker::reject_dot_or_dotdot_operand(Path::new("sub/.."));
+
+        match result {
+            Err(SafeRmError::DotOrDotDotOperand { path }) => {
+                assert_eq!(
+                    path,
+                    PathBuf::from("sub/.."),
+                    "エラーには利用者が入力した生パスを保持すべき"
+                );
+            }
+            other => panic!("DotOrDotDotOperand が返るべき: {:?}", other),
+        }
     }
 
     #[test]
