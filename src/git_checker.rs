@@ -32,9 +32,7 @@ impl GitChecker {
     pub fn open(path: &Path) -> Result<Option<Self>, SafeRmError> {
         match Repository::discover(path) {
             Ok(repo) => {
-                let workdir_canonical = repo
-                    .workdir()
-                    .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+                let workdir_canonical = Self::canonicalize_workdir(repo.workdir())?;
                 Ok(Some(Self {
                     repo,
                     workdir_canonical,
@@ -100,6 +98,14 @@ impl GitChecker {
             error.kind(),
             std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
         )
+    }
+
+    /// Git が返した workdir を比較に使える絶対実体パスへ解決する。
+    /// 解決失敗を未解決パスへフォールバックすると repo 外判定へ抜け得るため伝播する。
+    fn canonicalize_workdir(workdir: Option<&Path>) -> Result<Option<PathBuf>, SafeRmError> {
+        workdir
+            .map(|path| path.canonicalize().map_err(SafeRmError::IoError))
+            .transpose()
     }
 
     /// Git リポジトリのワークディレクトリ（ルート）を取得
@@ -606,7 +612,7 @@ impl GitChecker {
     /// * `Ok(())` - 削除可能
     /// * `Err(SafeRmError::DirtyFiles)` - 変更のあるファイルが存在
     pub fn check_path(&self, path: &Path) -> Result<(), SafeRmError> {
-        if Self::is_real_directory(path) {
+        if Self::is_real_directory(path)? {
             // まず read_dir ベースの再帰検査でディスク上のファイルを個別に検査する
             // （ダーティなファイルはその具体パスでブロックメッセージを出す）。
             self.check_directory(path)?;
@@ -660,7 +666,7 @@ impl GitChecker {
             })?;
             let path = entry.path();
 
-            if Self::is_real_directory(&path) {
+            if Self::is_real_directory(&path)? {
                 // サブディレクトリは再帰的にチェック
                 self.check_directory(&path)?;
             } else {
@@ -710,7 +716,7 @@ impl GitChecker {
             })?;
             let path = entry.path();
 
-            if Self::is_real_directory(&path) {
+            if Self::is_real_directory(&path)? {
                 // サブディレクトリも再帰的にチェック
                 self.check_directory_with_cache(&path, cache)?;
             } else {
@@ -748,7 +754,7 @@ impl GitChecker {
         path: &Path,
         cache: &HashMap<Vec<u8>, FileStatus>,
     ) -> Result<(), SafeRmError> {
-        if Self::is_real_directory(path) {
+        if Self::is_real_directory(path)? {
             // まず read_dir ベースの再帰検査でディスク上のファイルを個別に検査する
             // （ダーティなファイルはその具体パスでブロックメッセージを出す）。
             self.check_directory_with_cache(path, cache)?;
@@ -828,10 +834,10 @@ impl GitChecker {
     }
 
     /// シンボリックリンクを辿らずに「実体がディレクトリか」を判定
-    fn is_real_directory(path: &Path) -> bool {
+    fn is_real_directory(path: &Path) -> Result<bool, SafeRmError> {
         std::fs::symlink_metadata(path)
             .map(|metadata| metadata.file_type().is_dir())
-            .unwrap_or(false)
+            .map_err(SafeRmError::IoError)
     }
 }
 
@@ -903,6 +909,22 @@ mod tests {
         let repo_path = temp_dir.path().canonicalize().unwrap();
         let checker = GitChecker::open(&repo_path).expect("Git API エラーは想定外");
         assert!(checker.is_some());
+    }
+
+    #[test]
+    fn test_canonicalize_workdir_fails_closed_when_path_cannot_be_resolved() {
+        let temp_dir = TempDir::new().unwrap();
+        let missing_workdir = temp_dir.path().join("missing-worktree");
+        let result = GitChecker::canonicalize_workdir(Some(&missing_workdir));
+        match result {
+            Err(SafeRmError::IoError(error)) => assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "解決不能な workdir は NotFound になるべき"
+            ),
+            Err(error) => panic!("想定外のエラー: {}", error.user_message()),
+            Ok(workdir) => panic!("解決不能な workdir を受理してはならない: {workdir:?}"),
+        }
     }
 
     #[test]
@@ -1954,9 +1976,9 @@ mod tests {
         let link = root.join("dir_link");
         std::os::unix::fs::symlink(&real_dir, &link).unwrap();
 
-        assert!(GitChecker::is_real_directory(&real_dir));
+        assert!(GitChecker::is_real_directory(&real_dir).unwrap());
         assert!(
-            !GitChecker::is_real_directory(&link),
+            !GitChecker::is_real_directory(&link).unwrap(),
             "symlink to directory must be treated as non-directory"
         );
     }
@@ -2414,16 +2436,50 @@ mod tests {
         fs::write(&file, "content").unwrap();
 
         assert!(
-            !GitChecker::is_real_directory(&file),
+            !GitChecker::is_real_directory(&file).unwrap(),
             "通常ファイルに対して false を返すべき"
         );
     }
 
     #[test]
-    fn test_is_real_directory_returns_false_for_nonexistent() {
+    fn test_is_real_directory_propagates_nonexistent_path_error() {
         assert!(
-            !GitChecker::is_real_directory(Path::new("/nonexistent/path")),
-            "存在しないパスに対して false を返すべき"
+            matches!(
+                GitChecker::is_real_directory(Path::new("/nonexistent/path")),
+                Err(SafeRmError::IoError(error))
+                    if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "存在しないパスの metadata エラーを握りつぶしてはならない"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_real_directory_propagates_unreadable_parent_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let locked_dir = temp_dir.path().join("locked");
+        let child = locked_dir.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = GitChecker::is_real_directory(&child);
+
+        // TempDir の後始末を可能にしてから結果を検証する。
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // root 実行環境では権限ビットを迂回できるため、このケースだけ検証対象外とする。
+        if result.is_ok() {
+            return;
+        }
+        assert!(
+            matches!(
+                result,
+                Err(SafeRmError::IoError(error))
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+            ),
+            "読み取れない中間ディレクトリの metadata エラーを伝播すべき"
         );
     }
 
@@ -2735,7 +2791,7 @@ mod tests {
         let checker = open_checker(&repo_path);
 
         // symlink-to-file は check_file 経由で処理される
-        assert!(!GitChecker::is_real_directory(&link_path));
+        assert!(!GitChecker::is_real_directory(&link_path).unwrap());
         let result = checker.check_path(&link_path);
         assert!(result.is_ok(), "コミット済み symlink は削除可能であるべき");
     }
@@ -3021,7 +3077,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
 
         assert!(
-            GitChecker::is_real_directory(&dir),
+            GitChecker::is_real_directory(&dir).unwrap(),
             "実ディレクトリに対して true を返すべき"
         );
     }

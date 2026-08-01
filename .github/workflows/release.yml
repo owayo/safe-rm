@@ -29,14 +29,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.sha }}
 
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Bump version
+      - name: Calculate version
         id: bump
         run: |
           # Windows MSI 互換性のため年は2桁(YY)にする（major version は 255 以下が必要）
@@ -64,24 +59,8 @@ jobs:
           NEW_VERSION="${YEAR}.${MONTH}.${NEW_COUNTER}"
           echo "New version: ${NEW_VERSION}"
 
-          sed -i "s/^version = \"[^\"]*\"/version = \"${NEW_VERSION}\"/" Cargo.toml
-
-          if [ -f "Cargo.lock" ]; then
-            cargo generate-lockfile
-          fi
-
           echo "version=${NEW_VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag=v${NEW_VERSION}" >> "${GITHUB_OUTPUT}"
-
-      - name: Commit and tag
-        if: ${{ inputs.dry_run != true }}
-        run: |
-          git add Cargo.toml
-          [ -f "Cargo.lock" ] && git add Cargo.lock || true
-
-          git commit -m "Release ${{ steps.bump.outputs.tag }}"
-          git tag -a "${{ steps.bump.outputs.tag }}" -m "Release ${{ steps.bump.outputs.tag }}"
-          git push origin ${{ github.ref_name }} "${{ steps.bump.outputs.tag }}"
 
       - name: Dry run info
         if: ${{ inputs.dry_run == true }}
@@ -114,12 +93,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.prepare-release.outputs.tag }}
+          ref: ${{ github.sha }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Set release version
+        run: |
+          sed -i "s/^version = \"[^\"]*\"/version = \"${{ needs.prepare-release.outputs.version }}\"/" Cargo.toml
+          cargo generate-lockfile
 
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
@@ -130,9 +114,40 @@ jobs:
           name: ${{ matrix.asset_name }}
           path: ./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
 
+  commit-and-tag:
+    name: Commit and Tag
+    needs: [prepare-release, build-and-release]
+    if: ${{ inputs.dry_run != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set release version
+        run: |
+          sed -i "s/^version = \"[^\"]*\"/version = \"${{ needs.prepare-release.outputs.version }}\"/" Cargo.toml
+          cargo generate-lockfile
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit and tag
+        run: |
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release ${{ needs.prepare-release.outputs.tag }}"
+          git tag -a "${{ needs.prepare-release.outputs.tag }}" -m "Release ${{ needs.prepare-release.outputs.tag }}"
+          git push origin "HEAD:${{ github.ref_name }}" "${{ needs.prepare-release.outputs.tag }}"
+
   publish-release:
     name: Publish Release
-    needs: [prepare-release, build-and-release]
+    needs: [prepare-release, build-and-release, commit-and-tag]
     if: ${{ inputs.dry_run != true }}
     runs-on: ubuntu-latest
     steps:

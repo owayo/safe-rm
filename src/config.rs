@@ -113,11 +113,15 @@ impl Config {
     ///
     /// `read_to_string()` を直接呼ぶことで、`Path::exists()` が権限エラーで
     /// `false` を返し permissive default に倒れてしまう経路を避ける。
+    /// 設定パス自体を決定できない場合も、設定の有無を確認できないため fail-closed とする。
     /// `ErrorKind::NotFound` の場合のみファイル不在として permissive default を返し、
     /// それ以外の I/O エラー（権限、I/O 失敗等）は fail-closed で strict モードへ倒す。
     pub fn load_from_path(path: Option<PathBuf>) -> Self {
         let Some(path) = path else {
-            return Self::default();
+            eprintln!(
+                "safe-rm: warning: cannot determine config path; falling back to strict mode (allow_project_deletion = false)"
+            );
+            return Self::fail_closed_default();
         };
 
         match std::fs::read_to_string(&path) {
@@ -572,12 +576,13 @@ mod tests {
 
     #[test]
     fn test_load_none_path() {
-        // 設定パスが None の場合も permissive default を返す。
+        // 設定パスを決定できない場合は、strict 設定の存在を確認できないため
+        // fail-closed で strict モードに倒す。
         let config = Config::load_from_path(None);
         assert!(config.allowed_paths.is_empty());
         assert!(
-            config.allow_project_deletion,
-            "None パスは permissive default にフォールバックすべき"
+            !config.allow_project_deletion,
+            "None パスは strict モードにフォールバックすべき"
         );
     }
 

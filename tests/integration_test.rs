@@ -5658,7 +5658,7 @@ mod cross_repo_strict_tests {
         let parent_root = parent_dir.path().canonicalize().unwrap();
         let config = create_strict_config();
 
-        // repo A: cwd
+        // repo A: カレントディレクトリ側
         let repo_a = parent_root.join("repo_a");
         fs::create_dir(&repo_a).unwrap();
         Command::new("git")
