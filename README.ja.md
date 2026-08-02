@@ -450,15 +450,17 @@ cargo test
 cargo +1.87.0 check --locked --all-targets --all-features
 
 # リリースビルド
-cargo build --release
+cargo build --locked --release
 ```
 
-CI は Rust 1.87.0 で最小サポートバージョンを検証し、テスト・lint・リリースビルドではコミット済みの `Cargo.lock` を強制使用する。リリースワークフローは workflow_dispatch 対象の同一コミットを全ターゲットでビルドし、すべて成功した後にだけリリースコミットとタグを push する。
+CI は Rust 1.87.0 で最小サポートバージョンを検証し、テスト・lint・リリースビルドではコミット済みの `Cargo.lock` を強制使用する。ローカルの `make release` と `make install` でも同じロックファイルを強制する。リリースワークフローは workflow_dispatch 対象の同一コミットを全ターゲットでビルドし、すべて成功した後にだけリリースコミットとタグを push する。
 
 ### テストカバレッジ
 
 - **ユニットテスト**: ライブラリ284件 + バイナリ27件のテストで全モジュールをカバー（CLI、config、error、path_checker、git_checker、init）。Git API エラー時の fail-closed 検証、Git 管理メタデータの再帰探索エラー時の fail-closed 検証、worktree の canonicalize エラーと対象 metadata 種別判定エラーの伝播、`.git` と `.GIT` メタデータディレクトリの再帰検出、`convert_status()` が `WT_UNREADABLE` と未知のステータスフラグを `Modified` に倒し空ビット（`CURRENT`）のときだけ `Clean` を返す検証、`check_path_with_cache()` がディスク上に存在しない未コミットの削除（配下の `git rm` 済み=staged ファイルや worktree から削除済みの tracked ファイル）を含むディレクトリをブロックし、prefix が重なる別ディレクトリ（`dir` vs `dir2`）では誤ブロックしない検証、strict モードで対象を含む最も深い Git workdir を選択する検証、壊れた `.git` や読み取り不可の探索対象で `GitChecker::open()` が `Err(GitError)` を返し permissive 経路へ抜けないこと（`.git` 痕跡がなく、祖先確認にも成功した場合のみ `Ok(None)`）、`Config::load_from_path()` のフェイルクローズ検証（`read_to_string()` の結果で分岐し、設定位置不明・その他の I/O エラー・TOML パース失敗・最終または中間コンポーネントが dangling symlink の設定パスは strict モードへフォールバック、本当に存在しない場合と解決可能な symlink 配下の未作成 config のみ permissive を維持）、`link/child/../../victim` のようなネストした symlink 経由の `..` 親ディレクトリ参照拒否、dangling 中間 symlink のブロックと末尾 dangling symlink 自身の削除許可、`FileStatus::is_deletable()` 検証、設定の前方互換性、Unix における `SAFE_RM_CONFIG` の非 UTF-8 パス対応、キャッシュフォールバック動作、空リポジトリ対応、壊れた symlink 検出、複数ステータスの一括取得、キャッシュ使用時の ignored サブディレクトリチェック、`Status::CONFLICTED` を `Modified` にマッピングする検証（単独フラグおよび他フラグとの組み合わせ）、`touches_git_metadata_path`/`is_git_metadata_path` が現在のリポジトリの `.git` を指す symlink 自身の削除を許可しつつ symlink 経由のアクセスはブロックする検証、中間 symlink 経由の `.git`/bare リポジトリバイパス検出（symlink 配下の管理ファイルはブロック、symlink 自身の削除は許可）、`config` 破損で `Repository::open_bare()` が失敗する bare リポジトリを構造マーカーで検出する検証（`HEAD` が未作成 ref を指す symlink のケースを含む）、および許可ディレクトリ内から許可範囲外を指す symlink を拒否する検証を含む
 - **統合テスト**: 実際のGitリポジトリを使用した173件のテスト（許可/ブロックフロー、厳格モード、シンボリックリンク、repo symlink 別名の cwd からの相対実行を含むエイリアスパス対策、バッチ処理、ドライラン厳格モード、特殊ファイル名、forceフラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト、strict mode + force フラグの複合テスト、`..` コンポーネントを含む相対パス検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、設定ファイル読込/パースエラー時の strict モードフォールバック検証（読めない/壊れた config は permissive default に倒れず未追跡削除をブロックする）、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース、壊れた symlink のデフォルト/厳格モード対応、空リポジトリ厳格モード、バッチ force フラグ複合、allowed_paths ドライラン注釈、symlink 経由の `..` 親ディレクトリ参照拒否、dangling 中間 symlink のブロック、live 中間 symlink の包含ブロック、再帰削除時の `.GIT` メタデータブロック、中間 symlink で `.git`/bare リポジトリ配下を指す削除のブロック、プロジェクト外の symlink がプロジェクト内を指す場合の包含ブロック、`config` 破損で `Repository::open_bare()` が失敗する bare リポジトリでも HEAD 削除と全体再帰削除をブロックすること、厳格モードで配下に staged/worktree の削除を含むディレクトリの `-r` 削除をブロックすること（別ディレクトリの削除では clean なディレクトリの削除を阻害しない）、設定パスが最終・中間コンポーネントの dangling symlink のとき strict モードへフォールバックすること、allowed_paths 境界をまたぐ symlink の双方向（許可内から外を指すリンク、許可外から内を指すリンク）をいずれも削除せずブロックすること、`.` / `..` operand の拒否（非 Git ツリーで `-r .` がカレントディレクトリを消さないこと、Git リポジトリの孫ディレクトリからの `-r ..` が親を消さないこと、`-rf .` の force がバイパスにならないこと、`-r sub/..` で allowed_paths ディレクトリ全体を消せないこと、`.hidden` / `...` のような dot 始まりのファイル名は削除できること、`-r sub` のようなディレクトリ名の明示指定は従来どおり削除できること））
+
+- **プロジェクト構成テスト**: 1件の回帰テストで、ローカルの `release` ターゲットが `cargo build --locked --release` を維持し、`make release` と `make install` が依存解決を暗黙に書き換えないことを検証
 
 ## コントリビューション
 

@@ -13,7 +13,7 @@ build: ## デバッグビルド
 	cargo build
 
 release: ## リリースビルド
-	cargo build --release
+	cargo build --locked --release
 
 ## インストール
 
