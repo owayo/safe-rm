@@ -29,6 +29,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// true の場合、プロジェクト内の任意のファイルを Git ステータスチェックなしで削除可能。
     /// 包含検証は引き続き適用。デフォルト: true
@@ -80,6 +81,7 @@ impl Config {
 
 /// ディレクトリごとの設定を持つ許可パスエントリ
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllowedPathEntry {
     /// 削除を許可するディレクトリパス
     pub path: String,
@@ -1318,20 +1320,30 @@ recursive = true
     }
 
     #[test]
-    fn test_parse_unknown_fields_are_ignored() {
-        // 将来の設定フィールド追加に対する前方互換性を検証
+    fn test_parse_unknown_fields_are_rejected() {
+        // 安全性に関わる設定名のタイプミスを既定値へ黙って倒してはならない
         let toml_content = r#"
 allow_project_deletion = false
-unknown_future_field = "should be ignored"
+unknown_future_field = "must be rejected"
 another_unknown = 42
 
 [[allowed_paths]]
 path = "/tmp/test"
 recursive = true
 "#;
-        let config: Config = toml::from_str(toml_content).unwrap();
-        assert!(!config.allow_project_deletion);
-        assert_eq!(config.allowed_paths.len(), 1);
+        assert!(toml::from_str::<Config>(toml_content).is_err());
+    }
+
+    #[test]
+    fn test_parse_unknown_allowed_path_fields_are_rejected() {
+        // allowed_paths の設定名もタイプミスを黙って無視せず、設定全体を安全側へ倒す
+        let toml_content = r#"
+[[allowed_paths]]
+path = "/tmp/test"
+recursive = true
+recusrive = false
+"#;
+        assert!(toml::from_str::<Config>(toml_content).is_err());
     }
 
     #[test]

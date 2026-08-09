@@ -4588,6 +4588,36 @@ mod git_error_fail_closed_tests {
             stderr
         );
     }
+
+    #[test]
+    fn test_unknown_config_field_falls_back_to_strict_mode() {
+        // allow_project_deletion のタイプミスが既定値 true に倒れると、
+        // 利用者が意図した strict 保護が無効になるため解析エラーとして扱う。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletio = false\n").unwrap();
+        fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["untracked.txt"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "未知の設定キーは fail-closed で未追跡削除をブロックすべき: stderr='{}'",
+            stderr
+        );
+        assert!(
+            repo_path.join("untracked.txt").exists(),
+            "未知の設定キーがある場合は未追跡ファイルが残っているべき"
+        );
+        assert!(
+            stderr.contains("config parse error"),
+            "未知の設定キーによる解析エラーが表示されるべき: stderr='{}'",
+            stderr
+        );
+    }
 }
 
 // =============================================================================
