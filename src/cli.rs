@@ -2,6 +2,7 @@
 //!
 //! clap derive による型安全な引数パースを提供する。
 
+use clap::builder::{OsStringValueParser, TypedValueParser};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -22,7 +23,11 @@ pub struct CliArgs {
     pub command: Option<Commands>,
 
     /// 削除対象のファイルまたはディレクトリ
-    #[arg(required = true, value_name = "PATH")]
+    #[arg(
+        required_unless_present = "force",
+        value_name = "PATH",
+        value_parser = OsStringValueParser::new().map(PathBuf::from)
+    )]
     pub paths: Vec<PathBuf>,
 
     /// 再帰削除（ディレクトリとその内容を削除）
@@ -93,6 +98,24 @@ mod tests {
             false,
         );
         assert_eq!(args.paths.len(), 3);
+    }
+
+    #[test]
+    fn test_cli_args_empty_path() {
+        let args = CliArgs::try_parse_from(["safe-rm", ""]).unwrap();
+        assert_eq!(args.paths, vec![PathBuf::new()]);
+    }
+
+    #[test]
+    fn test_cli_args_force_without_path() {
+        let args = CliArgs::try_parse_from(["safe-rm", "-f"]).unwrap();
+        assert!(args.force);
+        assert!(args.paths.is_empty());
+    }
+
+    #[test]
+    fn test_cli_args_without_force_or_path_is_rejected() {
+        assert!(CliArgs::try_parse_from(["safe-rm"]).is_err());
     }
 
     #[test]

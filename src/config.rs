@@ -3,7 +3,7 @@
 //! `~/.config/safe-rm/config.toml` からユーザー設定を読み込む。
 //! 指定ディレクトリの安全チェックをバイパスする allowed_paths をサポート。
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 
 /// 設定構造体
@@ -84,11 +84,24 @@ impl Config {
 #[serde(deny_unknown_fields)]
 pub struct AllowedPathEntry {
     /// 削除を許可するディレクトリパス
+    #[serde(deserialize_with = "deserialize_non_empty_path")]
     pub path: String,
     /// true の場合、全ファイル/サブディレクトリを再帰的に許可。
     /// false の場合、直下の子のみ許可。
     #[serde(default)]
     pub recursive: bool,
+}
+
+/// 空の許可パスは任意のパスの prefix になり得るため、設定解析時に拒否する。
+fn deserialize_non_empty_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let path = String::deserialize(deserializer)?;
+    if path.is_empty() {
+        return Err(serde::de::Error::custom("allowed path must not be empty"));
+    }
+    Ok(path)
 }
 
 impl Config {
@@ -101,6 +114,11 @@ impl Config {
     /// Unix では非 UTF-8 の値もあり得るため、OsString として受け取る。
     pub fn config_path() -> Option<PathBuf> {
         if let Some(path) = std::env::var_os("SAFE_RM_CONFIG") {
+            // 空値を未作成ファイルとして扱うと permissive default に倒るため、
+            // 設定位置を決定できない状態として None を返し fail-closed にする。
+            if path.is_empty() {
+                return None;
+            }
             return Some(PathBuf::from(path));
         }
         dirs::home_dir().map(|d| d.join(".config").join("safe-rm").join("config.toml"))
@@ -222,10 +240,17 @@ impl Config {
 
     /// allowed_paths をロード時に事前解決する（性能最適化）
     /// 手動で Config を組み立てるテストでも同じ解決処理に使う。
+    ///
+    /// 空パスのエントリはここで捨てる。`deserialize_non_empty_path` が TOML 経由の
+    /// 空パスを既に弾いているが、`allowed_paths` と本メソッドは `pub` なので、
+    /// ライブラリ利用者が `Config` を手で組み立てれば検証を迂回できてしまう。
+    /// 空パスは canonicalize しても空のままで `Path::starts_with("")` が常に真になり、
+    /// 任意のパスが許可される fail-open になるため、多層で防ぐ。
     pub fn resolve_allowed_paths(&mut self) {
         self.allowed_paths_resolved = self
             .allowed_paths
             .iter()
+            .filter(|entry| !entry.path.is_empty())
             .map(|entry| {
                 let expanded = Self::expand_tilde(&entry.path);
                 let canonical = Self::try_canonicalize(&expanded);
@@ -361,6 +386,12 @@ impl Config {
 
     /// ターゲットパスが許可エントリに一致するか判定する（recursive フラグを考慮）。
     fn path_matches_allowed_entry(path: &Path, entry: &AllowedPathResolved) -> bool {
+        // 空の許可パスは `starts_with` が常に真になり任意のパスを許可してしまう。
+        // 解析時と解決時にも弾いているが、判定側でも最終防衛として拒否する。
+        if entry.canonical_path.as_os_str().is_empty() {
+            return false;
+        }
+
         if entry.recursive {
             // 再帰: ターゲットは許可パス配下の任意の場所に存在可能
             path.starts_with(&entry.canonical_path)
@@ -961,6 +992,17 @@ recursive = true
         assert_eq!(path, Some(PathBuf::from("/custom/path/config.toml")));
     }
 
+    #[test]
+    fn test_config_path_rejects_empty_env_var() {
+        let _env_lock = SAFE_RM_CONFIG_ENV_LOCK.lock().unwrap();
+        let _env_guard = SafeRmConfigEnvGuard::set("");
+
+        assert_eq!(Config::config_path(), None);
+        let config = Config::load();
+        assert!(!config.allow_project_deletion);
+        assert!(config.allowed_paths.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_config_path_uses_non_utf8_env_var() {
@@ -1347,6 +1389,16 @@ recusrive = false
     }
 
     #[test]
+    fn test_parse_empty_allowed_path_is_rejected() {
+        let toml_content = r#"
+[[allowed_paths]]
+path = ""
+recursive = true
+"#;
+        assert!(toml::from_str::<Config>(toml_content).is_err());
+    }
+
+    #[test]
     fn test_parse_strict_mode_only() {
         // allow_project_deletion = false のみで allowed_paths なしの設定
         let toml_content = "allow_project_deletion = false\n";
@@ -1591,6 +1643,89 @@ recusrive = false
         assert!(
             !Config::path_matches_allowed_entry(&grandchild, &entry),
             "非再帰エントリは孫以下のパスにマッチしないべき"
+        );
+    }
+
+    #[test]
+    fn test_path_matches_allowed_entry_rejects_empty_canonical_path() {
+        // 空の許可パスは `Path::starts_with("")` が常に真になるため、
+        // 判定側の最終防衛でも拒否されなければ任意のパスが許可されてしまう。
+        let recursive_entry = AllowedPathResolved {
+            canonical_path: PathBuf::new(),
+            recursive: true,
+        };
+        assert!(
+            !Config::path_matches_allowed_entry(Path::new("/etc/passwd"), &recursive_entry),
+            "空の再帰エントリは任意のパスにマッチしてはならない"
+        );
+
+        let non_recursive_entry = AllowedPathResolved {
+            canonical_path: PathBuf::new(),
+            recursive: false,
+        };
+        assert!(
+            !Config::path_matches_allowed_entry(Path::new("relative.txt"), &non_recursive_entry),
+            "空の非再帰エントリは親が空のパスにマッチしてはならない"
+        );
+    }
+
+    #[test]
+    fn test_resolve_allowed_paths_drops_manually_injected_empty_entry() {
+        // `allowed_paths` と `resolve_allowed_paths()` は pub なので、TOML の
+        // `deserialize_non_empty_path` を経由せずに空パスを注入できてしまう。
+        // 解決時にも捨てることで、ライブラリ利用時の fail-open を塞ぐ。
+        let mut config = Config::default();
+        config.allowed_paths.push(AllowedPathEntry {
+            path: String::new(),
+            recursive: true,
+        });
+        config.resolve_allowed_paths();
+
+        assert!(
+            config.allowed_paths_resolved.is_empty(),
+            "空パスの許可エントリは解決時に捨てられるべき"
+        );
+        assert!(
+            !config.is_path_allowed(Path::new("/etc/passwd")),
+            "空パスの許可エントリで任意のパスを許可してはならない"
+        );
+        assert!(
+            !config.is_path_allowed_for_removal(Path::new("/etc"), true, true),
+            "空パスの許可エントリでディレクトリの再帰削除を許可してはならない"
+        );
+    }
+
+    #[test]
+    fn test_resolve_allowed_paths_keeps_valid_entries_alongside_empty_entry() {
+        // 空エントリを捨てても、同居する正当なエントリは維持される。
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
+        let allowed_dir = canonical_tmp.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        let mut config = Config::default();
+        config.allowed_paths.push(AllowedPathEntry {
+            path: String::new(),
+            recursive: true,
+        });
+        config.allowed_paths.push(AllowedPathEntry {
+            path: allowed_dir.to_string_lossy().to_string(),
+            recursive: true,
+        });
+        config.resolve_allowed_paths();
+
+        assert_eq!(
+            config.allowed_paths_resolved.len(),
+            1,
+            "空エントリだけが捨てられ、正当なエントリは残るべき"
+        );
+        assert!(
+            config.is_path_allowed(&allowed_dir.join("file.txt")),
+            "正当な許可エントリは引き続き機能するべき"
+        );
+        assert!(
+            !config.is_path_allowed(Path::new("/etc/passwd")),
+            "許可範囲外のパスは拒否されるべき"
         );
     }
 }

@@ -1022,6 +1022,87 @@ mod edge_case_tests {
             stderr
         );
     }
+
+    #[test]
+    fn test_force_without_operand_succeeds() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = temp_dir.path();
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&["-f"], project_path);
+
+        assert_eq!(exit_code, 0, "rm -f と同様に operand なしを許可すべき");
+        assert!(stdout.is_empty(), "削除対象がないため出力しないこと");
+        assert!(
+            stderr.is_empty(),
+            "-f では missing operand を表示しないこと"
+        );
+        assert!(project_path.exists(), "カレントディレクトリは残るべき");
+    }
+
+    #[test]
+    fn test_force_without_operand_does_not_read_config() {
+        // 削除対象が無ければ設定も cwd も参照しないで成功する（rm -f 互換）。
+        // 設定を読むと、壊れた設定の警告が出たり cwd 消失で exit 1 になったりする。
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = temp_dir.path();
+        let broken_config = project_path.join("broken-config.toml");
+        fs::write(&broken_config, "this is not valid toml = = =").unwrap();
+
+        let (exit_code, stdout, stderr) =
+            run_safe_rm_with_config(&["-f"], project_path, Some(broken_config.as_path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "operand なしの -f は設定の状態によらず成功すべき"
+        );
+        assert!(stdout.is_empty(), "削除対象がないため出力しないこと");
+        assert!(
+            stderr.is_empty(),
+            "設定を読まないので config parse error の警告も出ないこと: {}",
+            stderr
+        );
+    }
+
+    #[test]
+    fn test_empty_operand_is_not_found_without_deleting_current_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = temp_dir.path();
+
+        let (exit_code, _, stderr) = run_safe_rm(&["-r", ""], project_path);
+
+        assert_eq!(exit_code, 1, "空文字 operand は NotFound として扱うべき");
+        assert!(
+            stderr.contains("No such file or directory"),
+            "空文字 operand のエラー理由を表示すべき: {}",
+            stderr
+        );
+        assert!(
+            project_path.exists(),
+            "空文字 operand でカレントディレクトリを削除してはならない"
+        );
+    }
+
+    #[test]
+    fn test_force_ignores_empty_operand_without_deleting_current_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = temp_dir.path();
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&["-r", "-f", ""], project_path);
+
+        assert_eq!(exit_code, 0, "-f は空文字 operand を無視すべき");
+        assert!(
+            stdout.is_empty(),
+            "無視した operand を削除済みと表示しないこと"
+        );
+        assert!(
+            stderr.is_empty(),
+            "-f では空文字 operand のエラーを表示しないこと"
+        );
+        assert!(
+            project_path.exists(),
+            "-f 付き空文字 operand でカレントディレクトリを削除してはならない"
+        );
+    }
 }
 
 // =============================================================================
@@ -1176,6 +1257,62 @@ mod strict_mode_allow_tests {
 
 mod env_config_tests {
     use super::*;
+
+    #[test]
+    fn test_empty_env_config_falls_back_to_strict_mode() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let untracked_file = repo_path.join("untracked.txt");
+        fs::write(&untracked_file, "untracked content").unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["untracked.txt"],
+            &repo_path,
+            Some(std::path::Path::new("")),
+        );
+
+        assert_eq!(
+            exit_code, 2,
+            "空の SAFE_RM_CONFIG は strict モードへ倒れるべき"
+        );
+        assert!(
+            stderr.contains("cannot determine config path") && stderr.contains("未コミットの変更"),
+            "設定位置不明の警告を出して未追跡ファイルをブロックすべき: {}",
+            stderr
+        );
+        assert!(untracked_file.exists(), "未追跡ファイルは残るべき");
+    }
+
+    #[test]
+    fn test_empty_allowed_path_does_not_bypass_project_boundary() {
+        let project_dir = create_test_repo();
+        let project_path = project_dir.path().canonicalize().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let outside_file = outside_dir.path().join("outside.txt");
+        fs::write(&outside_file, "outside content").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            config.path(),
+            "[[allowed_paths]]\npath = \"\"\nrecursive = true\n",
+        )
+        .unwrap();
+
+        let outside_arg = outside_file.to_string_lossy().to_string();
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&[outside_arg.as_str()], &project_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "空の allowed path でプロジェクト境界をバイパスしてはならない"
+        );
+        assert!(
+            stderr.contains("config parse error") && stderr.contains("プロジェクト外"),
+            "設定エラーを警告してプロジェクト外をブロックすべき: {}",
+            stderr
+        );
+        assert!(outside_file.exists(), "プロジェクト外のファイルは残るべき");
+    }
 
     #[test]
     fn test_env_config_nonexistent_path_fallback() {

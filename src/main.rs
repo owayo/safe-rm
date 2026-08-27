@@ -111,6 +111,14 @@ fn main() -> ExitCode {
 
 /// メイン実行ロジック
 fn run(args: CliArgs) -> Result<(), SafeRmError> {
+    // 削除対象がないなら設定も cwd も要らない。CLI 上ここに空 paths で来るのは
+    // `-f` 指定時だけで（サブコマンドは main() で処理済み）、`rm -f` は operand が
+    // 無ければ cwd を参照せず成功する。ここで返さないと、cwd が別プロセスに
+    // 削除された状態の `safe-rm -f` が current_dir() の ENOENT で exit 1 になる。
+    if args.paths.is_empty() {
+        return Ok(());
+    }
+
     // ユーザー設定の読み込み
     let config = Config::load();
 
@@ -197,6 +205,16 @@ fn process_path(
     args: &CliArgs,
     config: &Config,
 ) -> Result<bool, SafeRmError> {
+    // 空文字を cwd として解釈すると `-r` でカレントディレクトリ自体を削除し得る。
+    // rm と同様に存在しない operand として扱い、`-f` の場合だけ黙って無視する。
+    if path.as_os_str().is_empty() {
+        return if args.force {
+            Ok(false)
+        } else {
+            Err(SafeRmError::NotFound(path.to_path_buf()))
+        };
+    }
+
     // POSIX の rm は operand の basename が `.` / `..` のとき何も削除しない。
     // safe-rm でも同じ operand を拒否しないと `safe-rm -r .` で cwd 自体が、
     // `safe-rm -r ..` で親ディレクトリが消えてしまう。allowed_paths のバイパスや
@@ -219,15 +237,20 @@ fn process_path(
     // 以降のメタデータ取得・削除・許可判定はすべて clean 済みパスで行う。
     let normalized_path = abs_path.clean();
 
-    // allowed_paths 判定のために削除対象のディレクトリ性質を事前確認する。
+    // 削除対象のメタデータは 1 回だけ取得し、allowed_paths 判定・`-r` 必須判定・
+    // 実削除の方式決定すべてに同じ結果を使う。ここと削除直前で別々に
+    // `symlink_metadata()` を呼ぶと、その間に対象がファイルからディレクトリへ
+    // 入れ替わった場合に「非再帰 allowed エントリの直下ファイル」として許可した
+    // 対象を `remove_dir_all` で再帰削除してしまう（非再帰エントリの契約破り）。
     // 取得失敗（NotFound や I/O エラー）はここでは握りつぶし、後続の
-    // fetch_target_metadata 側で正規のエラーパスに委ねる。
+    // resolve_target_metadata 側で正規のエラーパスに委ねる。
     // symlink-to-directory は symlink_metadata 上 is_dir = false となるため、
     // ディレクトリの再帰削除制約は実体ディレクトリのみに適用される
     // （リンクエントリ自体は単一エントリの削除として扱われる）。
-    let target_is_dir = std::fs::symlink_metadata(&normalized_path)
-        .ok()
-        .map(|m| m.is_dir())
+    let target_metadata = std::fs::symlink_metadata(&normalized_path);
+    let target_is_dir = target_metadata
+        .as_ref()
+        .map(|metadata| metadata.is_dir())
         .unwrap_or(false);
 
     // allowed_paths 内のパスか確認（包含検証と Git チェックをバイパス）
@@ -243,7 +266,12 @@ fn process_path(
             git_context.checker(),
         )?;
 
-        let Some(metadata) = fetch_target_metadata(&normalized_path, args.force, args.recursive)?
+        let Some(metadata) = resolve_target_metadata(
+            &normalized_path,
+            target_metadata,
+            args.force,
+            args.recursive,
+        )?
         else {
             return Ok(false);
         };
@@ -281,7 +309,12 @@ fn process_path(
             git_context.checker(),
         )?;
 
-        let Some(metadata) = fetch_target_metadata(&normalized_path, args.force, args.recursive)?
+        let Some(metadata) = resolve_target_metadata(
+            &normalized_path,
+            target_metadata,
+            args.force,
+            args.recursive,
+        )?
         else {
             return Ok(false);
         };
@@ -497,11 +530,18 @@ fn ensure_git_metadata_not_targeted(
     Ok(())
 }
 
-/// 削除対象のメタデータを取得し、削除前の共通検証を行う。
+/// 取得済みの `symlink_metadata()` 結果から、削除前の共通検証を行う。
 ///
 /// allowed_paths 分岐と標準チェック分岐で完全に同一だった処理を共通化したもの。
 /// 呼び出し側の安全チェック順序（包含検証・Git メタデータ保護）は変えず、
-/// メタデータ取得とディレクトリ判定の重複だけを排除する。
+/// メタデータ判定の重複だけを排除する。
+///
+/// メタデータを内部で取り直さず引数で受け取るのは、`process_path()` の
+/// allowed_paths 判定に使った結果と、実削除の方式（`remove_file` /
+/// `remove_dir` / `remove_dir_all`）を決める結果を必ず一致させるため。
+/// 別々に `symlink_metadata()` を呼ぶと、その間に対象がファイルから
+/// ディレクトリへ入れ替わったときに、非再帰 allowed エントリの直下ファイルとして
+/// 許可した対象を再帰削除してしまう。
 ///
 /// # 戻り値
 /// * `Ok(Some(metadata))` - 削除対象が存在し、削除を続行してよい
@@ -509,13 +549,13 @@ fn ensure_git_metadata_not_targeted(
 /// * `Err(SafeRmError::NotFound)` - 対象が存在せず `-f` 未指定
 /// * `Err(SafeRmError::IsDirectory)` - ディレクトリだが `-r` 未指定
 /// * `Err(SafeRmError::IoError)` - メタデータ取得時の I/O エラー
-fn fetch_target_metadata(
+fn resolve_target_metadata(
     path: &Path,
+    metadata: std::io::Result<std::fs::Metadata>,
     force: bool,
     recursive: bool,
 ) -> Result<Option<std::fs::Metadata>, SafeRmError> {
-    // メタデータを1回の syscall で取得（exists() + is_dir() の代替）
-    let metadata = match std::fs::symlink_metadata(path) {
+    let metadata = match metadata {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return if force {
@@ -795,13 +835,14 @@ mod tests {
     }
 
     #[test]
-    fn test_fetch_target_metadata_returns_metadata_for_existing_file() {
+    fn test_resolve_target_metadata_returns_metadata_for_existing_file() {
         // 既存の通常ファイルはメタデータを返す
         let tmp_dir = tempfile::tempdir().unwrap();
         let file = tmp_dir.path().join("note.txt");
         std::fs::write(&file, "content").unwrap();
 
-        let result = super::fetch_target_metadata(&file, false, false);
+        let result =
+            super::resolve_target_metadata(&file, std::fs::symlink_metadata(&file), false, false);
         assert!(
             matches!(result, Ok(Some(_))),
             "既存ファイルはメタデータを返すべき: {:?}",
@@ -810,12 +851,17 @@ mod tests {
     }
 
     #[test]
-    fn test_fetch_target_metadata_missing_without_force_errors() {
+    fn test_resolve_target_metadata_missing_without_force_errors() {
         // 存在しないパスは force なしで NotFound エラー
         let tmp_dir = tempfile::tempdir().unwrap();
         let missing = tmp_dir.path().join("missing.txt");
 
-        let result = super::fetch_target_metadata(&missing, false, false);
+        let result = super::resolve_target_metadata(
+            &missing,
+            std::fs::symlink_metadata(&missing),
+            false,
+            false,
+        );
         assert!(
             matches!(result, Err(super::SafeRmError::NotFound(_))),
             "存在しないパスは force なしで NotFound を返すべき: {:?}",
@@ -824,12 +870,17 @@ mod tests {
     }
 
     #[test]
-    fn test_fetch_target_metadata_missing_with_force_is_none() {
+    fn test_resolve_target_metadata_missing_with_force_is_none() {
         // 存在しないパスは force ありで Ok(None)（スキップ対象）
         let tmp_dir = tempfile::tempdir().unwrap();
         let missing = tmp_dir.path().join("missing.txt");
 
-        let result = super::fetch_target_metadata(&missing, true, false);
+        let result = super::resolve_target_metadata(
+            &missing,
+            std::fs::symlink_metadata(&missing),
+            true,
+            false,
+        );
         assert!(
             matches!(result, Ok(None)),
             "force 指定時は存在しないパスを Ok(None) でスキップすべき: {:?}",
@@ -838,13 +889,14 @@ mod tests {
     }
 
     #[test]
-    fn test_fetch_target_metadata_directory_without_recursive_errors() {
+    fn test_resolve_target_metadata_directory_without_recursive_errors() {
         // ディレクトリは recursive なしで IsDirectory エラー
         let tmp_dir = tempfile::tempdir().unwrap();
         let dir = tmp_dir.path().join("subdir");
         std::fs::create_dir(&dir).unwrap();
 
-        let result = super::fetch_target_metadata(&dir, false, false);
+        let result =
+            super::resolve_target_metadata(&dir, std::fs::symlink_metadata(&dir), false, false);
         assert!(
             matches!(result, Err(super::SafeRmError::IsDirectory(_))),
             "ディレクトリは -r なしで IsDirectory を返すべき: {:?}",
@@ -853,15 +905,16 @@ mod tests {
     }
 
     #[test]
-    fn test_fetch_target_metadata_directory_with_recursive_returns_metadata() {
+    fn test_resolve_target_metadata_directory_with_recursive_returns_metadata() {
         // ディレクトリは recursive ありでメタデータを返す
         let tmp_dir = tempfile::tempdir().unwrap();
         let dir = tmp_dir.path().join("subdir");
         std::fs::create_dir(&dir).unwrap();
 
-        let metadata = super::fetch_target_metadata(&dir, false, true)
-            .expect("ディレクトリは -r ありで Ok を返すべき")
-            .expect("メタデータが存在するべき");
+        let metadata =
+            super::resolve_target_metadata(&dir, std::fs::symlink_metadata(&dir), false, true)
+                .expect("ディレクトリは -r ありで Ok を返すべき")
+                .expect("メタデータが存在するべき");
         assert!(
             metadata.is_dir(),
             "返されたメタデータはディレクトリを示すべき"
@@ -870,7 +923,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_fetch_target_metadata_symlink_to_dir_does_not_require_recursive() {
+    fn test_resolve_target_metadata_symlink_to_dir_does_not_require_recursive() {
         // ディレクトリへの symlink は symlink_metadata 上はディレクトリでないため、
         // recursive なしでもメタデータを返す（リンクエントリ自体が削除対象）
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -879,12 +932,44 @@ mod tests {
         let link = tmp_dir.path().join("link_to_dir");
         std::os::unix::fs::symlink(&target_dir, &link).unwrap();
 
-        let metadata = super::fetch_target_metadata(&link, false, false)
-            .expect("symlink は -r なしで Ok を返すべき")
-            .expect("メタデータが存在するべき");
+        let metadata =
+            super::resolve_target_metadata(&link, std::fs::symlink_metadata(&link), false, false)
+                .expect("symlink は -r なしで Ok を返すべき")
+                .expect("メタデータが存在するべき");
         assert!(
             metadata.file_type().is_symlink(),
             "返されたメタデータは symlink を示すべき"
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_metadata_uses_argument_without_restatting() {
+        // 渡されたメタデータだけで判定し、パスを stat し直さないことを検証する。
+        // 再取得すると allowed_paths 判定に使った結果と削除方式の判定がずれ、
+        // ファイル→ディレクトリの入れ替えで非再帰エントリの契約が破れる。
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let existing_file = tmp_dir.path().join("exists.txt");
+        std::fs::write(&existing_file, "content").unwrap();
+
+        // 実在するファイルでも、NotFound の取得結果を渡せば NotFound として扱う。
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "injected");
+        let result = super::resolve_target_metadata(&existing_file, Err(not_found), false, false);
+        assert!(
+            matches!(result, Err(super::SafeRmError::NotFound(_))),
+            "引数のメタデータのみを見て NotFound を返すべき（stat し直さない）: {:?}",
+            result
+        );
+
+        // 実在するディレクトリでも、ファイルのメタデータを渡せば `-r` を要求しない。
+        let dir = tmp_dir.path().join("subdir");
+        std::fs::create_dir(&dir).unwrap();
+        let file_metadata = std::fs::symlink_metadata(&existing_file).unwrap();
+        let resolved = super::resolve_target_metadata(&dir, Ok(file_metadata), false, false)
+            .expect("引数がファイルなら -r なしで Ok を返すべき")
+            .expect("メタデータが存在するべき");
+        assert!(
+            !resolved.is_dir(),
+            "返されるのは引数で渡したメタデータであるべき"
         );
     }
 
