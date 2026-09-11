@@ -168,6 +168,87 @@ impl PathChecker {
         Ok(())
     }
 
+    /// ルートディレクトリを指す operand を拒否する。
+    ///
+    /// POSIX は「operand がルートディレクトリに解決される場合、rm は診断メッセージを出して
+    /// その operand を一切処理しない」と定めており、GNU coreutils も `--preserve-root`
+    /// （既定で有効）で `rm -r /` を拒否する。
+    ///
+    /// safe-rm 側でこれを実装しないと、cwd が `/` の非 Git 環境（root 実行のコンテナ等）で
+    /// `safe-rm -r /` がプロジェクト境界を通過し、ファイルシステム全体の再帰削除に入り得る。
+    /// `.` / `..` operand の拒否と同じく、allowed_paths のバイパスや `-f` より前に評価する。
+    pub fn reject_root_operand(resolve_base: &Path, target_path: &Path) -> Result<(), SafeRmError> {
+        // 空 operand は呼び出し元が先に `NotFound` として処理するため対象外。
+        // ここで弾かないと `Path::parent()` が `None` を返して誤ってルート扱いになる。
+        if target_path.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        let absolute_path = Self::to_absolute(resolve_base, target_path).clean();
+        if absolute_path.parent().is_none() {
+            return Err(SafeRmError::RootOperand {
+                path: target_path.to_path_buf(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// 末尾セパレータ付き operand が「ディレクトリとして解決できる」ことを検証する。
+    ///
+    /// POSIX はパス末尾のセパレータを「その対象がディレクトリであること」の要求と定義して
+    /// おり、ディレクトリとして解決できなければ `ENOTDIR` / `ENOENT` 等で失敗する。rm も
+    /// この operand を削除しない。一方 safe-rm は `path_clean` で末尾セパレータを落とすため、
+    /// 検査しないと `file.txt/` が `file.txt` 自体の削除に、`danglink/`（リンク切れ symlink）が
+    /// リンクエントリの削除に化け、置き換え対象である rm より危険側へ倒れる。
+    ///
+    /// 末尾セパレータ付きのパスは OS が symlink を辿って解決するため、「ディレクトリとして
+    /// 解決できたか」だけを見れば足りる。ディレクトリへの symlink（`link/`）は `is_dir` として
+    /// 解決できるので通し、従来どおり正規化後のリンクエントリ自体の削除として扱う
+    /// （リンク先の実体を残す安全側の挙動を維持する）。
+    ///
+    /// 判定は末尾セパレータ付きの生 operand に対して行う必要があるため、正規化前に呼ぶ。
+    ///
+    /// # 戻り値
+    /// * `Ok(())` - 末尾セパレータがない、またはディレクトリとして解決できた
+    /// * `Err(SafeRmError::NotADirectory)` - 非ディレクトリに解決された（`ENOTDIR` 相当）
+    /// * `Err(SafeRmError::NotFound)` - 解決できなかった（`ENOENT` 相当。リンク切れ symlink を含む）
+    /// * `Err(SafeRmError::IoError)` - それ以外の解決失敗（`ELOOP`・権限不足等）
+    pub fn check_trailing_separator_operand(
+        resolve_base: &Path,
+        target_path: &Path,
+    ) -> Result<(), SafeRmError> {
+        if !Self::has_trailing_separator(target_path) {
+            return Ok(());
+        }
+
+        let absolute_path = Self::to_absolute(resolve_base, target_path);
+        match std::fs::metadata(&absolute_path) {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) => Err(SafeRmError::NotADirectory(target_path.to_path_buf())),
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::NotADirectory => {
+                    Err(SafeRmError::NotADirectory(target_path.to_path_buf()))
+                }
+                std::io::ErrorKind::NotFound => {
+                    Err(SafeRmError::NotFound(target_path.to_path_buf()))
+                }
+                // `ELOOP` や権限不足は「削除してよいか判断できない」ため握りつぶさず伝播する。
+                _ => Err(SafeRmError::IoError(e)),
+            },
+        }
+    }
+
+    /// パスが末尾セパレータで終わるか判定する。
+    ///
+    /// `Path::components()` は末尾セパレータを落とすため、生の `OsStr` の末尾を見る。
+    /// セパレータは ASCII なので、非 UTF-8 パスを `to_string_lossy()` で置換しても
+    /// 判定は狂わない（`.` / `..` operand の判定と同じ方針）。
+    fn has_trailing_separator(path: &Path) -> bool {
+        let raw = path.as_os_str().to_string_lossy();
+        raw.chars().next_back().is_some_and(std::path::is_separator)
+    }
+
     /// 末尾セパレータを除いた最後の成分が `.` / `..` かを判定する。
     ///
     /// `Path::components()` は `foo/.` の末尾 `.` を字句正規化で落として
@@ -1038,5 +1119,137 @@ mod tests {
             "Symlink alias 経由の未作成パスでもプロジェクト内として扱うべき"
         );
         assert_eq!(result.unwrap(), project_root.join("missing.txt"));
+    }
+
+    #[test]
+    fn test_has_trailing_separator() {
+        assert!(PathChecker::has_trailing_separator(Path::new("dir/")));
+        assert!(PathChecker::has_trailing_separator(Path::new("dir//")));
+        assert!(PathChecker::has_trailing_separator(Path::new("/")));
+        assert!(PathChecker::has_trailing_separator(Path::new("/abs/dir/")));
+
+        assert!(!PathChecker::has_trailing_separator(Path::new("dir")));
+        assert!(!PathChecker::has_trailing_separator(Path::new("file.txt")));
+        assert!(!PathChecker::has_trailing_separator(Path::new("")));
+        assert!(!PathChecker::has_trailing_separator(Path::new("a/b")));
+    }
+
+    #[test]
+    fn test_check_trailing_separator_operand_rejects_regular_file() {
+        // `file.txt/` は OS が ENOTDIR にする operand。`clean()` で末尾セパレータが
+        // 落ちて `file.txt` 自体の削除に化けるのを防ぐ（rm 互換の回帰防止）。
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        fs::write(base.join("file.txt"), "data").unwrap();
+
+        assert!(matches!(
+            PathChecker::check_trailing_separator_operand(base, Path::new("file.txt/")),
+            Err(SafeRmError::NotADirectory(_))
+        ));
+        assert!(matches!(
+            PathChecker::check_trailing_separator_operand(base, Path::new("file.txt//")),
+            Err(SafeRmError::NotADirectory(_))
+        ));
+        // 末尾セパレータが無ければ検査対象外（従来どおり通常の削除対象）
+        assert!(PathChecker::check_trailing_separator_operand(base, Path::new("file.txt")).is_ok());
+    }
+
+    #[test]
+    fn test_check_trailing_separator_operand_allows_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        fs::create_dir(base.join("sub")).unwrap();
+
+        assert!(PathChecker::check_trailing_separator_operand(base, Path::new("sub/")).is_ok());
+        assert!(PathChecker::check_trailing_separator_operand(base, Path::new("sub//")).is_ok());
+        assert!(PathChecker::check_trailing_separator_operand(base, Path::new("sub")).is_ok());
+    }
+
+    #[test]
+    fn test_check_trailing_separator_operand_reports_missing_path() {
+        // 存在しない operand は ENOENT。rm と同じく `NotFound`（`-f` で無視）にする。
+        let temp_dir = TempDir::new().unwrap();
+
+        assert!(matches!(
+            PathChecker::check_trailing_separator_operand(temp_dir.path(), Path::new("missing/")),
+            Err(SafeRmError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_check_trailing_separator_operand_symlink_variants() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        fs::create_dir(base.join("realdir")).unwrap();
+        fs::write(base.join("realfile"), "data").unwrap();
+        std::os::unix::fs::symlink(base.join("realdir"), base.join("dirlink")).unwrap();
+        std::os::unix::fs::symlink(base.join("realfile"), base.join("filelink")).unwrap();
+        std::os::unix::fs::symlink(base.join("no_such_target"), base.join("danglink")).unwrap();
+
+        // ディレクトリへの symlink は末尾セパレータ付きでも is_dir に解決できる。
+        // 従来どおり「リンクエントリのみ削除」の挙動を維持する。
+        assert!(PathChecker::check_trailing_separator_operand(base, Path::new("dirlink/")).is_ok());
+        // ファイルへの symlink は ENOTDIR。rm と同じく削除しない。
+        assert!(matches!(
+            PathChecker::check_trailing_separator_operand(base, Path::new("filelink/")),
+            Err(SafeRmError::NotADirectory(_))
+        ));
+        // リンク切れ symlink は ENOENT。ここで止めないと `clean()` 後に
+        // リンクエントリ自体が削除対象になってしまう。
+        assert!(matches!(
+            PathChecker::check_trailing_separator_operand(base, Path::new("danglink/")),
+            Err(SafeRmError::NotFound(_))
+        ));
+        assert!(matches!(
+            PathChecker::check_trailing_separator_operand(base, Path::new("danglink//")),
+            Err(SafeRmError::NotFound(_))
+        ));
+        // 末尾セパレータが無ければリンク切れ symlink 自体の削除は従来どおり許可する
+        assert!(PathChecker::check_trailing_separator_operand(base, Path::new("danglink")).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_check_trailing_separator_operand_symlink_loop_is_propagated() {
+        // 循環 symlink は ELOOP。判断できないため `-f` でも無視しない I/O エラーにする。
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        std::os::unix::fs::symlink(base.join("loop_b"), base.join("loop_a")).unwrap();
+        std::os::unix::fs::symlink(base.join("loop_a"), base.join("loop_b")).unwrap();
+
+        assert!(matches!(
+            PathChecker::check_trailing_separator_operand(base, Path::new("loop_a/")),
+            Err(SafeRmError::IoError(_))
+        ));
+    }
+
+    #[test]
+    fn test_reject_root_operand_blocks_root_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        assert!(matches!(
+            PathChecker::reject_root_operand(base, Path::new("/")),
+            Err(SafeRmError::RootOperand { .. })
+        ));
+        // 連続セパレータや `.` を挟んでも正規化後はルート
+        assert!(PathChecker::reject_root_operand(base, Path::new("//")).is_err());
+        assert!(PathChecker::reject_root_operand(base, Path::new("/.")).is_err());
+        // cwd がルートのとき、相対 operand がルートへ解決されるケース
+        assert!(PathChecker::reject_root_operand(Path::new("/"), Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn test_reject_root_operand_allows_normal_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        assert!(PathChecker::reject_root_operand(base, Path::new("/tmp")).is_ok());
+        assert!(PathChecker::reject_root_operand(base, Path::new("file.txt")).is_ok());
+        assert!(PathChecker::reject_root_operand(base, Path::new("sub/deep.txt")).is_ok());
+        assert!(PathChecker::reject_root_operand(base, Path::new("/a/b/c")).is_ok());
+        // 空 operand は呼び出し元が `NotFound` として扱うためここでは通す
+        assert!(PathChecker::reject_root_operand(base, Path::new("")).is_ok());
     }
 }

@@ -221,6 +221,11 @@ fn process_path(
     // `-f` に先んじて拒否するため、正規化・許可判定より前に評価する。
     PathChecker::reject_dot_or_dotdot_operand(path)?;
 
+    // POSIX の rm は operand がルートディレクトリに解決される場合も何も削除しない
+    // （GNU rm の `--preserve-root` 相当）。cwd が `/` の非 Git 環境では包含検証も
+    // Git メタデータ保護も `/` を通してしまうため、`.` / `..` と同じ位置で拒否する。
+    PathChecker::reject_root_operand(cwd, path)?;
+
     // 絶対パスに変換（相対パスは cwd から解決、git root からではない）
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
@@ -229,6 +234,24 @@ fn process_path(
     };
     PathChecker::reject_symlink_parent_traversal(cwd, path)?;
     PathChecker::reject_dangling_intermediate_symlink(cwd, path)?;
+
+    // `file.txt/` や `danglink/` のように末尾セパレータを付けた operand は、POSIX の
+    // path resolution がディレクトリ要求として扱うため、ディレクトリに解決できなければ
+    // rm も削除しない。safe-rm は直後の `clean()` で末尾セパレータを落とすので、ここで
+    // 検査しないと `file.txt` 自体やリンク切れ symlink のエントリ削除に化けて rm より
+    // 危険側へ倒れる。ENOTDIR / ENOENT は GNU / BSD いずれの rm でも `-f` の無視対象
+    // （nonexistent operand 扱い）なので、`-f` のときだけ黙って無視する。ELOOP や権限
+    // 不足は判断不能なので `-f` でも伝播させる。ディレクトリへの symlink（`link/`）は
+    // `is_dir` として解決できるため、従来どおりリンクエントリ自体の削除として扱われる。
+    if let Err(e) = PathChecker::check_trailing_separator_operand(cwd, path) {
+        let ignorable_with_force =
+            matches!(e, SafeRmError::NotADirectory(_) | SafeRmError::NotFound(_));
+        return if ignorable_with_force && args.force {
+            Ok(false)
+        } else {
+            Err(e)
+        };
+    }
 
     // 字句的に `..` を解決した正規化パス。
     // OS の path resolution は symlink を辿った後で `..` を解決するため、

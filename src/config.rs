@@ -267,12 +267,41 @@ impl Config {
         if path == "~" {
             dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
         } else if let Some(rest) = path.strip_prefix("~/") {
+            // `~//logs` のように `~/` の直後にセパレータが続くと、`rest` が絶対パス
+            // （`/logs`）になり `Path::join()` がホーム側を丸ごと破棄してしまう。
+            // `~//` なら許可パスが `/` になり、ファイルシステム全体が allowed_paths と
+            // して扱われる fail-open になるため、先頭のセパレータを落としてから結合する。
+            let rest = rest.trim_start_matches(std::path::is_separator);
+            // セパレータを落としてもなおルートやドライブ接頭辞が残る形（Windows の
+            // `~//C:/` や `~/C:logs`）は `Path::join()` が同じくホーム側を破棄し、
+            // ドライブ全体が許可対象に化ける。ホーム配下として解釈できない指定なので、
+            // ホームを破棄する結合を行わず元の文字列のまま返す（`dirs::home_dir()` が
+            // `None` のときと同じフォールバック）。返した文字列は後段で
+            // `try_canonicalize()` を通るため、リテラルの `~` を含むディレクトリが
+            // 実在しない限り許可対象にはならない。
+            if Self::has_root_or_prefix_component(Path::new(rest)) {
+                return PathBuf::from(path);
+            }
             dirs::home_dir()
                 .map(|home| home.join(rest))
                 .unwrap_or_else(|| PathBuf::from(path))
         } else {
             PathBuf::from(path)
         }
+    }
+
+    /// パスにルート（`/`）や Windows のドライブ接頭辞（`C:` 等）の成分が含まれるか判定する。
+    ///
+    /// `Path::join()` はこれらを含むパスを結合されると結合元を破棄するため、チルダ展開で
+    /// ホーム配下へ収める前の検査に使う。Unix では `C:` は通常のファイル名成分になるため
+    /// 該当しないが、判定ロジック自体は全プラットフォームでコンパイル・テストできるようにする。
+    fn has_root_or_prefix_component(path: &Path) -> bool {
+        path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_) | std::path::Component::RootDir
+            )
+        })
     }
 
     /// 可能であれば canonicalize する。
@@ -1351,6 +1380,84 @@ recursive = true
         // "~/" 付きの展開結果と整合性がある
         let expanded_with_slash = Config::expand_tilde("~/");
         assert_eq!(expanded_with_slash, home.join(""));
+    }
+
+    #[test]
+    fn test_expand_tilde_collapses_leading_separators() {
+        // `~//` のように `~/` の直後にセパレータが続くと、`rest` が絶対パスになり
+        // `Path::join()` がホーム側を破棄して `/` や `/logs` に化ける。
+        // ホーム配下の許可がファイルシステム全体の許可へ拡大する fail-open の回帰防止。
+        let home = dirs::home_dir().unwrap();
+
+        let double_slash = Config::expand_tilde("~//");
+        assert!(
+            double_slash.starts_with(&home),
+            "`~//` はホーム配下へ解決されるべき: {}",
+            double_slash.display()
+        );
+        assert_ne!(double_slash, PathBuf::from("/"));
+
+        assert_eq!(Config::expand_tilde("~//logs"), home.join("logs"));
+        assert_eq!(Config::expand_tilde("~///deep/dir"), home.join("deep/dir"));
+
+        // 通常の `~/foo` 形式は従来どおり
+        assert_eq!(Config::expand_tilde("~/logs"), home.join("logs"));
+    }
+
+    #[test]
+    fn test_has_root_or_prefix_component() {
+        // `Path::join()` が結合元を破棄する成分（ルート / Windows のドライブ接頭辞）の検出。
+        // Unix では `C:` は通常のファイル名成分になるため、ルート判定だけが真になる。
+        assert!(Config::has_root_or_prefix_component(Path::new("/logs")));
+        assert!(Config::has_root_or_prefix_component(Path::new("/")));
+
+        assert!(!Config::has_root_or_prefix_component(Path::new("logs")));
+        assert!(!Config::has_root_or_prefix_component(Path::new("a/b/c")));
+        assert!(!Config::has_root_or_prefix_component(Path::new("")));
+
+        // Windows のドライブ接頭辞は `Component::Prefix` として検出される
+        #[cfg(windows)]
+        {
+            assert!(Config::has_root_or_prefix_component(Path::new("C:/")));
+            assert!(Config::has_root_or_prefix_component(Path::new("C:logs")));
+        }
+    }
+
+    #[test]
+    fn test_expand_tilde_does_not_drop_home_for_prefixed_rest() {
+        // `~//C:/` のようにセパレータを落としてもドライブ接頭辞やルートが残る指定は、
+        // `Path::join()` がホームを破棄してドライブ全体の許可に化ける。展開せず
+        // 元の文字列のまま返し、どの実パスにもマッチさせない。
+        #[cfg(windows)]
+        {
+            assert_eq!(Config::expand_tilde("~//C:/"), PathBuf::from("~//C:/"));
+            assert_eq!(Config::expand_tilde("~/C:logs"), PathBuf::from("~/C:logs"));
+        }
+
+        // Unix では `C:` は通常のファイル名成分なので、従来どおりホーム配下へ展開する
+        #[cfg(unix)]
+        {
+            let home = dirs::home_dir().unwrap();
+            assert_eq!(Config::expand_tilde("~/C:logs"), home.join("C:logs"));
+        }
+    }
+
+    #[test]
+    fn test_double_slash_tilde_entry_does_not_allow_filesystem_root() {
+        // `path = "~//"` がルート許可に化けると、任意のパスが allowed_paths として
+        // 包含検証と Git ステータスチェックをバイパスできてしまう。
+        let mut config = Config {
+            allow_project_deletion: false,
+            allowed_paths: vec![AllowedPathEntry {
+                path: "~//".to_string(),
+                recursive: true,
+            }],
+            ..Default::default()
+        };
+        config.resolve_allowed_paths();
+
+        assert!(!config.is_path_allowed(Path::new("/etc/hosts")));
+        assert!(!config.is_path_allowed(Path::new("/usr/bin/env")));
     }
 
     #[test]

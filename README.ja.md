@@ -38,6 +38,8 @@
 - **dangling 中間 symlink ガード**: `dangling/child.txt` のように中間コンポーネントが解決不能な symlink のパスは、メタデータ取得前に fail-closed でブロック。末尾の dangling symlink 自体はリンクエントリだけを削除するため引き続き許可
 - **`.` / `..` operand の拒否**: 末尾成分が `.` または `..` の operand（`.`・`./`・`..`・`../`・`sub/.`・`sub/..`・`/abs/path/..`）を拒否。POSIX の rm も同じ operand について診断メッセージを出すだけで一切処理しない。この防御がないと `safe-rm -r .` がカレントディレクトリ自体を、`safe-rm -r ..` が親ディレクトリを削除してしまい、置き換え対象の rm より危険側へ倒れる。判定は正規化・`allowed_paths` 判定・`-f` 処理より前に行うため、許可パスでも force でもバイパスできない。`.hidden`・`...`・`..foo` のような dot で始まる通常のファイル名は従来どおり削除可能。Windows では drive-relative 形式（`C:.` / `C:..`）も拒否
 - **空文字 operand の拒否**: 空文字 operand（`safe-rm ""`）は `cwd.join("")` がカレントディレクトリと等価になるため、`-r ""` でカレントディレクトリ自体が消える。rm と同じく `No such file or directory`（exit 1）として先頭で拒否し、`-f` のときは黙って無視する。`rm -f` と同様に、operand を 1 つも指定しない `safe-rm -f` は設定もカレントディレクトリも参照せずに成功する
+- **ルート operand の拒否**: ルートディレクトリに解決される operand（`/`・`//`・cwd が `/` のときの `.`）を exit 2 で拒否する。POSIX の rm も、既定で有効な GNU rm の `--preserve-root` も同じ operand を処理しない。この拒否がないと、cwd が `/` の非 Git 環境（root 実行のコンテナ等）ではプロジェクトルートが `/` になって包含検証を通過し、Git 管理メタデータ保護も `/` 自体はカバーしないため、`safe-rm -r /` がファイルシステム全体の削除に入り得る。`.` / `..` の判定と同じく allowed_paths 判定や `-f` より前に評価する
+- **末尾セパレータ付き operand の検証**: POSIX では末尾セパレータは「その対象がディレクトリであること」の要求なので、rm はディレクトリとして解決できない operand を削除しない。字句正規化で末尾セパレータが落ちるため、検査しないと `file.txt/` が `file.txt` 自体の削除に、`danglink/`（リンク切れ symlink）がリンクエントリの削除に化ける。正規化前に生 operand を解決し、非ディレクトリなら `Not a directory`、解決できなければ `No such file or directory`（いずれも exit 1、rm と同じく `-f` では黙って無視）を返す。`ELOOP`（循環 symlink）や権限不足は判断不能なので `-f` でも I/O エラーとして伝播させる。ディレクトリへの symlink は引き続きディレクトリとして解決されるため、`link/` は従来どおりリンクエントリのみを削除してリンク先を残す
 - **無視ファイルの許可**: `.gitignore` で指定されたファイル（ビルド成果物など）の削除を許可。ただし `.gitignore` に一致していても `git add -f` で強制追跡された（tracked な）ファイルは、未コミット変更があれば保護される — ignore 判定より先にステータスを解決するため、追跡済みの dirty ファイルが `Ignored` と誤判定されることはない
 - **シンボリックリンク安全なGitチェック**: ディレクトリ symlink は辿らず、リンク自体として判定
 - **非UTF-8パス対応**: Git ステータスキャッシュは生バイト列をキー (`HashMap<Vec<u8>, FileStatus>`) として持ち、`entry.path_bytes()` を直接使うため、非 UTF-8 名のファイルも正しく登録される。これがないと、未追跡ディレクトリ配下の非 UTF-8 未追跡ファイルが `NotInRepo` に落ちて厳格モードでも削除可能になってしまう。`status_should_ignore()` のエラーも握りつぶさずに `Modified` 相当として fail-closed でブロック
@@ -189,7 +191,11 @@ flowchart TB
     EmptyCheck -->|Yes| Exit1["Exit 1 + stderr (-f なら無視)"]
     EmptyCheck -->|No| DotCheck{末尾成分が . または ..?}
     DotCheck -->|Yes| Exit2[Exit 2 + stderr]
-    DotCheck -->|No| ConfigCheck{allowed_paths内?}
+    DotCheck -->|No| RootCheck{ルートディレクトリに解決される?}
+    RootCheck -->|Yes| Exit2
+    RootCheck -->|No| SlashCheck{末尾セパレータがディレクトリに解決される?}
+    SlashCheck -->|No| Exit1
+    SlashCheck -->|Yes| ConfigCheck{allowed_paths内?}
     ConfigCheck -->|Yes| AllowedGitMetaCheck{Git 管理パス?}
     AllowedGitMetaCheck -->|Yes| Exit2
     AllowedGitMetaCheck -->|No| Delete[ファイル削除]
@@ -218,7 +224,9 @@ flowchart TB
 
 8. **`.` / `..` operand の拒否**: 末尾成分が `.` または `..` の operand は、正規化・`allowed_paths` 判定・`-f` 処理より前に exit 2 でブロックする。POSIX の rm も `.` / `..` ディレクトリの削除を拒否するため、これに揃えて「置き換え前の rm より危険」な状態を作らない。削除したいディレクトリは名前で明示する（`safe-rm -r sub`）。`.hidden` や `...` のような dot 始まりのファイル名は影響を受けない
 9. **空文字 operand の拒否**: 空文字 operand は `.` / `..` 判定より前に `No such file or directory`（exit 1）として拒否する。`cwd.join("")` がカレントディレクトリと等価になるため、拒否しないと `-r ""` でカレントディレクトリが消える。`-f` のときは rm と同じく黙って無視する
-10. **対象メタデータの単一取得**: 削除対象の `stat` は 1 回だけ行い、その結果で `allowed_paths` 判定・`-r` の要否・削除方式のすべてを決める。2 回読むと、その間にファイルをディレクトリへ入れ替えることで、「非再帰 allowed エントリの直下ファイル」として許可した対象を配下ごと `remove_dir_all` させられる
+10. **対象メタデータの共有**: `allowed_paths` 判定・`-r` の要否・削除方式は、すべて同一の `symlink_metadata()` 結果を使う。2 回読むと、その間にファイルをディレクトリへ入れ替えることで、「非再帰 allowed エントリの直下ファイル」として許可した対象を配下ごと `remove_dir_all` させられる（後述の末尾セパレータ検証はこれより前に別途 `metadata()` を呼ぶが、生 operand がディレクトリに解決されるかを判定するだけで削除方式には影響しない）
+11. **ルート operand の拒否**: ルートディレクトリに解決される operand（`/`・`//`・cwd が `/` のときの `.`）は exit 2 で拒否する。POSIX の rm も、既定で有効な GNU rm の `--preserve-root` も同じ operand を処理しない。この拒否がないと、cwd が `/` の非 Git 環境（root 実行のコンテナ等）ではプロジェクトルートが `/` になって包含検証を通過し、Git 管理メタデータ保護も `/` 自体はカバーしないため、`safe-rm -r /` がファイルシステム全体の再帰削除に入り得る。`.` / `..` の判定と同じく allowed_paths 判定や `-f` より前に評価する
+12. **末尾セパレータ付き operand の検証**: POSIX では末尾セパレータは「その対象がディレクトリであること」の要求なので、rm はディレクトリとして解決できない operand を削除しない。字句正規化で末尾セパレータが落ちるため、検査しないと `file.txt/` が `file.txt` 自体の削除に、`danglink/`（リンク切れ symlink）がリンクエントリの削除に化ける。正規化前に生 operand を解決し、非ディレクトリなら `Not a directory`、解決できなければ `No such file or directory`（いずれも exit 1、rm と同じく `-f` では黙って無視）を返す。`ELOOP`（循環 symlink）や権限不足は判断不能なので `-f` でも I/O エラーとして伝播させる。ディレクトリへの symlink は引き続きディレクトリとして解決されるため、`link/` は従来どおりリンクエントリのみを削除してリンク先を残す。この検査は dangling 中間 symlink ガードより後に走るため、解決不能な中間 symlink 配下のパス（`dangling/child/`）は従来どおり exit 2 でブロックされ、`-f` でも無視されない
 
 ### ファイルシステムと削除可能スコープ
 
@@ -323,8 +331,8 @@ flowchart TB
 | コード | 意味 | 例 |
 |--------|------|-----|
 | 0 | 成功 | ファイル削除、ドライラン完了 |
-| 1 | 操作エラー | ファイルが見つからない、-rなしでディレクトリ、I/Oエラー、部分的失敗 |
-| 2 | セキュリティブロック | ダーティファイル、プロジェクト外、ディレクトリ読み取りエラー（fail-closed） |
+| 1 | 操作エラー | ファイルが見つからない、-rなしでディレクトリ、非ディレクトリへの末尾セパレータ、I/Oエラー、部分的失敗 |
+| 2 | セキュリティブロック | ダーティファイル、プロジェクト外、`.` / `..` やルート operand、ディレクトリ読み取りエラー（fail-closed） |
 
 ## Claude Code 統合
 
@@ -442,6 +450,17 @@ safe-rm -r .
 safe-rm -r sub/..
 # Exit 2: "末尾が '.' または '..' のパスは削除できません"
 # 代わりにディレクトリ名を明示する: safe-rm -r sub
+
+# ルート operand（GNU rm も --preserve-root で拒否する形式）
+safe-rm -r /
+# Exit 2: "ルートディレクトリは削除できません"
+
+# ディレクトリではない対象への末尾セパレータ
+safe-rm file.txt/
+# Exit 1: "cannot remove 'file.txt/': Not a directory"
+safe-rm broken-link/
+# Exit 1: "cannot remove 'broken-link/': No such file or directory"
+# エントリ自体を消すなら末尾スラッシュを外す: safe-rm file.txt
 ```
 
 ## 開発
@@ -464,8 +483,8 @@ CI は Rust 1.87.0 で最小サポートバージョンを検証し、テスト�
 
 ### テストカバレッジ
 
-- **ユニットテスト**: ライブラリ293件 + バイナリ28件のテストで全モジュールをカバー（CLI、config、error、path_checker、git_checker、init）。Git API エラー時の fail-closed 検証、Git 管理メタデータの再帰探索エラー時の fail-closed 検証、worktree の canonicalize エラーと対象 metadata 種別判定エラーの伝播、`.git` と `.GIT` メタデータディレクトリの再帰検出、`convert_status()` が `WT_UNREADABLE` と未知のステータスフラグを `Modified` に倒し空ビット（`CURRENT`）のときだけ `Clean` を返す検証、`check_path_with_cache()` がディスク上に存在しない未コミットの削除（配下の `git rm` 済み=staged ファイルや worktree から削除済みの tracked ファイル）を含むディレクトリをブロックし、prefix が重なる別ディレクトリ（`dir` vs `dir2`）では誤ブロックしない検証、strict モードで対象を含む最も深い Git workdir を選択する検証、壊れた `.git` や読み取り不可の探索対象で `GitChecker::open()` が `Err(GitError)` を返し permissive 経路へ抜けないこと（`.git` 痕跡がなく、祖先確認にも成功した場合のみ `Ok(None)`）、`Config::load_from_path()` のフェイルクローズ検証（`read_to_string()` の結果で分岐し、設定位置不明・その他の I/O エラー・TOML パース失敗・最終または中間コンポーネントが dangling symlink の設定パスは strict モードへフォールバック、本当に存在しない場合と解決可能な symlink 配下の未作成 config のみ permissive を維持）、`link/child/../../victim` のようなネストした symlink 経由の `..` 親ディレクトリ参照拒否、dangling 中間 symlink のブロックと末尾 dangling symlink 自身の削除許可、`FileStatus::is_deletable()` 検証、未知の設定キーを拒否する検証、Unix における `SAFE_RM_CONFIG` の非 UTF-8 パス対応、キャッシュフォールバック動作、空リポジトリ対応、壊れた symlink 検出、複数ステータスの一括取得、キャッシュ使用時の ignored サブディレクトリチェック、`Status::CONFLICTED` を `Modified` にマッピングする検証（単独フラグおよび他フラグとの組み合わせ）、`touches_git_metadata_path`/`is_git_metadata_path` が現在のリポジトリの `.git` を指す symlink 自身の削除を許可しつつ symlink 経由のアクセスはブロックする検証、中間 symlink 経由の `.git`/bare リポジトリバイパス検出（symlink 配下の管理ファイルはブロック、symlink 自身の削除は許可）、`config` 破損で `Repository::open_bare()` が失敗する bare リポジトリを構造マーカーで検出する検証（`HEAD` が未作成 ref を指す symlink のケースを含む）、許可ディレクトリ内から許可範囲外を指す symlink を拒否する検証、`resolve_target_metadata()` が渡されたメタデータだけで判定しパスを stat し直さない検証（allowed_paths 判定と削除方式の判定が食い違わないことの保証）、空の `SAFE_RM_CONFIG` が設定位置なしとして strict モードへフォールバックする検証、空の `allowed_paths` エントリを 3 層で拒否する検証（TOML 解析エラー・`resolve_allowed_paths()` での除外・`path_matches_allowed_entry()` での拒否）により手組みの `Config` でも全パス許可にならないことを含む
-- **統合テスト**: 実際のGitリポジトリを使用した180件のテスト（許可/ブロックフロー、厳格モード、シンボリックリンク、repo symlink 別名の cwd からの相対実行を含むエイリアスパス対策、バッチ処理、ドライラン厳格モード、特殊ファイル名、forceフラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト、strict mode + force フラグの複合テスト、`..` コンポーネントを含む相対パス検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、設定ファイル読込/パースエラー時の strict モードフォールバック検証（読めない・壊れた・未知キーを含む config は permissive default に倒れず未追跡削除をブロックする）、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース、壊れた symlink のデフォルト/厳格モード対応、空リポジトリ厳格モード、バッチ force フラグ複合、allowed_paths ドライラン注釈、symlink 経由の `..` 親ディレクトリ参照拒否、dangling 中間 symlink のブロック、live 中間 symlink の包含ブロック、再帰削除時の `.GIT` メタデータブロック、中間 symlink で `.git`/bare リポジトリ配下を指す削除のブロック、プロジェクト外の symlink がプロジェクト内を指す場合の包含ブロック、`config` 破損で `Repository::open_bare()` が失敗する bare リポジトリでも HEAD 削除と全体再帰削除をブロックすること、厳格モードで配下に staged/worktree の削除を含むディレクトリの `-r` 削除をブロックすること（別ディレクトリの削除では clean なディレクトリの削除を阻害しない）、設定パスが最終・中間コンポーネントの dangling symlink のとき strict モードへフォールバックすること、allowed_paths 境界をまたぐ symlink の双方向（許可内から外を指すリンク、許可外から内を指すリンク）をいずれも削除せずブロックすること、`.` / `..` operand の拒否（非 Git ツリーで `-r .` がカレントディレクトリを消さないこと、Git リポジトリの孫ディレクトリからの `-r ..` が親を消さないこと、`-rf .` の force がバイパスにならないこと、`-r sub/..` で allowed_paths ディレクトリ全体を消せないこと、`.hidden` / `...` のような dot 始まりのファイル名は削除できること、`-r sub` のようなディレクトリ名の明示指定は従来どおり削除できること）、空文字 operand の扱い（`-r ""` が exit 1 の `No such file or directory` でカレントディレクトリを削除しないこと、`-r -f ""` が exit 0 で黙って無視すること）、operand なしの `-f` が設定を読まずに成功すること、空の `SAFE_RM_CONFIG` が strict モードへフォールバックすること、空の `allowed_paths` エントリが解析エラーとなりプロジェクト境界をバイパスしないこと）
+- **ユニットテスト**: ライブラリ307件 + バイナリ28件のテストで全モジュールをカバー（CLI、config、error、path_checker、git_checker、init）。Git API エラー時の fail-closed 検証、Git 管理メタデータの再帰探索エラー時の fail-closed 検証、worktree の canonicalize エラーと対象 metadata 種別判定エラーの伝播、`.git` と `.GIT` メタデータディレクトリの再帰検出、`convert_status()` が `WT_UNREADABLE` と未知のステータスフラグを `Modified` に倒し空ビット（`CURRENT`）のときだけ `Clean` を返す検証、`check_path_with_cache()` がディスク上に存在しない未コミットの削除（配下の `git rm` 済み=staged ファイルや worktree から削除済みの tracked ファイル）を含むディレクトリをブロックし、prefix が重なる別ディレクトリ（`dir` vs `dir2`）では誤ブロックしない検証、strict モードで対象を含む最も深い Git workdir を選択する検証、壊れた `.git` や読み取り不可の探索対象で `GitChecker::open()` が `Err(GitError)` を返し permissive 経路へ抜けないこと（`.git` 痕跡がなく、祖先確認にも成功した場合のみ `Ok(None)`）、`Config::load_from_path()` のフェイルクローズ検証（`read_to_string()` の結果で分岐し、設定位置不明・その他の I/O エラー・TOML パース失敗・最終または中間コンポーネントが dangling symlink の設定パスは strict モードへフォールバック、本当に存在しない場合と解決可能な symlink 配下の未作成 config のみ permissive を維持）、`link/child/../../victim` のようなネストした symlink 経由の `..` 親ディレクトリ参照拒否、dangling 中間 symlink のブロックと末尾 dangling symlink 自身の削除許可、`FileStatus::is_deletable()` 検証、未知の設定キーを拒否する検証、Unix における `SAFE_RM_CONFIG` の非 UTF-8 パス対応、キャッシュフォールバック動作、空リポジトリ対応、壊れた symlink 検出、複数ステータスの一括取得、キャッシュ使用時の ignored サブディレクトリチェック、`Status::CONFLICTED` を `Modified` にマッピングする検証（単独フラグおよび他フラグとの組み合わせ）、`touches_git_metadata_path`/`is_git_metadata_path` が現在のリポジトリの `.git` を指す symlink 自身の削除を許可しつつ symlink 経由のアクセスはブロックする検証、中間 symlink 経由の `.git`/bare リポジトリバイパス検出（symlink 配下の管理ファイルはブロック、symlink 自身の削除は許可）、`config` 破損で `Repository::open_bare()` が失敗する bare リポジトリを構造マーカーで検出する検証（`HEAD` が未作成 ref を指す symlink のケースを含む）、許可ディレクトリ内から許可範囲外を指す symlink を拒否する検証、`resolve_target_metadata()` が渡されたメタデータだけで判定しパスを stat し直さない検証（allowed_paths 判定と削除方式の判定が食い違わないことの保証）、空の `SAFE_RM_CONFIG` が設定位置なしとして strict モードへフォールバックする検証、空の `allowed_paths` エントリを 3 層で拒否する検証（TOML 解析エラー・`resolve_allowed_paths()` での除外・`path_matches_allowed_entry()` での拒否）により手組みの `Config` でも全パス許可にならないこと、チルダ展開が連続セパレータ（`~//`・`~//logs`・`~///deep/dir`）を畳んでホーム配下の許可がファイルシステム全体へ広がらないこと、セパレータを落としてもルートやドライブ接頭辞が残る指定（Windows の `~//C:/`・`~/C:logs`）は展開しないこと、`reject_root_operand()` が `/`・`//`・`/.` と cwd が `/` のときの `.` を拒否しつつ通常パスと空 operand は通すこと、`check_trailing_separator_operand()` が通常ファイルとファイルへの symlink を `Not a directory`、存在しないパスとリンク切れ symlink を `No such file or directory`、循環 symlink を I/O エラーとして返し、ディレクトリとディレクトリへの symlink は通すことを含む
+- **統合テスト**: 実際のGitリポジトリを使用した192件のテスト（許可/ブロックフロー、厳格モード、シンボリックリンク、repo symlink 別名の cwd からの相対実行を含むエイリアスパス対策、バッチ処理、ドライラン厳格モード、特殊ファイル名、forceフラグとダーティファイルの複合ケース、ネスト未追跡ディレクトリのブロック、ドライラン+フォース複合、空ディレクトリ処理、バッチセキュリティエラー優先、設定の複合テスト、strict mode + force フラグの複合テスト、`..` コンポーネントを含む相対パス検証、バッチ全ダーティの終了コード検証、allowed_paths ディレクトリ自体の削除挙動検証、2パスバッチの終了コード優先度検証、symlink-to-directory の非再帰削除、Git index 破損時の fail-closed 検証、設定ファイル読込/パースエラー時の strict モードフォールバック検証（読めない・壊れた・未知キーを含む config は permissive default に倒れず未追跡削除をブロックする）、3パスバッチの終了コード優先度検証、ドライランのファイルシステム非変更保証、設定ファイルのエッジケース、壊れた symlink のデフォルト/厳格モード対応、空リポジトリ厳格モード、バッチ force フラグ複合、allowed_paths ドライラン注釈、symlink 経由の `..` 親ディレクトリ参照拒否、dangling 中間 symlink のブロック、live 中間 symlink の包含ブロック、再帰削除時の `.GIT` メタデータブロック、中間 symlink で `.git`/bare リポジトリ配下を指す削除のブロック、プロジェクト外の symlink がプロジェクト内を指す場合の包含ブロック、`config` 破損で `Repository::open_bare()` が失敗する bare リポジトリでも HEAD 削除と全体再帰削除をブロックすること、厳格モードで配下に staged/worktree の削除を含むディレクトリの `-r` 削除をブロックすること（別ディレクトリの削除では clean なディレクトリの削除を阻害しない）、設定パスが最終・中間コンポーネントの dangling symlink のとき strict モードへフォールバックすること、allowed_paths 境界をまたぐ symlink の双方向（許可内から外を指すリンク、許可外から内を指すリンク）をいずれも削除せずブロックすること、`.` / `..` operand の拒否（非 Git ツリーで `-r .` がカレントディレクトリを消さないこと、Git リポジトリの孫ディレクトリからの `-r ..` が親を消さないこと、`-rf .` の force がバイパスにならないこと、`-r sub/..` で allowed_paths ディレクトリ全体を消せないこと、`.hidden` / `...` のような dot 始まりのファイル名は削除できること、`-r sub` のようなディレクトリ名の明示指定は従来どおり削除できること）、空文字 operand の扱い（`-r ""` が exit 1 の `No such file or directory` でカレントディレクトリを削除しないこと、`-r -f ""` が exit 0 で黙って無視すること）、operand なしの `-f` が設定を読まずに成功すること、空の `SAFE_RM_CONFIG` が strict モードへフォールバックすること、空の `allowed_paths` エントリが解析エラーとなりプロジェクト境界をバイパスしないこと、ルート operand の拒否（cwd が `/` のとき `-n -r /` が exit 2 になり削除対象として列挙もされないこと、`//` も同様に拒否されること）、末尾セパレータ付き operand の扱い（`clean.txt/` が exit 1 の `Not a directory`・`-f clean.txt//` が exit 0 でいずれもファイルを残すこと、`link_to_file/` がリンクもリンク先も残すこと、`danglink/` が exit 1 の `No such file or directory`・`-f danglink/` が exit 0 でいずれもリンクを残す一方、末尾スラッシュ無しの `danglink` は従来どおり削除できること、allowed_paths 配下でも `file.txt/` が拒否されること）、`~//` の allowed_paths エントリがプロジェクト外のファイルを許可しないこと）
 
 - **プロジェクト構成テスト**: 1件の回帰テストで、ローカルの `release` ターゲットが `cargo build --locked --release` を維持し、`make release` と `make install` が依存解決を暗黙に書き換えないことを検証
 

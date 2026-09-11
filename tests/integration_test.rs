@@ -1083,6 +1083,51 @@ mod edge_case_tests {
     }
 
     #[test]
+    fn test_root_operand_is_rejected_from_root_cwd() {
+        // cwd が `/` の非 Git 環境（root 実行のコンテナ等）では、包含検証は
+        // project_root = `/` として通り、Git メタデータ保護も `/` 自体は素通りする。
+        // POSIX rm / GNU rm の --preserve-root と同じく operand 段階で拒否すること。
+        // 実削除に至らないよう dry-run で検証する（拒否は dry-run 判定より前に行われる）。
+        let (exit_code, stdout, stderr) =
+            run_safe_rm(&["-n", "-r", "/"], std::path::Path::new("/"));
+
+        assert_eq!(
+            exit_code, 2,
+            "ルート operand はセキュリティブロックとして拒否するべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("ルートディレクトリ"),
+            "ルート operand の拒否理由を表示すべき: {}",
+            stderr
+        );
+        assert!(
+            !stdout.contains("would remove"),
+            "ルート operand を削除対象として扱ってはならない: {}",
+            stdout
+        );
+    }
+
+    #[test]
+    fn test_root_operand_with_double_slash_is_rejected() {
+        // `//` も正規化後はルート。連続セパレータで拒否を回避できないこと。
+        let temp_dir = TempDir::new().unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&["-n", "-r", "//"], temp_dir.path());
+
+        assert_eq!(
+            exit_code, 2,
+            "`//` もルート operand として拒否するべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            !stdout.contains("would remove"),
+            "ルート operand を削除対象として扱ってはならない: {}",
+            stdout
+        );
+    }
+
+    #[test]
     fn test_force_ignores_empty_operand_without_deleting_current_directory() {
         let temp_dir = TempDir::new().unwrap();
         let project_path = temp_dir.path();
@@ -4643,6 +4688,324 @@ mod symlink_to_directory_no_recursive_tests {
         assert!(
             target_dir.join("inner.txt").exists(),
             "リンク先ディレクトリ内のファイルも残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_trailing_slash_on_regular_file_is_rejected() {
+        // POSIX では `file/` はディレクトリ要求なので OS が ENOTDIR にし、rm も削除しない。
+        // safe-rm は字句正規化で末尾セパレータを落とすため、検査しないと `file` 自体の
+        // 削除に化けて rm より危険側へ倒れる（回帰防止）。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "clean.txt", "content");
+
+        let (exit_code, _, stderr) = run_safe_rm(&["clean.txt/"], &repo_path);
+
+        assert_eq!(
+            exit_code, 1,
+            "末尾スラッシュ付きの通常ファイルは rm と同じく操作エラーになるべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("Not a directory"),
+            "rm と同じ診断メッセージを出すべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("clean.txt").exists(),
+            "拒否された operand のファイルは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_force_ignores_trailing_slash_on_regular_file() {
+        // ENOTDIR は GNU / BSD いずれの rm でも `-f` の無視対象。黙って成功しつつ、
+        // ファイルは削除しない。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "clean.txt", "content");
+
+        let (exit_code, _, stderr) = run_safe_rm(&["-f", "clean.txt//"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "`-f` では診断を出さず成功扱いにするべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("clean.txt").exists(),
+            "`-f` でもファイルを削除してはならない"
+        );
+    }
+
+    #[test]
+    fn test_trailing_slash_on_symlink_to_file_is_rejected() {
+        // ファイルへの symlink に末尾スラッシュを付けると OS は ENOTDIR にする。
+        // ディレクトリへの symlink（リンクのみ削除）とは扱いが分かれる。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "target.txt", "content");
+
+        let link_path = repo_path.join("link_to_file");
+        std::os::unix::fs::symlink(repo_path.join("target.txt"), &link_path).unwrap();
+        std::process::Command::new("git")
+            .args(["add", "link_to_file"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "Add symlink"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm(&["link_to_file/"], &repo_path);
+
+        assert_eq!(
+            exit_code, 1,
+            "ファイルへの symlink + 末尾スラッシュは ENOTDIR 相当で拒否するべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            link_path.symlink_metadata().is_ok(),
+            "拒否された operand の symlink は残っているべき"
+        );
+        assert!(
+            repo_path.join("target.txt").exists(),
+            "リンク先のファイルも残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_trailing_slash_on_dangling_symlink_is_rejected() {
+        // リンク切れ symlink に末尾スラッシュを付けると OS は ENOENT にする（rm も削除しない）。
+        // ここで止めないと `clean()` で末尾セパレータが落ちた後、リンクエントリ自体が
+        // 削除対象になってしまう。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "dummy.txt", "content");
+
+        let link_path = repo_path.join("danglink");
+        std::os::unix::fs::symlink(repo_path.join("no_such_target"), &link_path).unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm(&["danglink/"], &repo_path);
+
+        assert_eq!(
+            exit_code, 1,
+            "リンク切れ symlink + 末尾スラッシュは ENOENT 相当で拒否するべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("No such file or directory"),
+            "rm と同じ診断メッセージを出すべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            link_path.symlink_metadata().is_ok(),
+            "拒否された operand の symlink は残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_force_ignores_trailing_slash_on_dangling_symlink() {
+        // `-f` は ENOENT を無視するだけで、リンクエントリを削除してはならない。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "dummy.txt", "content");
+
+        let link_path = repo_path.join("danglink");
+        std::os::unix::fs::symlink(repo_path.join("no_such_target"), &link_path).unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&["-f", "danglink/"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "`-f` では診断を出さず成功扱いにするべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            stdout.is_empty(),
+            "無視した operand を削除済みと表示しないこと: {}",
+            stdout
+        );
+        assert!(
+            stderr.is_empty(),
+            "`-f` では診断メッセージを出さないこと: {}",
+            stderr
+        );
+        assert!(
+            link_path.symlink_metadata().is_ok(),
+            "`-f` でもリンクエントリを削除してはならない"
+        );
+    }
+
+    #[test]
+    fn test_dry_run_does_not_list_trailing_slash_on_dangling_symlink() {
+        // ドライランでも「削除対象」として扱われないこと。`-n` 単体は exit 1、
+        // `-n -f` は exit 0 で、いずれも `would remove` を出さずリンクを残す。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "dummy.txt", "content");
+
+        let link_path = repo_path.join("danglink");
+        std::os::unix::fs::symlink(repo_path.join("no_such_target"), &link_path).unwrap();
+
+        let (exit_code, stdout, _) = run_safe_rm(&["-n", "danglink/"], &repo_path);
+        assert_eq!(exit_code, 1, "ドライランでも拒否されるべき");
+        assert!(
+            !stdout.contains("would remove"),
+            "削除対象として列挙してはならない: {}",
+            stdout
+        );
+
+        let (exit_code, stdout, _) = run_safe_rm(&["-n", "-f", "danglink/"], &repo_path);
+        assert_eq!(exit_code, 0, "`-f` 併用のドライランは成功扱い");
+        assert!(
+            !stdout.contains("would remove"),
+            "無視した operand を列挙してはならない: {}",
+            stdout
+        );
+
+        assert!(
+            link_path.symlink_metadata().is_ok(),
+            "ドライランでリンクを削除してはならない"
+        );
+    }
+
+    #[test]
+    fn test_trailing_slash_on_symlink_loop_is_not_ignored_by_force() {
+        // 循環 symlink は ELOOP。削除可否を判断できないため `-f` でも無視せず
+        // I/O エラー（exit 1）で止め、リンクを残す。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "dummy.txt", "content");
+
+        let loop_a = repo_path.join("loop_a");
+        let loop_b = repo_path.join("loop_b");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+
+        let (exit_code, stdout, stderr) = run_safe_rm(&["-f", "loop_a/"], &repo_path);
+
+        assert_eq!(
+            exit_code, 1,
+            "`-f` でも循環 symlink の解決失敗を握りつぶしてはならない。stderr: {}",
+            stderr
+        );
+        assert!(
+            !stdout.contains("removed"),
+            "削除成功として表示してはならない: {}",
+            stdout
+        );
+        assert!(
+            loop_a.symlink_metadata().is_ok() && loop_b.symlink_metadata().is_ok(),
+            "リンクエントリは両方とも残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_trailing_slash_on_dangling_symlink_without_slash_still_removable() {
+        // 末尾スラッシュが無ければ、リンク切れ symlink 自体の削除は従来どおり許可する。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+
+        commit_file(&repo_path, "dummy.txt", "content");
+
+        let link_path = repo_path.join("danglink");
+        std::os::unix::fs::symlink(repo_path.join("no_such_target"), &link_path).unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm(&["danglink"], &repo_path);
+
+        assert_eq!(
+            exit_code, 0,
+            "末尾スラッシュ無しのリンク切れ symlink は従来どおり削除できるべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            link_path.symlink_metadata().is_err(),
+            "symlink 自体は削除されているべき"
+        );
+    }
+
+    #[test]
+    fn test_trailing_slash_rejected_even_inside_allowed_paths() {
+        // allowed_paths は包含検証と Git チェックをバイパスするが、末尾セパレータの
+        // 検査はその前段で行うため、許可ディレクトリ配下でも `file/` は削除されない。
+        let allowed_dir = TempDir::new().unwrap();
+        let allowed = allowed_dir.path().canonicalize().unwrap();
+        let file = allowed.join("file.txt");
+        fs::write(&file, "data").unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            config.path(),
+            format!(
+                "[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n",
+                allowed.display()
+            ),
+        )
+        .unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["file.txt/"], &allowed, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 1,
+            "allowed_paths 配下でも末尾スラッシュ付き通常ファイルは拒否するべき。stderr: {}",
+            stderr
+        );
+        assert!(
+            file.exists(),
+            "拒否された operand のファイルは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_double_slash_tilde_allowed_path_does_not_bypass_project_boundary() {
+        // `path = "~//"` は `Path::join()` の仕様でホーム側が破棄され、許可パスが `/`
+        // に化け得る。ファイルシステム全体が allowed_paths になると、プロジェクト外の
+        // 削除が包含検証も Git チェックも通らず素通りする（回帰防止）。
+        let outside_dir = TempDir::new().unwrap();
+        let outside = outside_dir.path().canonicalize().unwrap();
+        let victim = outside.join("victim.txt");
+        fs::write(&victim, "data").unwrap();
+
+        // TMPDIR がホーム配下にある環境では `~//` の許可範囲に実際に入るため検証不能。
+        if let Some(home) = std::env::var_os("HOME") {
+            if victim.starts_with(std::path::Path::new(&home)) {
+                return;
+            }
+        }
+
+        let cwd_dir = TempDir::new().unwrap();
+        let cwd = cwd_dir.path().canonicalize().unwrap();
+
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            config.path(),
+            "[[allowed_paths]]\npath = \"~//\"\nrecursive = true\n",
+        )
+        .unwrap();
+
+        let (exit_code, stdout, _) =
+            run_safe_rm_with_config(&[victim.to_str().unwrap()], &cwd, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "`~//` がルート許可に化けてはならない。stdout: {}",
+            stdout
+        );
+        assert!(
+            victim.exists(),
+            "プロジェクト外のファイルが削除されてはならない"
         );
     }
 }

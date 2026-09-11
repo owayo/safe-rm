@@ -53,6 +53,8 @@ pub enum SafeRmError {
     NotFound(PathBuf),
     /// ディレクトリに -r フラグなし
     IsDirectory(PathBuf),
+    /// 末尾セパレータ付き operand が非ディレクトリを指している（OS の `ENOTDIR` 相当）
+    NotADirectory(PathBuf),
     /// 部分的な失敗（dry_run=true の場合は実削除ではないため表示文言を変える）
     PartialFailure {
         success: usize,
@@ -73,6 +75,8 @@ pub enum SafeRmError {
     DanglingIntermediateSymlink { path: PathBuf, symlink: PathBuf },
     /// 末尾成分が `.` / `..` の operand（POSIX rm が拒否する形式）
     DotOrDotDotOperand { path: PathBuf },
+    /// ルートディレクトリを指す operand（POSIX rm が拒否する形式）
+    RootOperand { path: PathBuf },
     /// Git 管理メタデータへのアクセス
     ProtectedGitPath { path: PathBuf },
     /// プロジェクト外へのアクセス
@@ -101,11 +105,15 @@ impl SafeRmError {
             | Self::UnsafeTraversal { .. }
             | Self::DanglingIntermediateSymlink { .. }
             | Self::DotOrDotDotOperand { .. }
+            | Self::RootOperand { .. }
             | Self::ProtectedGitPath { .. }
             | Self::OutsideProject { .. }
             | Self::DirtyFiles { .. } => 2,
             // ファイル操作エラー
-            Self::NotFound(_) | Self::IsDirectory(_) | Self::PartialFailure { .. } => 1,
+            Self::NotFound(_)
+            | Self::IsDirectory(_)
+            | Self::NotADirectory(_)
+            | Self::PartialFailure { .. } => 1,
             // その他のエラー
             _ => 1,
         }
@@ -125,6 +133,9 @@ impl SafeRmError {
                     "cannot remove '{}': Is a directory (use -r for recursive)",
                     path.display()
                 )
+            }
+            Self::NotADirectory(path) => {
+                format!("cannot remove '{}': Not a directory", path.display())
             }
             Self::PartialFailure {
                 success,
@@ -172,6 +183,12 @@ impl SafeRmError {
             Self::DotOrDotDotOperand { path } => {
                 format!(
                     "末尾が '.' または '..' のパスは削除できません。\nPath: {}\nPOSIX の rm も同じ operand を拒否します。削除したいディレクトリ名を明示的に指定してください。",
+                    path.display()
+                )
+            }
+            Self::RootOperand { path } => {
+                format!(
+                    "ルートディレクトリは削除できません。\nPath: {}\nPOSIX の rm も同じ operand を拒否します（GNU rm の --preserve-root 相当）。削除したい対象を個別に指定してください。",
                     path.display()
                 )
             }
@@ -294,6 +311,10 @@ mod tests {
             1
         );
         assert_eq!(
+            SafeRmError::NotADirectory(PathBuf::from("./file.txt/")).exit_code(),
+            1
+        );
+        assert_eq!(
             SafeRmError::PartialFailure {
                 success: 2,
                 failed: 1,
@@ -319,6 +340,26 @@ mod tests {
         assert!(msg.contains("mydir"));
         assert!(msg.contains("Is a directory"));
         assert!(msg.contains("-r"));
+    }
+
+    #[test]
+    fn test_root_operand_exit_code_and_message() {
+        let err = SafeRmError::RootOperand {
+            path: PathBuf::from("/"),
+        };
+        assert_eq!(err.exit_code(), 2);
+        let msg = err.user_message();
+        assert!(msg.contains("ルートディレクトリ"));
+        assert!(msg.contains("Path: /"));
+    }
+
+    #[test]
+    fn test_user_message_not_a_directory() {
+        // 末尾セパレータ付きの生 operand をそのまま見せて、rm と同じ診断に揃える。
+        let err = SafeRmError::NotADirectory(PathBuf::from("./file.txt/"));
+        let msg = err.user_message();
+        assert!(msg.contains("./file.txt/"));
+        assert!(msg.contains("Not a directory"));
     }
 
     #[test]
