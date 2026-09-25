@@ -4979,10 +4979,10 @@ mod symlink_to_directory_no_recursive_tests {
         fs::write(&victim, "data").unwrap();
 
         // TMPDIR がホーム配下にある環境では `~//` の許可範囲に実際に入るため検証不能。
-        if let Some(home) = std::env::var_os("HOME") {
-            if victim.starts_with(std::path::Path::new(&home)) {
-                return;
-            }
+        if let Some(home) = std::env::var_os("HOME")
+            && victim.starts_with(std::path::Path::new(&home))
+        {
+            return;
         }
 
         let cwd_dir = TempDir::new().unwrap();

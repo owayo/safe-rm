@@ -343,16 +343,16 @@ impl GitChecker {
     /// macOS の /var→/private/var 等のエイリアス差異を吸収する。
     fn to_workdir_relative(&self, path: &Path) -> Option<PathBuf> {
         // canonicalize 済みワークディレクトリで試行
-        if let Some(canonical) = &self.workdir_canonical {
-            if let Ok(rel) = path.strip_prefix(canonical) {
-                return Some(rel.to_path_buf());
-            }
+        if let Some(canonical) = &self.workdir_canonical
+            && let Ok(rel) = path.strip_prefix(canonical)
+        {
+            return Some(rel.to_path_buf());
         }
         // フォールバック: 未解決ワークディレクトリで試行
-        if let Some(raw) = self.repo.workdir() {
-            if let Ok(rel) = path.strip_prefix(raw) {
-                return Some(rel.to_path_buf());
-            }
+        if let Some(raw) = self.repo.workdir()
+            && let Ok(rel) = path.strip_prefix(raw)
+        {
+            return Some(rel.to_path_buf());
         }
         None
     }

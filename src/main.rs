@@ -542,12 +542,12 @@ fn ensure_git_metadata_not_targeted(
     }
 
     // 現在のリポジトリの Git 管理メタデータも保護する。
-    if let Some(checker) = git_checker {
-        if checker.touches_git_metadata_path(normalized_path) {
-            return Err(SafeRmError::ProtectedGitPath {
-                path: original_path.to_path_buf(),
-            });
-        }
+    if let Some(checker) = git_checker
+        && checker.touches_git_metadata_path(normalized_path)
+    {
+        return Err(SafeRmError::ProtectedGitPath {
+            path: original_path.to_path_buf(),
+        });
     }
 
     Ok(())
