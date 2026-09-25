@@ -3,11 +3,11 @@ name = "safe-rm"
 version = "26.5.101"
 edition = "2024"
 rust-version = "1.98"
-authors = ["owayo <yoheiowa@gmail.com>"]
+authors = ["owayo"]
 description = "Secure deletion proxy for Claude Code PreToolUse hooks with spatial containment and VCS safety"
 license = "MIT"
 repository = "https://github.com/owayo/safe-rm"
-keywords = ["rm", "delete", "safety", "ai", "agent", "claude"]
+keywords = ["rm", "delete", "safety", "ai", "claude"]
 categories = ["command-line-utilities"]
 
 [lib]
@@ -42,4 +42,5 @@ tempfile = "3.27.0"
 
 [profile.release]
 lto = true
+codegen-units = 1
 strip = true
