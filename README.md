@@ -1,31 +1,34 @@
 <h1 align="center">safe-rm</h1>
 
 <p align="center">
-  <strong>Secure file deletion CLI for AI agents with Git-aware protection</strong>
+  Secure file deletion CLI for AI agents with Git-aware protection
+</p>
+
+<!-- standard:badges:start -->
+<h3 align="center">Supported Platforms</h3>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&amp;logoColor=black" alt="Linux">
+  <img src="https://img.shields.io/badge/macOS-000000?logo=apple&amp;logoColor=white" alt="macOS">
 </p>
 
 <p align="center">
-  <a href="https://github.com/owayo/safe-rm/actions/workflows/ci.yml">
-    <img alt="CI" src="https://github.com/owayo/safe-rm/actions/workflows/ci.yml/badge.svg?branch=main">
-  </a>
-  <a href="https://github.com/owayo/safe-rm/releases/latest">
-    <img alt="Version" src="https://img.shields.io/github/v/release/owayo/safe-rm">
-  </a>
-  <a href="LICENSE">
-    <img alt="License" src="https://img.shields.io/github/license/owayo/safe-rm">
-  </a>
+  <a href="https://github.com/owayo/safe-rm/actions/workflows/ci.yml"><img src="https://github.com/owayo/safe-rm/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/owayo/safe-rm/releases/latest"><img src="https://img.shields.io/github/v/release/owayo/safe-rm" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/owayo/safe-rm" alt="License"></a>
 </p>
 
 <p align="center">
   <a href="README.md">English</a> |
   <a href="README.ja.md">日本語</a>
 </p>
+<!-- standard:badges:end -->
 
 ---
 
-## Overview
-
 `safe-rm` is a CLI tool that prevents AI agents from accidentally deleting files outside the project or critical Git metadata. By default it enforces project containment and blocks Git administrative paths such as `.git`. In **strict mode** (`allow_project_deletion = false`), it also enforces Git-aware access control and blocks deletion of modified, staged, or untracked files.
+
+It is meant to stand in for `rm` in AI agents such as Claude Code: a `PreToolUse` hook rejects `rm` and `rmdir` in Bash tool calls and tells the agent to use `safe-rm` instead (see [Claude Code Integration](#claude-code-integration)).
 
 ## Features
 
@@ -49,22 +52,45 @@
 - **Dry Run Mode**: Preview what would be deleted without actually deleting
 - **Deterministic Error Output**: Single-path failures emit one stderr block, while batch runs emit one error per failed path without duplicating the same message
 
-## Requirements
-
-- **OS**: macOS, Linux
-- **Rust**: 1.87+ (for building from source)
+How the checks fit together (check order, safety layers, and what each mode can delete): [docs/architecture.md](docs/architecture.md)
 
 ## Installation
 
-### From Source
+<!-- standard:install:start -->
+### Cargo
+
+Requires Rust 1.98 or later.
 
 ```bash
-cargo install --path .
+cargo install --git https://github.com/owayo/safe-rm --locked
 ```
 
-### Binary Download
+### From GitHub Releases
 
-Download the latest release from [Releases](https://github.com/owayo/safe-rm/releases).
+Download the archive for your platform from [Releases](https://github.com/owayo/safe-rm/releases/latest), extract it, and put `safe-rm` on your `PATH`. Each release also includes `SHA256SUMS` for checking the downloads.
+
+| Platform | Archive |
+|---|---|
+| Linux (x86_64) | `safe-rm-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS (Intel) | `safe-rm-x86_64-apple-darwin.tar.gz` |
+| macOS (Apple Silicon) | `safe-rm-aarch64-apple-darwin.tar.gz` |
+
+On macOS, if you downloaded the archive with a browser, remove the quarantine attribute before running it: `xattr -d com.apple.quarantine safe-rm`.
+
+### From Source
+
+Requires [mise](https://mise.jdx.dev/) (the Rust toolchain is pinned in `mise.toml`).
+
+```bash
+git clone https://github.com/owayo/safe-rm.git
+cd safe-rm
+make install
+```
+
+`make install` installs to `/usr/local/bin`. Set `INSTALL_PATH` to change it (for example `make install INSTALL_PATH="$HOME/.local/bin"`).
+<!-- standard:install:end -->
+
+Then add the hook and the `CLAUDE.md` rules from [Claude Code Integration](#claude-code-integration). `safe-rm init` creates the optional configuration file (see [Configuration](#configuration)).
 
 ## Usage
 
@@ -88,21 +114,21 @@ safe-rm -f nonexistent.txt
 safe-rm -rf build/
 ```
 
-### Options
+A blocked deletion exits with code 2 and prints the reason on stderr:
 
-| Option | Description |
-|--------|-------------|
-| `-r, --recursive` | Delete directories and their contents |
-| `-f, --force` | Ignore nonexistent files (no error). Also allows running with no operand at all, like `rm -f` |
-| `-n, --dry-run` | Show what would be deleted without deleting |
-| `-h, --help` | Show help message |
-| `-V, --version` | Show version |
+```bash
+# Outside project
+safe-rm /etc/passwd
+# Exit 2: "プロジェクト外へのアクセスは禁止されています"
 
-### Subcommands
+# `.` / `..` operands (POSIX rm refuses these too)
+safe-rm -r .
+# Exit 2: "末尾が '.' または '..' のパスは削除できません"
+```
 
-| Subcommand | Description |
-|------------|-------------|
-| `init` | Generate config file at `~/.config/safe-rm/config.toml` |
+More allowed and blocked operations, including the strict-mode cases: [docs/usage.md](docs/usage.md)
+
+All options, the `init` subcommand, and exit codes: [docs/cli-reference.md](docs/cli-reference.md)
 
 ## Configuration
 
@@ -154,184 +180,7 @@ recursive = true
 
 Unknown keys at the top level or inside `allowed_paths` are rejected. This makes misspelled security settings a parse error, which triggers the fail-closed strict-mode fallback instead of silently applying a permissive default. An older `safe-rm` reading a config written for a newer version therefore becomes more restrictive, not less.
 
-### Behavior
-
-- **`allow_project_deletion = true` (default)**: Worktree files inside the project can be deleted without Git status checks. Git administrative paths such as `.git`, and recursive deletion of a path that contains any repository metadata (including nested repositories), are still blocked.
-- **`allow_project_deletion = false`**: Only clean (committed) or ignored worktree files can be deleted. Uncommitted changes are protected even when they live under an ignored parent directory, and Git administrative paths are still blocked. Paths matching `allowed_paths` still bypass Git status checks even if the current repository cannot read its index or the current working directory's Git metadata cannot be opened.
-- Paths matching `allowed_paths` bypass project containment and Git status checks, but they do **not** bypass Git metadata protection for any repository metadata. Current-repository Git metadata is checked when Git discovery is available, but a Git discovery failure in the current working directory does not by itself block an allowed path. Intermediate symlinks that resolve into `.git` or bare-repository metadata are still blocked, while deleting the symlink itself is allowed because only the link is removed. For nonexistent targets, the nearest existing parent is canonicalized so alias-path differences are still absorbed
-- The `recursive` flag controls whether subdirectories are included:
-  - `recursive = true`: `/path/to/dir/sub/deep/file.txt` is allowed, and `safe-rm -r /path/to/dir/sub` recursively deletes everything under it through the allowed bypass
-  - `recursive = false`: Only direct children such as `/path/to/dir/file.txt` are allowed; a direct-child subdirectory may still be removed via `-r`, but only by falling through to the **standard safety branch** (project containment + strict Git status checks). The allowed bypass intentionally rejects `-r` on a direct-child directory under a non-recursive entry so that nested contents are never deleted without the standard checks running.
-- If the config file is **genuinely missing**, `safe-rm` falls back to permissive default (`allow_project_deletion = true`, no allowed paths). If the config location itself cannot be determined, or the config file **exists but cannot be read or parsed** — including a **dangling symlink** at the config path, whether the final or an intermediate path component, which reads back as `NotFound` yet still signals an intended-but-broken config — `safe-rm` falls back to fail-closed strict mode (`allow_project_deletion = false`, no allowed paths) so that an unknown location, syntax error, or broken symlink cannot silently disable intended strict protection. A path whose symlinks still resolve to a not-yet-created file is treated as genuinely missing (permissive), so an unconfigured setup is never over-escalated to strict
-- `safe-rm init` protects the config path itself: a dangling symlink at `~/.config/safe-rm/config.toml` is treated as an existing entry and is not followed, so the generated template is never written through the symlink target.
-- Output includes `(allowed by config)` annotation for config-permitted deletions
-
-### Example
-
-```bash
-# With the default config generated by `safe-rm init`:
-# allowed_paths = [
-#   { path = "~/.claude/skills", recursive = true },
-#   { path = "/tmp", recursive = true },
-# ]
-
-# This works even outside the current project:
-safe-rm ~/.claude/skills/my-skill/rules.md
-# removed: /Users/you/.claude/skills/my-skill/rules.md (allowed by config)
-
-safe-rm -r ~/.claude/skills/old-skill/
-# removed: /Users/you/.claude/skills/old-skill/ (allowed by config)
-```
-
-## Architecture
-
-```mermaid
-flowchart TB
-    CLI[CLI Arguments] --> EmptyCheck{Empty operand?}
-    EmptyCheck -->|Yes| Exit1["Exit 1 + stderr (skipped with -f)"]
-    EmptyCheck -->|No| DotCheck{Trailing component is . or ..?}
-    DotCheck -->|Yes| Exit2[Exit 2 + stderr]
-    DotCheck -->|No| RootCheck{Resolves to the root directory?}
-    RootCheck -->|Yes| Exit2
-    RootCheck -->|No| SlashCheck{Trailing separator resolves to a directory?}
-    SlashCheck -->|No| Exit1
-    SlashCheck -->|Yes| ConfigCheck{In allowed_paths?}
-    ConfigCheck -->|Yes| AllowedGitMetaCheck{Git metadata path?}
-    AllowedGitMetaCheck -->|Yes| Exit2
-    AllowedGitMetaCheck -->|No| Delete[Delete File]
-    ConfigCheck -->|No| GitOpen[Open Git repo if needed]
-    GitOpen --> PathCheck[Path Checker]
-    PathCheck --> GitMetaCheck{Git metadata path?}
-    GitMetaCheck -->|Yes| Exit2
-    GitMetaCheck -->|No| ProjectCheck{allow_project_deletion?}
-    ProjectCheck -->|true| Delete
-    ProjectCheck -->|false| GitCheck[Git Checker]
-    GitCheck --> Result{Clean or Ignored?}
-    Result -->|Yes| Delete
-    Result -->|No| Exit2
-    Delete --> Exit0[Exit 0]
-```
-
-### Safety Layers
-
-1. **Git Metadata Protection**: Always blocks `.git`, gitdir indirection files, bare-repository administrative paths, and recursive deletion of paths that contain Git metadata, even if config would otherwise allow deletion. Bare repositories are detected by their structure markers (`HEAD` entry, `objects/`, `refs/`), so a bare repository with a corrupted `config` (where `Repository::open_bare()` fails) is still protected fail-closed. If a recursive metadata scan cannot read a directory entry, deletion is blocked fail-closed.
-2. **Path Containment**: Ensures all non-`allowed_paths` paths resolve within the project directory (Git repository root, or cwd if not a Git repo) before recursive metadata scanning. For nonexistent targets, it canonicalizes the nearest existing parent to absorb alias differences (e.g. repo symlink alias, `/var` vs `/private/var`). Both the deletion entry (the trailing component, without following a trailing symlink) and the fully resolved target must lie inside the project, so an outside symlink pointing into the project (entry is outside) and an inside symlink pointing outside (target is outside) are both blocked; the same two-position check applies to `allowed_paths` matching.
-3. **Git Protection**: When `allow_project_deletion = false`, blocks deletion of dirty files (modified/staged/untracked), including files nested under untracked directories. Status is evaluated using the Git repository that actually owns the target — both the cwd-side discovery and a discovery from the target itself are tried, and the deepest workdir containing the target is selected, so cross-repository deletions (cwd non-Git but target inside a nested Git repo, cwd repo ignoring a nested repo, or cwd and target belonging to different repos) are still checked fail-closed
-4. **Recursive Check**: For real directories, validates all contained files. Ignored descendants remain deletable, but ignored parent directories do not hide tracked modified/staged files or untracked siblings
-5. **Fail-Closed**: Any directory read failure (including entry iteration errors), target metadata classification failure, Git API error from `Repository::discover()` on non-`allowed_paths` deletion paths (e.g. corrupted `.git`, permission errors, I/O failures), worktree canonicalization failure, unreadable metadata probe while classifying a `NotFound`, an unresolvable intermediate symlink, or config location/read/parse error blocks deletion or falls back to strict mode. `NotFound` is treated as non-Git only when no `.git`/bare-repository ancestor is found and the ancestor probe itself succeeds. `allowed_paths` still enforce Git metadata protection, but they do not require current-directory Git discovery to succeed
-6. **Unsafe Parent Traversal Guard**: Reject paths whose `..` would collapse a component that is not a real directory before deletion. Patterns such as `link/../victim` (symlink), `missing/../victim` (non-existent), `file/../victim` (regular file), and any component whose metadata cannot be read (permission denied, special file) are rejected fail-closed, preventing lexical normalization from silently retargeting a different on-disk file. Paths below a dangling intermediate symlink are also rejected before deletion, while deleting the dangling symlink entry itself remains allowed
-7. **Alias-Path Hardening**: Path containment and `allowed_paths` matching canonicalize the nearest existing parent and reattach missing segments, while Git checks canonicalize non-symlink paths and only parent directories for symlink paths, to avoid alias-based bypasses (e.g. repo symlink alias, `/var` vs `/private/var`)
-8. **`.` / `..` Operand Rejection**: Operands whose trailing component is `.` or `..` are rejected with exit code 2 before any normalization, `allowed_paths` matching, or `-f` handling, mirroring POSIX `rm`, which refuses to remove `.` or `..` directories. Name the directory explicitly (`safe-rm -r sub`) instead. Dot-prefixed filenames such as `.hidden` and `...` are unaffected
-9. **Empty-Operand Rejection**: An empty operand is rejected as `No such file or directory` (exit 1) before the `.` / `..` check, because `cwd.join("")` equals `cwd` and would otherwise let `-r ""` delete the working directory. Under `-f` it is silently ignored, as `rm` does
-10. **Shared Metadata Read per Target**: The `allowed_paths` decision, the `-r` requirement, and the removal method all share one and the same `symlink_metadata()` result. Reading it twice would let a file-to-directory swap between the two reads turn a target approved as "a direct child of a non-recursive allowed entry" into a `remove_dir_all` of its whole subtree. (The trailing-separator check below runs earlier and uses a separate `metadata()` call, which only decides whether the raw operand resolves to a directory and never feeds the removal method.)
-11. **Root-Operand Rejection**: Operands that resolve to the root directory (`/`, `//`, or `.` when the working directory is `/`) are rejected with exit code 2, mirroring POSIX `rm` and GNU `rm`'s `--preserve-root` (enabled by default). Without this, a working directory of `/` in a non-Git environment (for example a container running as root) would make the project root `/`, so containment passes and Git metadata protection does not cover `/` itself
-12. **Trailing-Separator Operand Validation**: A trailing separator is a POSIX request that the operand be a directory, so `rm` does not remove operands that fail to resolve as one. Because normalization strips the trailing separator, `file.txt/` would otherwise become a deletion of `file.txt` itself and `danglink/` (a broken symlink) a deletion of the link entry. The raw operand is resolved before normalization: non-directories yield `Not a directory` and unresolvable paths yield `No such file or directory` (both exit 1, silently ignored under `-f` just as `rm` does), while `ELOOP` and permission failures propagate as I/O errors even under `-f`. Symlinks to directories still resolve as directories, so `link/` keeps removing only the link entry and leaves the target intact. This check runs after the dangling-intermediate-symlink guard, so a path below an unresolvable intermediate symlink (`dangling/child/`) is still blocked with exit code 2 and is not ignored by `-f`
-
-### File System and Deletable Scope
-
-#### Default Mode (`allow_project_deletion = true`)
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#666666', 'primaryTextColor': '#000000', 'primaryBorderColor': '#666666' }}}%%
-flowchart TB
-    subgraph outside["Outside Project 🛡️ ALWAYS BLOCKED"]
-        etc["/etc/passwd"]
-        home["~/.bashrc"]
-        other["../other-project/"]
-    end
-
-    subgraph allowed["Config Allowed Paths ✅"]
-        skills["~/.claude/skills/**<br/>(allowed by config)"]
-    end
-
-    subgraph project["Project Directory (git root) ✅ Worktree files deletable"]
-        modified["main.rs (modified)"]
-        staged["new_feature.rs (staged)"]
-        untracked["temp.txt (untracked)"]
-        clean["old_module.rs (clean)"]
-        ignored["target/ (.gitignore)"]
-    end
-
-    style outside fill:#ffcccc,stroke:#cc0000,color:#000000
-    style allowed fill:#ccffcc,stroke:#00cc00,color:#000000
-    style project fill:#ccffcc,stroke:#00cc00,color:#000000
-```
-
-| File | Deletable | Reason |
-|------|-----------|--------|
-| `old_module.rs` (clean) | ✅ Yes | Inside project |
-| `target/` (ignored) | ✅ Yes | Inside project |
-| `main.rs` (modified) | ✅ Yes | Inside project (allow_project_deletion=true) |
-| `temp.txt` (untracked) | ✅ Yes | Inside project (allow_project_deletion=true) |
-| `~/.claude/skills/foo` | ✅ Yes | Allowed by config (recursive) |
-| `.git/` | ❌ No | Git administrative metadata is always protected |
-| `./` or repo root with `-r` | ❌ No | Recursive deletion would include Git administrative metadata |
-| `/etc/passwd` | ❌ No | Outside project directory |
-| `../other-project/` | ❌ No | Path traversal blocked |
-
-#### Strict Mode (`allow_project_deletion = false`)
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#666666', 'primaryTextColor': '#000000', 'primaryBorderColor': '#666666' }}}%%
-flowchart TB
-    subgraph outside["Outside Project 🛡️ ALWAYS BLOCKED"]
-        etc["/etc/passwd"]
-        home["~/.bashrc"]
-        other["../other-project/"]
-    end
-
-    subgraph allowed["Config Allowed Paths ✅"]
-        skills["~/.claude/skills/**<br/>(allowed by config)"]
-    end
-
-    subgraph project["Project Directory (git root)"]
-        subgraph dirty["Uncommitted Changes 🛡️"]
-            modified["main.rs<br/>(modified)"]
-            staged["new_feature.rs<br/>(staged)"]
-            untracked["temp.txt<br/>(untracked)"]
-        end
-
-        subgraph deletable["Deletable Files ✅"]
-            clean["old_module.rs<br/>(clean/committed)"]
-            ignored["target/<br/>(.gitignore)"]
-            nodemod["node_modules/<br/>(.gitignore)"]
-        end
-    end
-
-    style outside fill:#ffcccc,stroke:#cc0000,color:#000000
-    style allowed fill:#ccffcc,stroke:#00cc00,color:#000000
-    style dirty fill:#ffcccc,stroke:#cc0000,color:#000000
-    style deletable fill:#ccffcc,stroke:#00cc00,color:#000000
-```
-
-| File | Deletable | Reason |
-|------|-----------|--------|
-| `old_module.rs` (clean) | ✅ Yes | Committed, recoverable via `git checkout` |
-| `target/` (ignored) | ✅ Yes | In `.gitignore`, build artifacts |
-| `node_modules/` (ignored) | ✅ Yes | In `.gitignore`, dependencies |
-| `~/.claude/skills/foo` | ✅ Yes | Allowed by config (recursive) |
-| `.git/` | ❌ No | Git administrative metadata is always protected |
-| `./` or repo root with `-r` | ❌ No | Recursive deletion would include Git administrative metadata |
-| `main.rs` (modified) | ❌ No | Uncommitted changes would be lost |
-| `new_feature.rs` (staged) | ❌ No | Pending commit would be lost |
-| `temp.txt` (untracked) | ❌ No | Not in Git history, unrecoverable |
-| `/etc/passwd` | ❌ No | Outside project directory |
-| `../other-project/` | ❌ No | Path traversal blocked |
-
-**Key Points**:
-- Files outside the project are **always blocked**, regardless of settings
-- Git administrative metadata such as `.git` is **always blocked**, regardless of settings; this includes recursive deletion of the current repository root
-- **Default mode (`allow_project_deletion = true`)**: Worktree files inside the project can be deleted (ideal for AI agents)
-- **Strict mode (`allow_project_deletion = false`)**: Only clean (committed) or ignored worktree files can be deleted. Deleting a directory also rejects uncommitted deletions that no longer exist on disk (a `git rm`-staged or worktree-deleted tracked file under it), since those are detected via the Git status cache rather than `read_dir`
-- **Config allowed paths** bypass containment and Git-status checks, but not Git metadata protection (supports `~` expansion)
-
-## Exit Codes
-
-| Code | Meaning | Examples |
-|------|---------|----------|
-| 0 | Success | File deleted, dry-run completed |
-| 1 | Operation error | File not found, is directory without -r, trailing separator on a non-directory, I/O error, partial failure |
-| 2 | Security block | Dirty file, outside project, `.` / `..` or root operand, directory read error (fail-closed) |
+How the settings behave (default and strict mode, `allowed_paths` and `recursive`, missing or broken config files) and an example: [docs/configuration.md](docs/configuration.md)
 
 ## Claude Code Integration
 
@@ -384,112 +233,35 @@ Add to your `CLAUDE.md`:
 - Preview what would be deleted: `safe-rm -n file.txt`
 ```
 
-## Git Status Decision Matrix
-
-### Default Mode (`allow_project_deletion = true`)
-
-| File Status | Deletable? | Reason |
-|-------------|------------|--------|
-| Any (inside project) | Yes | `allow_project_deletion = true` skips Git checks |
-| Outside project | No | Always blocked regardless of settings |
-
-### Strict Mode (`allow_project_deletion = false`)
-
-| File Status | Deletable? | Reason |
-|-------------|------------|--------|
-| Clean | Yes | Committed and recoverable via `git checkout` |
-| Modified | No | Uncommitted changes would be lost |
-| Staged | No | Pending commit would be lost |
-| Untracked | No | Not in Git history, unrecoverable |
-| Ignored | Yes | Build artifacts, not source controlled |
-| Outside project | No | Always blocked regardless of Git status |
-
-**Note**: A non-Git current directory does not disable strict checks. `safe-rm` also discovers a repository from each deletion target and selects the deepest worktree containing it. Git status checks are skipped only when the target itself is not in a Git repository; discovery and worktree-resolution errors fail closed.
-
-## Examples
-
-### Allowed Operations
-
-```bash
-# Clean file (committed, no changes)
-safe-rm src/old_module.rs  # Exit 0
-
-# Ignored file (in .gitignore)
-safe-rm target/debug/app   # Exit 0
-safe-rm -r node_modules    # Exit 0
-
-# Non-Git directory
-safe-rm temp_file.txt      # Exit 0
-
-# Dry run
-safe-rm -n file.txt        # Exit 0, shows "would remove: file.txt"
-```
-
-### Blocked Operations
-
-```bash
-# Modified file
-safe-rm src/main.rs
-# Exit 2: "未コミットの変更があるファイルは削除できません"
-
-# Outside project
-safe-rm /etc/passwd
-# Exit 2: "プロジェクト外へのアクセスは禁止されています"
-
-safe-rm ../../../etc/hosts
-# Exit 2: "プロジェクト外へのアクセスは禁止されています"
-
-# Untracked file
-safe-rm new_feature.rs
-# Exit 2: "未コミットの変更があるファイルは削除できません"
-
-# `.` / `..` operands (POSIX rm refuses these too)
-safe-rm -r .
-# Exit 2: "末尾が '.' または '..' のパスは削除できません"
-safe-rm -r sub/..
-# Exit 2: "末尾が '.' または '..' のパスは削除できません"
-# Name the directory explicitly instead: safe-rm -r sub
-
-# Root operand (GNU rm refuses this too, via --preserve-root)
-safe-rm -r /
-# Exit 2: "ルートディレクトリは削除できません"
-
-# Trailing separator on something that is not a directory
-safe-rm file.txt/
-# Exit 1: "cannot remove 'file.txt/': Not a directory"
-safe-rm broken-link/
-# Exit 1: "cannot remove 'broken-link/': No such file or directory"
-# Drop the trailing slash to delete the entry itself: safe-rm file.txt
-```
-
 ## Development
 
+<!-- standard:dev:start -->
+Requires [mise](https://mise.jdx.dev/). Tool versions are pinned in `mise.toml`.
+
 ```bash
-# Build
-cargo build
-
-# Run tests
-cargo test
-
-# Check the minimum supported Rust version
-cargo +1.87.0 check --locked --all-targets --all-features
-
-# Build release
-cargo build --locked --release
+make setup   # Install the toolchain (mise) and dependencies
+make ci      # Run the same checks as CI (no changes)
 ```
 
-CI verifies the declared minimum Rust version with Rust 1.87.0 and uses the committed `Cargo.lock` for tests, linting, and release builds. Local `make release` and `make install` also enforce the committed lockfile. The release workflow builds the exact dispatch commit on every target before it creates and pushes the release commit and tag.
+| Command | Description |
+|---|---|
+| `make setup` | Install the toolchain (mise) and dependencies |
+| `make build` | Build a debug binary |
+| `make release` | Build a release binary |
+| `make test` | Run the tests |
+| `make lint` | Run clippy with warnings as errors |
+| `make fmt` | Format the code (rewrites files) |
+| `make fmt-check` | Check the formatting (no changes) |
+| `make check` | Run fmt-check and lint (no changes) |
+| `make ci` | Run the same checks as CI (no changes) |
+| `make install` | Install the release binary to INSTALL_PATH (default /usr/local/bin) |
+| `make uninstall` | Remove the binary from INSTALL_PATH |
+| `make clean` | Remove build artifacts |
 
-### Test Coverage
+Run `make` to list every target. Releases are published from GitHub Actions (**Actions → Release → Run workflow**).
+<!-- standard:dev:end -->
 
-- **Unit Tests**: 307 library unit tests plus 28 binary unit tests covering all modules (CLI, config, error, path_checker, git_checker, init) including fail-closed Git API error handling, fail-closed recursive Git metadata scan errors, worktree canonicalization and target metadata classification errors, recursive detection of `.git` and `.GIT` metadata directories, `convert_status()` mapping `WT_UNREADABLE` and unknown status flags to `Modified` (only the empty/`CURRENT` bitset stays `Clean`), `check_path_with_cache()` blocking directories that contain an on-disk-absent uncommitted deletion (a `git rm`-staged or worktree-deleted tracked file) without over-blocking a sibling directory with a colliding name prefix (`dir` vs `dir2`), selecting the deepest Git workdir that contains a strict-mode target, fail-closed `GitChecker::open()` for corrupted `.git` and unreadable discovery targets (returns `Err(GitError)` whenever any `.git` ancestor is detected or ancestor probing cannot be trusted, so a `NotFound` from `Repository::discover()` never silently downgrades to permissive default), fail-closed `Config::load_from_path()` based on `read_to_string()` results — strict mode fallback when the config location is unknown or the file fails to read or parse, permissive default only when the file is genuinely absent, with a dangling symlink at the config path (final or intermediate component) treated as exists-but-unreadable and escalated to strict while a resolvable symlink to a not-yet-created file stays permissive, symlink-parent `..` traversal rejection including nested `link/child/../../victim` normalization mismatches, dangling intermediate symlink blocking while allowing final dangling symlink deletion, `FileStatus::is_deletable()` validation, unknown config-key rejection, `SAFE_RM_CONFIG` non-UTF-8 path handling on Unix, cache fallback behavior, empty repository handling, broken symlink detection, multiple status type batch retrieval, cached ignored subdirectory checks, `Status::CONFLICTED` mapping to `Modified` (single-flag and combined cases), `touches_git_metadata_path`/`is_git_metadata_path` allowing symlinks pointing at the current `.git` while still blocking deletion through them, intermediate-symlink bypass detection (intermediate symlinks pointing to `.git` or bare repos are blocked when targeting their contents, while deleting the symlink itself is allowed), marker-based bare-repository detection that keeps protecting a bare repo whose `config` is corrupted enough to make `Repository::open_bare()` fail (including a symlink `HEAD` pointing at an unborn ref), rejection of an allowed-directory symlink whose resolved target lies outside the allowed boundary, `resolve_target_metadata()` classifying the target purely from the metadata it is handed rather than re-`stat`ing the path (so the allowed_paths decision and the removal method can never disagree), an empty `SAFE_RM_CONFIG` resolving to no config location and falling back to strict mode, three-layer rejection of an empty `allowed_paths` entry (TOML parse error, dropped during `resolve_allowed_paths()`, and refused by `path_matches_allowed_entry()`) so a hand-built `Config` cannot allow every path, tilde expansion collapsing repeated separators (`~//`, `~//logs`, `~///deep/dir`) so a home-relative allowed path can never widen to the filesystem root, refusal to expand a tilde path whose remainder still carries a root or drive prefix (`~//C:/`, `~/C:logs` on Windows), `reject_root_operand()` rejecting `/`, `//`, `/.` and `.` from a root working directory while passing ordinary paths and the empty operand, and `check_trailing_separator_operand()` classifying regular files and file symlinks as `Not a directory`, missing paths and broken symlinks as `No such file or directory`, symlink loops as I/O errors, and directories plus directory symlinks as deletable
-- **Integration Tests**: 192 tests with real Git repositories (allow/block flows, strict mode, symlinks, alias-path hardening including relative execution from symlink-alias cwd, batch operations, dry-run in strict mode, special filenames, force flag combined with dirty files, nested untracked directory blocking, dry-run + force combinations, empty directory handling, batch security error precedence, config combination tests, strict mode + force flag combinations, relative paths with `..` components, batch all-dirty exit code verification, allowed_paths directory self-deletion behavior, two-path batch exit code priority, symlink-to-directory non-recursive deletion, Git index corruption fail-closed verification, config read/parse error strict-mode fallback verification (unreadable, corrupted, or unknown-key config no longer downgrades into permissive default), three-path batch exit code priority, dry-run filesystem non-modification guarantee, config edge cases, broken symlink handling in default/strict modes, empty repository strict mode, batch force flag combinations, allowed_paths dry-run annotations, symlink-parent `..` traversal rejection, dangling intermediate symlink blocking, live intermediate symlink containment blocking, recursive `.GIT` metadata blocking, intermediate-symlink-to-`.git`/bare-repository bypass blocking, outside-symlink-pointing-into-project containment blocking, corrupted-config bare-repository HEAD and full recursive deletion blocking, strict-mode blocking of directories that contain a staged or worktree deletion (without over-blocking a clean directory when the deletion is in another directory), config-path dangling symlinks (final or intermediate component) falling back to strict mode, both `allowed_paths` boundary directions (an inside link resolving outside and an outside link resolving inside) being blocked without deleting either endpoint, and `.` / `..` operand rejection (`-r .` not deleting the current directory in a non-Git tree, `-r ..` not deleting the parent from a Git repository grandchild, `-rf .` not being bypassed by force, `-r sub/..` not wiping an `allowed_paths` directory, dot-prefixed names such as `.hidden` and `...` staying deletable, and explicitly named directories such as `-r sub` still being deletable), empty-operand handling (`-r ""` exiting 1 as `No such file or directory` without deleting the current directory, `-r -f ""` exiting 0 while silently ignoring it), `-f` with no operand succeeding without reading the config, an empty `SAFE_RM_CONFIG` falling back to strict mode, an empty `allowed_paths` entry failing to parse instead of bypassing the project boundary, root-operand rejection (`-n -r /` from a root working directory exiting 2 without listing anything, and `//` rejected the same way), trailing-separator handling (`clean.txt/` exiting 1 as `Not a directory` and `-f clean.txt//` exiting 0, both leaving the file intact; `link_to_file/` leaving both the link and its target; `danglink/` exiting 1 as `No such file or directory` and `-f danglink/` exiting 0, both leaving the link, while `danglink` without the slash stays deletable; and `file.txt/` still rejected inside an `allowed_paths` directory), and an `allowed_paths` entry of `~//` not granting access to files outside the project)
-
-- **Project Configuration Test**: 1 regression test ensures the local `release` target keeps `cargo build --locked --release`, so `make release` and `make install` cannot silently rewrite dependency resolution
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+What CI checks, how a release is made, and what the tests cover: [docs/development.md](docs/development.md)
 
 ## Security
 
@@ -497,4 +269,6 @@ If you discover a security vulnerability, please report it via [GitHub Issues](h
 
 ## License
 
+<!-- standard:license:start -->
 [MIT](LICENSE)
+<!-- standard:license:end -->
