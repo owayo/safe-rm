@@ -18,7 +18,7 @@ make install            # /usr/local/bin にインストール (INSTALL_PATH で
 make test               # 全テスト実行
 make test-unit          # ユニットテストのみ (cargo test --lib)
 make test-integration   # 統合テストのみ (cargo test --test integration_test)
-make lint               # clippy (--all-targets --all-features, -D warnings)
+make lint               # clippy (--all-targets, -D warnings)
 make fmt                # コードフォーマット
 make fmt-check          # フォーマット済みかの検査 (書き換えない)
 make check              # fmt-check + lint

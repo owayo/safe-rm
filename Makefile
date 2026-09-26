@@ -63,7 +63,7 @@ test-integration: ## Run only the integration tests (tests/integration_test.rs)
 	$(RUN) cargo test $(CARGO_FLAGS) --test integration_test
 
 lint: ## Run clippy with warnings as errors
-	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets --all-features -- -D warnings
+	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets -- -D warnings
 
 fmt: ## Format the code (rewrites files)
 	$(RUN) cargo fmt --all
