@@ -30,10 +30,10 @@ git2 = { version = "0.21.0", features = ["vendored-libgit2", "vendored-openssl"]
 
 # 設定ファイル解析
 serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.4"
+toml = "1.1.6"
 
 # ホームディレクトリ検出
-dirs = "6.0"
+dirs = "7.0.0"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

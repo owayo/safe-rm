@@ -1,25 +1,25 @@
-# Development tasks for safe-rm. Run `make` with no arguments to list the targets.
+# safe-rm の開発タスク。引数なしの `make` でターゲット一覧を表示する。
 #
-# Tool versions are pinned in mise.toml. When mise is available, every tool runs through
-# `mise exec --`, so the pinned versions are used even when mise is not activated in the shell
-# (for example when make is started from an IDE or a GUI). SYSTEM_TOOLS=1 uses the tools on PATH
-# instead (the versions are then not guaranteed).
+# ツールの版は mise.toml で固定する。mise が使えるときは全ツールを `mise exec --`
+# 経由で起動し、シェルで mise が有効化されていなくても（IDE や GUI からの起動など）
+# 固定版を使う。SYSTEM_TOOLS=1 の場合は PATH 上のツールを使い、版は保証しない。
 #
-# Only GNU Make 3.81 features are used (the make that ships with macOS):
-# no .ONESHELL, .SHELLFLAGS, $(file ...) or !=.
+# macOS に付属する GNU Make 3.81 で使える機能だけを使う。
+# .ONESHELL、.SHELLFLAGS、$(file ...) および != は使わない。
 
 .DEFAULT_GOAL := help
 
 BINARY_NAME := safe-rm
 INSTALL_PATH ?= /usr/local/bin
-# Cargo.lock is committed, so resolve dependencies exactly as CI does. release (and install through
-# it) must keep this default; tests/project_configuration_test.rs checks it
+# Cargo.lock をコミットしているため、CI と同じ依存解決を使う。
+# release と、それを経由する install でもこの既定値を維持する。
+# tests/project_configuration_test.rs で検査する。
 CARGO_FLAGS ?= --locked
 
-# ---- Toolchain ------------------------------------------------------------------
-# Look for mise on PATH, then in the usual install locations (make started from a GUI may not
-# inherit the shell's PATH). Override with make MISE=/path/to/mise.
-# To try the behavior without mise, empty the candidates with MISE_CANDIDATES=.
+# ---- ツールチェーン -------------------------------------------------------------
+# mise を PATH と一般的なインストール先から探す。GUI から起動した make はシェルの
+# PATH を引き継がない場合がある。make MISE=/path/to/mise で上書きできる。
+# mise がない場合の動作確認には MISE_CANDIDATES= で候補を空にする。
 MISE_CANDIDATES ?= $(HOME)/.local/bin/mise /opt/homebrew/bin/mise /usr/local/bin/mise
 ifeq ($(SYSTEM_TOOLS),1)
 RUN :=
@@ -37,58 +37,58 @@ endif
 
 .PHONY: help setup build release test test-unit test-integration lint fmt fmt-check check ci install install-hooks uninstall clean
 
-## Setup
+## 準備
 
-setup: ## Install the toolchain (mise) and dependencies
+setup: ## ツールチェーン (mise) と依存を取得
 	@if [ -n "$(MISE)" ]; then "$(MISE)" install; fi
 	$(RUN) cargo fetch $(CARGO_FLAGS)
 
-## Build
+## ビルド
 
-build: ## Build a debug binary
+build: ## デバッグ用バイナリをビルド
 	$(RUN) cargo build $(CARGO_FLAGS)
 
-release: ## Build a release binary
+release: ## リリース用バイナリをビルド
 	$(RUN) cargo build --release $(CARGO_FLAGS)
 
-## Checks
+## 検査
 
-test: ## Run the tests
+test: ## 全テストを実行
 	$(RUN) cargo test $(CARGO_FLAGS)
 
-test-unit: ## Run only the library unit tests (cargo test --lib)
+test-unit: ## ライブラリのユニットテストだけを実行 (cargo test --lib)
 	$(RUN) cargo test $(CARGO_FLAGS) --lib
 
-test-integration: ## Run only the integration tests (tests/integration_test.rs)
+test-integration: ## 統合テストだけを実行 (tests/integration_test.rs)
 	$(RUN) cargo test $(CARGO_FLAGS) --test integration_test
 
-lint: ## Run clippy with warnings as errors
+lint: ## 警告をエラーとして clippy を実行
 	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets -- -D warnings
 
-fmt: ## Format the code (rewrites files)
+fmt: ## コードを整形 (ファイルを書き換える)
 	$(RUN) cargo fmt --all
 
-fmt-check: ## Check the formatting (no changes)
+fmt-check: ## 整形済みか検査 (書き換えない)
 	$(RUN) cargo fmt --all -- --check
 
-check: fmt-check lint ## Run fmt-check and lint (no changes)
+check: fmt-check lint ## fmt-check と lint を実行 (書き換えない)
 
-ci: check test ## Run the same checks as CI (no changes)
+ci: check test ## CI と同じ検査を実行 (書き換えない)
 
-## Install
+## インストール
 
-# Replace the binary through a temporary file and a rename instead of copying over it. macOS
-# caches the code signature check per inode, so a binary copied over one that is running (or ran
-# a moment ago) is killed with SIGKILL right after it starts (exit 137). The temporary file sits
-# in the same directory so that the rename swaps the inode.
-install: release ## Install the release binary to INSTALL_PATH (default /usr/local/bin)
+# バイナリを直接上書きせず、一時ファイルを同じディレクトリに置いて rename する。
+# macOS はコード署名の検証結果を inode 単位でキャッシュするため、実行中または直前に
+# 実行したバイナリを cp で上書きすると、起動直後に SIGKILL（exit 137）される。
+# rename により inode ごと入れ替える。
+install: release ## リリース用バイナリを INSTALL_PATH に配置 (既定 /usr/local/bin)
 	@mkdir -p "$(INSTALL_PATH)"
 	cp "target/release/$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"
 	mv -f "$(INSTALL_PATH)/$(BINARY_NAME).new" "$(INSTALL_PATH)/$(BINARY_NAME)"
 
-# Only prints the steps. The hook itself and the CLAUDE.md rules are in README.md
-# (Claude Code Integration), so there is a single copy to keep up to date
-install-hooks: ## Show how to set up the Claude Code integration
+# 手順の表示のみ行う。フック本体と CLAUDE.md のルールは README.md の
+# Claude Code Integration に集約し、更新対象を一箇所にする。
+install-hooks: ## Claude Code 連携の設定手順を表示
 	@echo "Claude Code integration"
 	@echo ""
 	@echo "1. Add the PreToolUse hook from README.md (Claude Code Integration > Hook Configuration)"
@@ -99,15 +99,15 @@ install-hooks: ## Show how to set up the Claude Code integration
 	@echo ""
 	@echo '3. Allow the command: claude /permissions add Bash "safe-rm*"'
 
-uninstall: ## Remove the binary from INSTALL_PATH
+uninstall: ## INSTALL_PATH からバイナリを削除
 	rm -f "$(INSTALL_PATH)/$(BINARY_NAME)"
 
-clean: ## Remove build artifacts
+clean: ## ビルド成果物を削除
 	$(RUN) cargo clean
 
-## Help
+## ヘルプ
 
-help: ## Show this help
+help: ## このヘルプを表示
 	@echo "Development tasks for $(BINARY_NAME)"
 	@echo ""
 	@echo "Usage: make <target>"

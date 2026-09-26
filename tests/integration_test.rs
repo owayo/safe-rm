@@ -2026,6 +2026,29 @@ mod init_tests {
     }
 
     #[test]
+    fn test_init_creates_config_with_relative_filename() {
+        let temp_dir = TempDir::new().unwrap();
+        let output = Command::new(get_binary_path())
+            .arg("init")
+            .current_dir(temp_dir.path())
+            .env("SAFE_RM_CONFIG", "config.toml")
+            .output()
+            .expect("safe-rm init を実行できること");
+
+        assert!(
+            output.status.success(),
+            "相対ファイル名の設定を作成できること: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config_path = temp_dir.path().join("config.toml");
+        assert!(config_path.is_file());
+        assert!(
+            toml::from_str::<safe_rm::config::Config>(&fs::read_to_string(config_path).unwrap())
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn test_init_does_not_overwrite_existing() {
         let temp_dir = TempDir::new().unwrap();
         let config_dir = temp_dir.path().join("safe-rm");
@@ -3373,6 +3396,40 @@ mod strict_mode_nested_tests {
             repo_path.join("dir/keep.txt").exists(),
             "dir/keep.txt は dir 削除がブロックされたため残っているべき"
         );
+    }
+
+    #[test]
+    fn test_allowed_delete_invalidates_existing_strict_status_cache() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            config.path(),
+            format!(
+                "allow_project_deletion = false\n[[allowed_paths]]\npath = \"{}\"\nrecursive = false\n",
+                repo_path.join("dir").display()
+            ),
+        )
+        .unwrap();
+
+        commit_file(&repo_path, "dirty.txt", "original");
+        commit_file(&repo_path, "dir/a.txt", "tracked");
+        fs::write(repo_path.join("dirty.txt"), "modified").unwrap();
+
+        // 最初の失敗でキャッシュを作り、許可パスの削除後に同じリポジトリを再検査する。
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["-r", "dirty.txt", "dir/a.txt", "dir"],
+            &repo_path,
+            Some(config.path()),
+        );
+
+        assert_eq!(exit_code, 2, "未コミット変更を拒否すること: {stderr}");
+        assert!(!repo_path.join("dir/a.txt").exists());
+        assert!(
+            repo_path.join("dir").exists(),
+            "許可パスの削除で生じた未コミット削除を後続の判定で検出すること: {stderr}"
+        );
+        assert!(repo_path.join("dirty.txt").exists());
     }
 }
 

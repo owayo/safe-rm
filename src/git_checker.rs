@@ -3427,9 +3427,10 @@ mod tests {
     fn test_get_file_status_from_cache_blocks_non_utf8_with_empty_cache() {
         // 空キャッシュ経由でも、`lookup_status_in_listing` の path_bytes 比較が
         // 動作することを検証する。
-        // 経路: cache miss → ignored_status_from_relative_path (Ok(false)) →
-        // resolve_status_from_relative_path → status_file (NotFound) →
-        // lookup_status_in_listing (path_bytes 比較で発見) → Untracked
+        // 経路: キャッシュミス → resolve_status_from_relative_path →
+        // status_file (NotFound) → lookup_status_in_listing
+        // (path_bytes 比較で発見) → Untracked。
+        // Untracked と確定するため、ignore 判定には進まない。
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 

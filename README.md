@@ -132,7 +132,7 @@ All options, the `init` subcommand, and exit codes: [docs/cli-reference.md](docs
 
 ## Configuration
 
-`safe-rm` supports an optional configuration file at `~/.config/safe-rm/config.toml`. You can also specify a custom config path via the `SAFE_RM_CONFIG` environment variable. On Unix, the environment variable is read as a raw OS path so non-UTF-8 paths are preserved.
+`safe-rm` supports an optional configuration file at `~/.config/safe-rm/config.toml`. You can also specify a custom config path via the `SAFE_RM_CONFIG` environment variable. Relative paths, including a filename alone, are resolved from the current directory by both `safe-rm init` and normal commands. On Unix, the environment variable is read as a raw OS path so non-UTF-8 paths are preserved.
 
 ### Setup
 

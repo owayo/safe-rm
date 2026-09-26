@@ -98,6 +98,7 @@ Config と `allowed_paths` の TOML デシリアライズには `#[serde(deny_un
 - **プロジェクト構成テスト**: `tests/project_configuration_test.rs` - `release` ターゲットのレシピが `$(RUN) cargo build --release $(CARGO_FLAGS)` で、`CARGO_FLAGS` の既定値が `--locked` であることを検証し、ローカルのリリース・インストール時にコミット済みの依存解決を強制する
 - **設定キー検証**: Config と `allowed_paths` の未知キーを拒否するユニットテストと、`allow_project_deletion` のタイプミスが strict モードへフォールバックして未追跡ファイル削除を exit 2 でブロックする統合テストを含む
 - **追加の fail-closed 回帰テスト**: 設定パスを決定できない `Config::load_from_path(None)` が strict モードへ倒れること、workdir の canonicalize 不能を `IoError` として伝播すること、存在しないパスと読み取り不能な中間ディレクトリ配下の `symlink_metadata()` エラーを `is_real_directory()` が握りつぶさないことを検証する
+- **設定パスとバッチ処理の境界テスト**: `SAFE_RM_CONFIG=config.toml` の相対ファイル名で `safe-rm init` がカレントディレクトリに設定を作ること、および既存の strict Git ステータスキャッシュがあるバッチで allowed_paths のファイル削除後にキャッシュを破棄し、後続のディレクトリ削除で未コミット削除を検出することを検証する
 
 ### 既知の限界
 
@@ -115,7 +116,7 @@ YY.M.NNN 形式（例: 26.2.100）。リリースは GitHub Actions の workflow
 | `path-clean` | パス正規化 |
 | `git2` | Git操作 (vendored) |
 | `serde` + `toml` | 設定ファイルパース |
-| `dirs` | ホームディレクトリ検出 |
+| `dirs` | ホームディレクトリ検出。7 系では `home_dir()` のみ利用し、Windows の `preference_dir()` の仕様変更は影響しない |
 
 ### Dev Dependencies
 
