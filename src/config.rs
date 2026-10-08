@@ -3,6 +3,7 @@
 //! `~/.config/safe-rm/config.toml` からユーザー設定を読み込む。
 //! 指定ディレクトリの安全チェックをバイパスする allowed_paths をサポート。
 
+use crate::path_resolution::{canonicalize_parent_keep_filename, try_canonicalize};
 use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 
@@ -253,7 +254,7 @@ impl Config {
             .filter(|entry| !entry.path.is_empty())
             .map(|entry| {
                 let expanded = Self::expand_tilde(&entry.path);
-                let canonical = Self::try_canonicalize(&expanded);
+                let canonical = try_canonicalize(&expanded);
                 AllowedPathResolved {
                     canonical_path: canonical,
                     recursive: entry.recursive,
@@ -304,51 +305,6 @@ impl Config {
         })
     }
 
-    /// 可能であれば canonicalize する。
-    /// 末尾が未作成で失敗した場合は、既存の親ディレクトリまで canonicalize してから
-    /// 未作成部分を再結合する。
-    fn try_canonicalize(path: &Path) -> PathBuf {
-        if let Ok(canonical) = std::fs::canonicalize(path) {
-            return canonical;
-        }
-
-        let mut current = path;
-        let mut missing_segments = Vec::new();
-
-        while let Some(parent) = current.parent() {
-            if let Some(name) = current.file_name() {
-                missing_segments.push(name.to_os_string());
-            }
-
-            if let Ok(canonical_parent) = parent.canonicalize() {
-                let mut rebuilt = canonical_parent;
-                for segment in missing_segments.iter().rev() {
-                    rebuilt.push(segment);
-                }
-                return rebuilt;
-            }
-
-            current = parent;
-        }
-
-        path.to_path_buf()
-    }
-
-    /// 親ディレクトリのみ canonicalize し、末尾コンポーネントは解決せず保持する。
-    ///
-    /// 削除対象が symlink の場合、`remove_*` はリンクを辿らずリンクエントリ自体を
-    /// 削除する。許可判定を「実際に削除されるエントリ」の位置で行うために、末尾
-    /// コンポーネントは canonicalize しない。中間 symlink（エイリアス）は解決する。
-    fn canonicalize_parent_keep_filename(path: &Path) -> PathBuf {
-        let Some(file_name) = path.file_name() else {
-            return Self::try_canonicalize(path);
-        };
-        let Some(parent) = path.parent() else {
-            return path.to_path_buf();
-        };
-        Self::try_canonicalize(parent).join(file_name)
-    }
-
     /// パスが許可ディレクトリ内にあるかチェック
     ///
     /// 指定パスが allowed_paths のいずれかのエントリに一致する場合 true を返す。
@@ -389,8 +345,8 @@ impl Config {
         // 許可範囲内であることを要求しつつ、許可ディレクトリ外の symlink が許可内を
         // 指すバイパス（エントリは外なのに実体だけ内側）も塞ぐ。中間 symlink（別名）は
         // 両者とも解決され、別名 cwd や /var→/private/var 差異は吸収される。
-        let entry_path = Self::canonicalize_parent_keep_filename(&target_normalized);
-        let resolved_path = Self::try_canonicalize(&target_normalized);
+        let entry_path = canonicalize_parent_keep_filename(&target_normalized);
+        let resolved_path = try_canonicalize(&target_normalized);
 
         // ディレクトリの再帰削除では `recursive = true` のエントリのみ対象とする。
         // これにより `recursive = false` のエントリ配下の subdir に対する `-r` で
@@ -1331,32 +1287,6 @@ recursive = true
     }
 
     #[test]
-    fn test_try_canonicalize_existing_path() {
-        // 存在するパスは canonicalize 成功する
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let dir_path = tmp_dir.path().canonicalize().unwrap();
-
-        let result = Config::try_canonicalize(&dir_path);
-        assert_eq!(result, dir_path);
-    }
-
-    #[test]
-    fn test_try_canonicalize_partial_existing() {
-        // 既存ディレクトリ + 未作成セグメント
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let canonical_tmp = tmp_dir.path().canonicalize().unwrap();
-
-        let missing_path = canonical_tmp.join("nonexistent").join("deep.txt");
-        let result = Config::try_canonicalize(&missing_path);
-
-        // canonical_tmp は解決済みなので、結果はそこから再結合される
-        assert!(result.starts_with(&canonical_tmp));
-        assert!(
-            result.ends_with("nonexistent/deep.txt") || result.ends_with("nonexistent\\deep.txt")
-        );
-    }
-
-    #[test]
     fn test_is_path_allowed_empty_resolved_paths() {
         // allowed_paths_resolved が空の場合、常に false を返す
         let config = Config {
@@ -1458,14 +1388,6 @@ recursive = true
 
         assert!(!config.is_path_allowed(Path::new("/etc/hosts")));
         assert!(!config.is_path_allowed(Path::new("/usr/bin/env")));
-    }
-
-    #[test]
-    fn test_try_canonicalize_all_missing_segments() {
-        // 全セグメントが存在しない場合、元のパスがそのまま返される
-        let path = Path::new("/nonexistent_root_xyz/a/b");
-        let result = Config::try_canonicalize(path);
-        assert_eq!(result, path.to_path_buf());
     }
 
     #[test]

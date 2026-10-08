@@ -3,6 +3,7 @@
 //! パスの正規化とプロジェクト境界の包含検証を行う。
 
 use crate::error::SafeRmError;
+use crate::path_resolution::{canonicalize_parent_keep_filename, try_canonicalize};
 use path_clean::PathClean;
 use std::path::{Path, PathBuf};
 
@@ -48,7 +49,7 @@ impl PathChecker {
         let cleaned_path = absolute_path.clean();
 
         // 3. プロジェクトルートも正規化
-        let canonical_root = Self::try_canonicalize(&project_root.clean());
+        let canonical_root = try_canonicalize(&project_root.clean());
 
         // 4. 削除対象エントリ（末尾コンポーネント）の位置で境界判定する。
         //    `remove_file`/`remove_dir` は symlink を辿らず「リンクエントリ自体」を
@@ -57,7 +58,7 @@ impl PathChecker {
         //    これにより、プロジェクト外の symlink がプロジェクト内の実体を指していても、
         //    エントリ自体がプロジェクト外であれば確実にブロックできる（実体だけ見て
         //    通過させてしまう包含バイパスを塞ぐ）。
-        let entry_path = Self::canonicalize_parent_keep_filename(&cleaned_path);
+        let entry_path = canonicalize_parent_keep_filename(&cleaned_path);
         if !Self::is_contained(&canonical_root, &entry_path) {
             return Err(SafeRmError::OutsideProject {
                 path: target_path.to_path_buf(),
@@ -68,7 +69,7 @@ impl PathChecker {
         // 5. 末尾まで解決した実体パスもプロジェクト内であることを要求する。
         //    プロジェクト内の symlink がプロジェクト外の実体を指すケースは、従来どおり
         //    安全側でブロックし続ける。未作成パスは既存の親まで解決される。
-        let resolved_path = Self::try_canonicalize(&cleaned_path);
+        let resolved_path = try_canonicalize(&cleaned_path);
         if !Self::is_contained(&canonical_root, &resolved_path) {
             return Err(SafeRmError::OutsideProject {
                 path: target_path.to_path_buf(),
@@ -364,63 +365,10 @@ impl PathChecker {
         }
     }
 
-    /// 可能であれば canonicalize する。
-    /// 末尾が未作成で失敗した場合は、既存の親ディレクトリまで canonicalize してから
-    /// 未作成部分を再結合する。
-    fn try_canonicalize(path: &Path) -> PathBuf {
-        if let Ok(canonical) = path.canonicalize() {
-            return canonical;
-        }
-
-        let mut current = path;
-        let mut missing_segments: Vec<std::ffi::OsString> = Vec::new();
-
-        while let Some(parent) = current.parent() {
-            if let Some(name) = current.file_name() {
-                missing_segments.push(name.to_os_string());
-            }
-
-            if let Ok(canonical_parent) = parent.canonicalize() {
-                let mut rebuilt = canonical_parent;
-                for segment in missing_segments.iter().rev() {
-                    rebuilt.push(segment);
-                }
-                return rebuilt;
-            }
-
-            current = parent;
-        }
-
-        path.to_path_buf()
-    }
-
-    /// 親ディレクトリのみ canonicalize し、末尾コンポーネントは解決せず保持する。
-    ///
-    /// 削除対象が symlink の場合、`remove_file`/`remove_dir` はリンクを辿らず
-    /// リンクエントリ自体を削除する。境界判定を「実際に削除されるエントリ」の位置で
-    /// 行うために、末尾コンポーネントは canonicalize しない。中間 symlink（エイリアス）は
-    /// 解決して、中間 symlink 経由の境界脱出は引き続き防ぐ。
-    fn canonicalize_parent_keep_filename(path: &Path) -> PathBuf {
-        let Some(file_name) = path.file_name() else {
-            return Self::try_canonicalize(path);
-        };
-        let Some(parent) = path.parent() else {
-            return path.to_path_buf();
-        };
-        Self::try_canonicalize(parent).join(file_name)
-    }
-
     /// パスがルート内に含まれているかチェック
     fn is_contained(root: &Path, path: &Path) -> bool {
         // パスがルートと同一か、ルートの子孫である
         path.starts_with(root)
-    }
-
-    /// ホームディレクトリへの参照をチェック
-    #[allow(dead_code)]
-    fn is_home_reference(path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
-        path_str.starts_with("~/") || path_str == "~"
     }
 }
 
@@ -912,15 +860,6 @@ mod tests {
         assert!(!PathChecker::is_contained(root, path));
     }
 
-    #[test]
-    fn test_is_home_reference() {
-        assert!(PathChecker::is_home_reference(Path::new("~")));
-        assert!(PathChecker::is_home_reference(Path::new("~/")));
-        assert!(PathChecker::is_home_reference(Path::new("~/Documents")));
-        assert!(!PathChecker::is_home_reference(Path::new("/home/user")));
-        assert!(!PathChecker::is_home_reference(Path::new("./file.txt")));
-    }
-
     // --- verify_containment_with_base のテスト ---
 
     #[test]
@@ -1001,28 +940,6 @@ mod tests {
             result.is_ok(),
             "Project root itself should pass containment check"
         );
-    }
-
-    #[test]
-    fn test_try_canonicalize_nonexistent_path() {
-        // 存在しないパスでもフォールバックでパスが返る
-        let path = Path::new("/nonexistent/path/to/file.txt");
-        let result = PathChecker::try_canonicalize(path);
-        assert_eq!(result, path.to_path_buf());
-    }
-
-    #[test]
-    fn test_try_canonicalize_multiple_missing_segments() {
-        // 既存の親ディレクトリから複数の未作成セグメントがある場合
-        let temp_dir = TempDir::new().unwrap();
-        let project_root = temp_dir.path().canonicalize().unwrap();
-
-        let deep_nonexistent = project_root.join("a").join("b").join("c").join("file.txt");
-        let result = PathChecker::try_canonicalize(&deep_nonexistent);
-
-        // project_root は canonicalize 可能なので、そこから再結合される
-        assert!(result.starts_with(&project_root));
-        assert!(result.ends_with("a/b/c/file.txt") || result.ends_with("a\\b\\c\\file.txt"));
     }
 
     #[test]

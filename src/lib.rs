@@ -9,3 +9,4 @@ pub mod error;
 pub mod git_checker;
 pub mod init;
 pub mod path_checker;
+mod path_resolution;

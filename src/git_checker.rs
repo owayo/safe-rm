@@ -3,6 +3,7 @@
 //! Git リポジトリを検出し、安全な削除のためにファイルステータスを確認する。
 
 use crate::error::{FileStatus, SafeRmError};
+use crate::path_resolution::{canonicalize_parent_keep_filename, try_canonicalize};
 use git2::{Repository, Status, StatusOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -127,7 +128,7 @@ impl GitChecker {
     /// symlink 自身は実体ではないため Git 管理メタデータには含めない。
     /// 中間 symlink 経由のアクセスは親までの canonicalize で検出する。
     pub fn is_git_metadata_path(&self, path: &Path) -> bool {
-        let target = Self::canonicalize_parent_keep_filename(path);
+        let target = canonicalize_parent_keep_filename(path);
         self.protected_git_roots()
             .iter()
             .any(|root| target.starts_with(root))
@@ -144,7 +145,7 @@ impl GitChecker {
     /// `gitlink/config` のように中間 symlink を介して `.git` を指すケースでは、
     /// 親までは canonicalize されるため引き続きブロックされる。
     pub fn touches_git_metadata_path(&self, path: &Path) -> bool {
-        let target = Self::canonicalize_parent_keep_filename(path);
+        let target = canonicalize_parent_keep_filename(path);
         self.protected_git_roots()
             .iter()
             .any(|root| target.starts_with(root) || root.starts_with(&target))
@@ -183,7 +184,7 @@ impl GitChecker {
         // `nested/.git/config` が消されるケース）も検出する。
         // 末尾コンポーネントは canonicalize しない（symlink 自身の削除はリンクだけが
         // 消えて実体は残るため、`gitlink` 単体の削除を過剰にブロックしない）。
-        let resolved_for_check = Self::canonicalize_parent_keep_filename(path);
+        let resolved_for_check = canonicalize_parent_keep_filename(path);
         if resolved_for_check != path && Self::path_has_dot_git_component(&resolved_for_check) {
             return Ok(true);
         }
@@ -215,27 +216,6 @@ impl GitChecker {
         path.components().any(|component| {
             matches!(component, std::path::Component::Normal(name) if Self::is_dot_git_component(name))
         })
-    }
-
-    /// 親ディレクトリのみを canonicalize し、末尾のコンポーネントは元のまま保持する。
-    ///
-    /// これにより中間 symlink を辿った実体パスを得つつ、末尾が symlink でも
-    /// その実体は解決しない。`gitlink/config` のように中間 symlink で `.git` を
-    /// バイパスするケースは検出できるが、`gitlink` 単体の削除（リンクだけ消える）は
-    /// 通常ファイルとして扱える。
-    fn canonicalize_parent_keep_filename(path: &Path) -> PathBuf {
-        let Some(file_name) = path.file_name() else {
-            return path.to_path_buf();
-        };
-        let Some(parent) = path.parent() else {
-            return path.to_path_buf();
-        };
-        if let Ok(canonical_parent) = parent.canonicalize() {
-            return canonical_parent.join(file_name);
-        }
-        // 親も canonicalize できない場合は、既存祖先まで辿って再結合する。
-        // 末尾コンポーネントは保持するので末尾 symlink を辿らない原則は守られる。
-        Self::try_canonicalize_existing_parent(path)
     }
 
     /// `.git` の大文字小文字を区別しない比較。
@@ -359,46 +339,16 @@ impl GitChecker {
 
     /// 削除を常時ブロックすべき Git 管理ディレクトリ/ファイルの一覧を返す。
     fn protected_git_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![Self::try_canonicalize_existing_parent(self.repo.path())];
+        let mut roots = vec![try_canonicalize(self.repo.path())];
 
         if let Some(workdir) = &self.workdir_canonical {
-            let displayed_git_entry = Self::try_canonicalize_existing_parent(&workdir.join(".git"));
+            let displayed_git_entry = try_canonicalize(&workdir.join(".git"));
             if !roots.contains(&displayed_git_entry) {
                 roots.push(displayed_git_entry);
             }
         }
 
         roots
-    }
-
-    /// 可能であれば canonicalize する。
-    /// 末尾が未作成で失敗した場合は、既存の親ディレクトリまで canonicalize してから
-    /// 未作成部分を再結合する。
-    fn try_canonicalize_existing_parent(path: &Path) -> PathBuf {
-        if let Ok(canonical) = path.canonicalize() {
-            return canonical;
-        }
-
-        let mut current = path;
-        let mut missing_segments = Vec::new();
-
-        while let Some(parent) = current.parent() {
-            if let Some(name) = current.file_name() {
-                missing_segments.push(name.to_os_string());
-            }
-
-            if let Ok(canonical_parent) = parent.canonicalize() {
-                let mut rebuilt = canonical_parent;
-                for segment in missing_segments.iter().rev() {
-                    rebuilt.push(segment);
-                }
-                return rebuilt;
-            }
-
-            current = parent;
-        }
-
-        path.to_path_buf()
     }
 
     /// 全ファイルのステータスを一括取得（バッチ処理用）
