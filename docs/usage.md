@@ -17,6 +17,10 @@ safe-rm temp_file.txt      # Exit 0
 
 # Dry run
 safe-rm -n file.txt        # Exit 0, shows "would remove: file.txt"
+
+# If an ignored build directory contains vendored Git directories,
+# name every reported metadata directory explicitly.
+safe-rm -r --allow-nested-git target/vendor/.git target
 ```
 
 ## Blocked Operations
@@ -54,4 +58,8 @@ safe-rm file.txt/
 safe-rm broken-link/
 # Exit 1: "cannot remove 'broken-link/': No such file or directory"
 # Drop the trailing slash to delete the entry itself: safe-rm file.txt
+
+# A nested Git directory is protected by default, even under an ignored target.
+safe-rm -r target
+# Exit 2: lists the nested Git metadata paths and their count
 ```

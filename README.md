@@ -34,7 +34,7 @@ It is meant to stand in for `rm` in AI agents such as Claude Code: a `PreToolUse
 
 - **Path Containment**: Block deletion of files outside project directory
 - **Strict-Mode Git Status Protection**: When `allow_project_deletion = false`, prevent deletion of modified, staged, or untracked files. The check uses the Git repository that actually owns each target — both the cwd-side checker and a discovery from the target itself are evaluated, and the deepest workdir that contains the target is selected. This blocks bypasses where (a) cwd is non-Git but the target lives inside a nested Git repository, (b) the cwd repository ignores a nested repository (e.g. via `.gitignore`) so its files would otherwise be treated as `Ignored`, and (c) cwd and the target belong to different Git repositories. If the owning repository redirects its working tree elsewhere (e.g. via `core.worktree`) so that its `workdir()` does not contain the target, the target is treated as `Modified` and blocked fail-closed instead of silently falling through to `NotInRepo`
-- **Git Metadata Protection**: Always block `.git`, gitdir indirection files, bare-repository administrative paths, recursive deletes that would include current-repository Git metadata, and nested Git metadata found in the deletion target, any intermediate path component, or its subtree. This includes nested `.git` files/directories and bare repositories that have no `.git` component. Component matching is ASCII case-insensitive to also block `.GIT` bypass attempts on case-insensitive filesystems (e.g., macOS APFS). Intermediate symlinks that resolve to a `.git` directory or bare repository (for example `gitlink -> nested/.git` followed by deleting `gitlink/config`) are also blocked by canonicalizing only the parent directory while keeping the trailing component (so deleting the symlink itself is still permitted because it removes only the link)
+- **Git Metadata Protection**: Always block direct `.git` targets, gitdir indirection files, bare-repository administrative paths, and recursive deletes that would include current-repository Git metadata. Nested Git metadata in a target subtree is blocked by default, with every discovered path shown in the error. For a single ignored directory, `--allow-nested-git GIT_PATH` explicitly permits a named nested `.git` directory or bare repository root; repeat the option for every entry. Gitdir files and symlinks cannot be opted in, and strict-mode Git status checks still apply. Component matching is ASCII case-insensitive to block `.GIT` bypass attempts on case-insensitive filesystems. Intermediate symlinks that resolve to a `.git` directory or bare repository are blocked, while deleting the symlink itself remains permitted
 - **Conflict-Aware Status Mapping**: Files with the `Status::CONFLICTED` flag are treated as `Modified` in strict mode, even when no other index/worktree flags are set, to prevent silent deletion of unresolved merge conflicts
 - **Nested Dirty-File Protection**: Strict-mode checks catch files inside untracked directories, mixed ignored/untracked directories, and tracked modifications inside ignored directories instead of treating them as outside Git
 - **Directory Traversal Prevention**: Block `../` escape attempts whenever the component being collapsed by `..` is not a real directory. Patterns such as `link/../victim` (symlink intermediate), `missing/../victim` (non-existent intermediate), and `file/../victim` (regular-file intermediate) all fail under the OS path resolver but would otherwise be silently normalized to `victim` by lexical path cleaning; safe-rm rejects them fail-closed
@@ -113,7 +113,13 @@ safe-rm -f nonexistent.txt
 
 # Combine flags
 safe-rm -rf build/
+
+# Delete an ignored build directory that contains a vendored Git directory
+# (use the exact path reported by a blocked attempt)
+safe-rm -r --allow-nested-git build/vendor/.git build/
 ```
+
+`--allow-nested-git` deletes the named nested repository, including its local Git history and uncommitted changes. Use it only for disposable copies.
 
 A blocked deletion exits with code 2 and prints the reason on stderr:
 

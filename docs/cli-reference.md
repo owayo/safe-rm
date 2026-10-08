@@ -9,6 +9,7 @@ Command-line options, subcommands, and exit codes of `safe-rm`. The configuratio
 | `-r, --recursive` | Delete directories and their contents |
 | `-f, --force` | Ignore nonexistent files (no error). Also allows running with no operand at all, like `rm -f` |
 | `-n, --dry-run` | Show what would be deleted without deleting |
+| `--allow-nested-git GIT_PATH` | With `-r`, explicitly allow one Git metadata directory found inside a single ignored target directory. Repeat for every reported path. Gitdir files, direct metadata targets, and the current repository's metadata remain protected |
 | `-h, --help` | Show help message |
 | `-V, --version` | Show version |
 

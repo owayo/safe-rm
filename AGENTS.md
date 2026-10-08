@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-safe-rm は AI エージェント（Claude Code等）向けの安全なファイル削除プロキシ。常時プロジェクト境界と Git 管理メタデータ（`.git` 等）を保護し、`allow_project_deletion = false` の厳格モードでは未コミットのファイル削除もブロックする Rust CLI ツール。
+safe-rm は AI エージェント（Claude Code等）向けの安全なファイル削除プロキシ。プロジェクト境界と Git 管理メタデータ（`.git` 等）を保護し、`allow_project_deletion = false` の厳格モードでは未コミットのファイル削除もブロックする Rust CLI ツール。再帰削除の配下にある Git 管理エントリは既定で全件表示して拒否する。ignore 済みの単一ディレクトリに限り、`--allow-nested-git GIT_PATH` で各 `.git` ディレクトリまたは bare リポジトリを明示したときだけ削除を許可する。直接指定した管理パス、現在の repo の管理領域、gitdir ファイル、symlink は例外にしない。
 
 ## Commands
 

@@ -3,7 +3,7 @@
 //! プロジェクト境界と Git 管理メタデータを保護するファイル削除プロキシ。
 //! 厳格モードでは Git 状態に基づき未コミット変更の削除もブロックする。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -111,6 +111,13 @@ fn main() -> ExitCode {
 
 /// メイン実行ロジック
 fn run(args: CliArgs) -> Result<(), SafeRmError> {
+    // 例外的な Git 管理エントリの許可は、全件を削除前に照合できる単一 operand に限る。
+    if !args.allow_nested_git.is_empty() && args.paths.len() != 1 {
+        return Err(SafeRmError::DangerousOption {
+            option: "--allow-nested-git requires exactly one PATH".to_string(),
+        });
+    }
+
     // 削除対象がないなら設定も cwd も要らない。CLI 上ここに空 paths で来るのは
     // `-f` 指定時だけで（サブコマンドは main() で処理済み）、`rm -f` は operand が
     // 無ければ cwd を参照せず成功する。ここで返さないと、cwd が別プロセスに
@@ -288,6 +295,7 @@ fn process_path(
             path,
             args.recursive,
             git_context.checker(),
+            &args.allow_nested_git,
         )?;
 
         let Some(metadata) = resolve_target_metadata(
@@ -331,6 +339,7 @@ fn process_path(
             path,
             args.recursive,
             git_context.checker(),
+            &args.allow_nested_git,
         )?;
 
         let Some(metadata) = resolve_target_metadata(
@@ -533,21 +542,102 @@ fn ensure_git_metadata_not_targeted(
     original_path: &Path,
     recursive: bool,
     git_checker: Option<&GitChecker>,
+    allowed_entries: &[PathBuf],
 ) -> Result<(), SafeRmError> {
-    // 任意階層の `.git` や bare リポジトリ、および再帰削除時に配下へ含まれる
-    // Git 管理メタデータを保護する（ネストしたリポジトリ対応）。
-    if GitChecker::try_path_targets_or_contains_git_metadata(normalized_path, recursive)? {
+    // 対象自身や中間コンポーネントにある Git メタデータは例外なく保護する。
+    if GitChecker::try_path_targets_or_contains_git_metadata(normalized_path, false)? {
         return Err(SafeRmError::ProtectedGitPath {
             path: original_path.to_path_buf(),
+            metadata_paths: Vec::new(),
         });
     }
 
-    // 現在のリポジトリの Git 管理メタデータも保護する。
+    // 現在のリポジトリの管理領域を含む親ディレクトリも常に保護する。
     if let Some(checker) = git_checker
         && checker.touches_git_metadata_path(normalized_path)
     {
         return Err(SafeRmError::ProtectedGitPath {
             path: original_path.to_path_buf(),
+            metadata_paths: Vec::new(),
+        });
+    }
+
+    let metadata_paths = if recursive {
+        GitChecker::git_metadata_entries_under(normalized_path)?
+    } else {
+        Vec::new()
+    };
+    if allowed_entries.is_empty() {
+        return if metadata_paths.is_empty() {
+            Ok(())
+        } else {
+            Err(SafeRmError::ProtectedGitPath {
+                path: original_path.to_path_buf(),
+                metadata_paths,
+            })
+        };
+    }
+
+    if metadata_paths.is_empty() {
+        return Err(SafeRmError::InvalidGitOptIn {
+            path: allowed_entries[0].clone(),
+        });
+    }
+
+    // ignore は削除同意を意味しないため、明示フラグと併用する条件にだけ使う。
+    // 対象自身が repo なら relative path が空となり許可されない。
+    let ignored = match GitChecker::open(normalized_path)? {
+        Some(checker) => checker.is_ignored_directory(normalized_path)?,
+        None => false,
+    };
+    if !ignored {
+        return Err(SafeRmError::ProtectedGitPath {
+            path: original_path.to_path_buf(),
+            metadata_paths,
+        });
+    }
+
+    let cwd = std::env::current_dir().map_err(SafeRmError::IoError)?;
+    let mut permitted = HashSet::new();
+    for flag_path in allowed_entries {
+        let absolute = if flag_path.is_absolute() {
+            flag_path.clone()
+        } else {
+            cwd.join(flag_path)
+        };
+        let Ok(normalized_entry) = absolute.canonicalize() else {
+            return Err(SafeRmError::InvalidGitOptIn {
+                path: flag_path.clone(),
+            });
+        };
+        let Some((index, _)) = metadata_paths.iter().enumerate().find(|(_, candidate)| {
+            candidate.canonicalize().ok().as_ref() == Some(&normalized_entry)
+        }) else {
+            return Err(SafeRmError::InvalidGitOptIn {
+                path: flag_path.clone(),
+            });
+        };
+        // gitdir ファイルと symlink は linked worktree 等を指し得るため例外にしない。
+        if !std::fs::symlink_metadata(&metadata_paths[index])
+            .map_err(SafeRmError::IoError)?
+            .is_dir()
+        {
+            return Err(SafeRmError::InvalidGitOptIn {
+                path: flag_path.clone(),
+            });
+        }
+        permitted.insert(index);
+    }
+
+    let unpermitted: Vec<PathBuf> = metadata_paths
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, path)| (!permitted.contains(&index)).then_some(path))
+        .collect();
+    if !unpermitted.is_empty() {
+        return Err(SafeRmError::ProtectedGitPath {
+            path: original_path.to_path_buf(),
+            metadata_paths: unpermitted,
         });
     }
 
@@ -795,7 +885,8 @@ mod tests {
         let plain_file = tmp_dir.path().join("note.txt");
         std::fs::write(&plain_file, "content").unwrap();
 
-        let result = super::ensure_git_metadata_not_targeted(&plain_file, &plain_file, false, None);
+        let result =
+            super::ensure_git_metadata_not_targeted(&plain_file, &plain_file, false, None, &[]);
 
         assert!(
             result.is_ok(),
@@ -811,7 +902,7 @@ mod tests {
         std::fs::create_dir(&dot_git_path).unwrap();
 
         let result =
-            super::ensure_git_metadata_not_targeted(&dot_git_path, &dot_git_path, false, None);
+            super::ensure_git_metadata_not_targeted(&dot_git_path, &dot_git_path, false, None, &[]);
 
         assert!(
             matches!(result, Err(super::SafeRmError::ProtectedGitPath { .. })),
@@ -827,8 +918,13 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let inside_dot_git = tmp_dir.path().join(".git").join("config");
 
-        let result =
-            super::ensure_git_metadata_not_targeted(&inside_dot_git, &inside_dot_git, false, None);
+        let result = super::ensure_git_metadata_not_targeted(
+            &inside_dot_git,
+            &inside_dot_git,
+            false,
+            None,
+            &[],
+        );
 
         assert!(
             matches!(result, Err(super::SafeRmError::ProtectedGitPath { .. })),
@@ -849,6 +945,7 @@ mod tests {
             &inside_dot_git_upper,
             false,
             None,
+            &[],
         );
 
         assert!(
@@ -1019,8 +1116,13 @@ mod tests {
             .expect("Git リポジトリが存在すべき");
 
         // リポジトリのルートを再帰削除しようとすると、配下の `.git` が含まれるためブロック
-        let result =
-            super::ensure_git_metadata_not_targeted(&repo_path, &repo_path, true, Some(&checker));
+        let result = super::ensure_git_metadata_not_targeted(
+            &repo_path,
+            &repo_path,
+            true,
+            Some(&checker),
+            &[],
+        );
 
         assert!(
             matches!(result, Err(super::SafeRmError::ProtectedGitPath { .. })),
@@ -1056,6 +1158,7 @@ mod tests {
             &plain_file,
             false,
             Some(&checker),
+            &[],
         );
 
         assert!(

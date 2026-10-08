@@ -5793,6 +5793,205 @@ mod nested_git_metadata_tests {
     }
 
     #[test]
+    fn test_ignored_build_with_nested_git_requires_explicit_opt_in() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        commit_file(&outer_path, ".gitignore", "build/\n");
+
+        let build = outer_path.join("build");
+        let vendor = build.join("vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        init_repo(&vendor);
+        fs::write(build.join("artifact.bin"), "artifact").unwrap();
+
+        let (blocked, _, stderr) = run_safe_rm(&["-r", "build"], &outer_path);
+        assert_eq!(blocked, 2, "通常の削除は保護を維持する: {stderr}");
+        assert!(stderr.contains("build/vendor/.git"), "原因を示す: {stderr}");
+        assert!(vendor.join(".git").exists());
+
+        let (allowed, _, stderr) = run_safe_rm(
+            &["-r", "--allow-nested-git", "build/vendor/.git", "build"],
+            &outer_path,
+        );
+        assert_eq!(allowed, 0, "明示的に許可した成果物は削除できる: {stderr}");
+        assert!(!build.exists());
+        assert!(outer_path.join(".git").exists());
+    }
+
+    #[test]
+    fn test_nested_git_opt_in_requires_ignored_directory() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        let nested = outer_path.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        init_repo(&nested);
+
+        let (exit_code, _, stderr) = run_safe_rm(
+            &["-r", "--allow-nested-git", "nested/.git", "nested"],
+            &outer_path,
+        );
+        assert_eq!(exit_code, 2, "無視されていない repo は保護する: {stderr}");
+        assert!(nested.join(".git").exists());
+    }
+
+    #[test]
+    fn test_nested_git_opt_in_requires_every_entry_before_deleting() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        commit_file(&outer_path, ".gitignore", "build/\n");
+        let build = outer_path.join("build");
+        for name in ["one", "two"] {
+            let nested = build.join(name);
+            fs::create_dir_all(&nested).unwrap();
+            init_repo(&nested);
+        }
+
+        let (exit_code, _, stderr) =
+            run_safe_rm(&["-r", "--allow-nested-git", "build", "build"], &outer_path);
+        assert_eq!(exit_code, 2, "親ディレクトリでは許可できない: {stderr}");
+        assert!(build.join("one/.git").exists());
+        assert!(build.join("two/.git").exists());
+
+        let (exit_code, _, stderr) = run_safe_rm(
+            &["-r", "--allow-nested-git", "build/one/.git", "build"],
+            &outer_path,
+        );
+        assert_eq!(exit_code, 2, "未指定の repo があれば拒否する: {stderr}");
+        assert!(
+            stderr.contains("build/two/.git"),
+            "未指定のパスを示す: {stderr}"
+        );
+        assert!(build.join("one/.git").exists());
+        assert!(build.join("two/.git").exists());
+
+        let (exit_code, _, stderr) = run_safe_rm(
+            &[
+                "-r",
+                "--allow-nested-git",
+                "build/one/.git",
+                "--allow-nested-git",
+                "build/two/.git",
+                "build",
+            ],
+            &outer_path,
+        );
+        assert_eq!(exit_code, 0, "全件の明示後は削除できる: {stderr}");
+        assert!(!build.exists());
+    }
+
+    #[test]
+    fn test_nested_git_opt_in_cannot_delete_gitfile() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        commit_file(&outer_path, ".gitignore", "build/\n");
+        let worktree = outer_path.join("build/worktree");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../.git/worktrees/example\n",
+        )
+        .unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm(
+            &["-r", "--allow-nested-git", "build/worktree/.git", "build"],
+            &outer_path,
+        );
+        assert_eq!(exit_code, 2, "gitdir ファイルは保護する: {stderr}");
+        assert!(worktree.join(".git").exists());
+    }
+
+    #[test]
+    fn test_nested_git_opt_in_does_not_bypass_strict_dirty_check() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        let config = TempDir::new().unwrap();
+        let config_path = config.path().join("config.toml");
+        fs::write(&config_path, "allow_project_deletion = false\n").unwrap();
+        commit_file(&outer_path, ".gitignore", "build/\n");
+        let build = outer_path.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("tracked.txt"), "before").unwrap();
+        Command::new("git")
+            .args(["add", "-f", "build/tracked.txt"])
+            .current_dir(&outer_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Track build file"])
+            .current_dir(&outer_path)
+            .output()
+            .unwrap();
+        fs::write(build.join("tracked.txt"), "after").unwrap();
+        let vendor = build.join("vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        init_repo(&vendor);
+
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["-r", "--allow-nested-git", "build/vendor/.git", "build"],
+            &outer_path,
+            Some(&config_path),
+        );
+        assert_eq!(exit_code, 2, "strict の変更検査は維持する: {stderr}");
+        assert!(build.join("tracked.txt").exists());
+        assert!(vendor.join(".git").exists());
+    }
+
+    #[test]
+    fn test_nested_git_opt_in_allows_clean_strict_build() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        let config = TempDir::new().unwrap();
+        let config_path = config.path().join("config.toml");
+        fs::write(&config_path, "allow_project_deletion = false\n").unwrap();
+        commit_file(&outer_path, ".gitignore", "build/\n");
+        let vendor = outer_path.join("build/vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        init_repo(&vendor);
+
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["-r", "--allow-nested-git", "build/vendor/.git", "build"],
+            &outer_path,
+            Some(&config_path),
+        );
+        assert_eq!(
+            exit_code, 0,
+            "strict でも ignore 済み成果物は許可: {stderr}"
+        );
+        assert!(!outer_path.join("build").exists());
+    }
+
+    #[test]
+    fn test_nested_git_opt_in_never_allows_current_repo_metadata() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        let repo_operand = outer_path.to_str().unwrap();
+
+        let (exit_code, _, stderr) = run_safe_rm(
+            &["-r", "--allow-nested-git", ".git", repo_operand],
+            &outer_path,
+        );
+        assert_eq!(exit_code, 2, "現在の repo は保護する: {stderr}");
+        assert!(outer_path.join(".git").exists());
+    }
+
+    #[test]
+    fn test_nested_bare_repo_can_be_named_inside_ignored_build() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        commit_file(&outer_path, ".gitignore", "build/\n");
+        let bare = outer_path.join("build/cache.git");
+        fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        init_bare_repo(&bare);
+
+        let (exit_code, _, stderr) = run_safe_rm(
+            &["-r", "--allow-nested-git", "build/cache.git", "build"],
+            &outer_path,
+        );
+        assert_eq!(exit_code, 0, "明示した bare repo は許可: {stderr}");
+        assert!(!outer_path.join("build").exists());
+    }
+
+    #[test]
     fn test_nested_bare_repo_recursive_delete_blocked() {
         // bare リポジトリは `.git` コンポーネントがなくても Git 管理メタデータ。
         let outer = create_test_repo();
