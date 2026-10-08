@@ -6522,3 +6522,282 @@ mod cross_repo_strict_tests {
         );
     }
 }
+
+// =============================================================================
+// strict モード: 入力の綴りとディスク上の綴りが違う operand のテスト
+// =============================================================================
+
+mod strict_mode_spelling_tests {
+    use super::*;
+
+    /// 「テストガ」の NFD 形（ガ = カ + U+3099）。macOS の Finder などはこの形で保存する
+    const DECOMPOSED_STEM: &str = "\u{30C6}\u{30B9}\u{30C8}\u{30AB}\u{3099}";
+    /// 「テストガ」の NFC 形。git の precompose 後や、通常のキー入力で得られる形
+    const PRECOMPOSED_STEM: &str = "\u{30C6}\u{30B9}\u{30C8}\u{30AC}";
+
+    /// allow_project_deletion = false の設定ファイルを作成
+    fn create_strict_config() -> tempfile::NamedTempFile {
+        let config = tempfile::NamedTempFile::new().unwrap();
+        fs::write(config.path(), "allow_project_deletion = false\n").unwrap();
+        config
+    }
+
+    /// git コマンドを実行する
+    fn git(repo_path: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} が失敗: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 大文字小文字を区別しない FS か（macOS の APFS や Windows の NTFS の既定）
+    fn is_case_insensitive_fs(dir: &std::path::Path) -> bool {
+        let probe = dir.join("case_probe");
+        fs::write(&probe, "").unwrap();
+        let insensitive = fs::symlink_metadata(dir.join("CASE_PROBE")).is_ok();
+        fs::remove_file(&probe).unwrap();
+        insensitive
+    }
+
+    /// Unicode 正規化を区別しない FS か（macOS の APFS / HFS+）
+    fn is_normalization_insensitive_fs(dir: &std::path::Path) -> bool {
+        let probe = dir.join(DECOMPOSED_STEM);
+        fs::write(&probe, "").unwrap();
+        let insensitive = fs::symlink_metadata(dir.join(PRECOMPOSED_STEM)).is_ok();
+        fs::remove_file(&probe).unwrap();
+        insensitive
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_case_variant_directory_with_staged_deletion() {
+        // 配下に staged deletion がある `src` を `SRC` と指定しても削除しない
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        if !is_case_insensitive_fs(&repo_path) {
+            eprintln!("大文字小文字を区別する FS のためテストをスキップ");
+            return;
+        }
+        let config = create_strict_config();
+
+        commit_file(&repo_path, "src/a.txt", "a");
+        commit_file(&repo_path, "src/b.txt", "b");
+        git(&repo_path, &["rm", "-q", "src/b.txt"]);
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "SRC"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "大文字小文字違いの指定でも staged deletion を含むディレクトリはブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join("src/a.txt").exists(),
+            "ブロックされたディレクトリは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_deletes_clean_case_variant_directory() {
+        // clean なディレクトリは、大文字小文字違いで指定しても従来どおり削除できる
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        if !is_case_insensitive_fs(&repo_path) {
+            eprintln!("大文字小文字を区別する FS のためテストをスキップ");
+            return;
+        }
+        let config = create_strict_config();
+
+        commit_file(&repo_path, "src/a.txt", "a");
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", "SRC"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "clean なディレクトリは削除できるべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            !repo_path.join("src").exists(),
+            "clean なディレクトリは削除されるべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_case_variant_file_when_ignorecase_disabled() {
+        // core.ignorecase = false の repo でも、大文字小文字違いの指定で変更済みファイルを消さない
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        if !is_case_insensitive_fs(&repo_path) {
+            eprintln!("大文字小文字を区別する FS のためテストをスキップ");
+            return;
+        }
+        let config = create_strict_config();
+
+        commit_file(&repo_path, "mod.txt", "v1");
+        fs::write(repo_path.join("mod.txt"), "v2").unwrap();
+        git(&repo_path, &["config", "core.ignorecase", "false"]);
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["MOD.TXT"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "大文字小文字違いの指定でも変更済みファイルはブロックすべき. stderr: {}",
+            stderr
+        );
+        assert_eq!(
+            fs::read_to_string(repo_path.join("mod.txt")).unwrap(),
+            "v2",
+            "未コミットの変更は残っているべき"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_strict_mode_blocks_case_variant_symlink_when_ignorecase_disabled() {
+        // core.ignorecase = false の repo でも、大文字小文字違いで指定した変更済みの symlink を消さない
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        if !is_case_insensitive_fs(&repo_path) {
+            eprintln!("大文字小文字を区別する FS のためテストをスキップ");
+            return;
+        }
+        let config = create_strict_config();
+
+        commit_file(&repo_path, "a.txt", "a");
+        commit_file(&repo_path, "b.txt", "b");
+        std::os::unix::fs::symlink("a.txt", repo_path.join("my_link")).unwrap();
+        git(&repo_path, &["add", "my_link"]);
+        git(&repo_path, &["commit", "-q", "-m", "add link"]);
+        // リンク先を変えて Modified にする
+        fs::remove_file(repo_path.join("my_link")).unwrap();
+        std::os::unix::fs::symlink("b.txt", repo_path.join("my_link")).unwrap();
+        git(&repo_path, &["config", "core.ignorecase", "false"]);
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["MY_LINK"], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "大文字小文字違いの指定でも変更済みの symlink はブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            fs::symlink_metadata(repo_path.join("my_link")).is_ok(),
+            "ブロックされた symlink は残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_modified_file_with_decomposed_name() {
+        // ディスク上の名前（NFD）のまま指定した変更済みファイルを消さない
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+        let name = format!("{DECOMPOSED_STEM}.txt");
+
+        commit_file(&repo_path, &name, "v1");
+        fs::write(repo_path.join(&name), "v2").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&[name.as_str()], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "NFD 名の変更済みファイルはブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join(&name).exists(),
+            "ブロックされたファイルは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_precomposed_operand_for_decomposed_file() {
+        // ディスク上は NFD の名前を NFC で指定しても、同じファイルとしてブロックする
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        if !is_normalization_insensitive_fs(&repo_path) {
+            eprintln!("Unicode 正規化を区別する FS のためテストをスキップ");
+            return;
+        }
+        let config = create_strict_config();
+        let decomposed = format!("{DECOMPOSED_STEM}.txt");
+        let precomposed = format!("{PRECOMPOSED_STEM}.txt");
+
+        commit_file(&repo_path, &decomposed, "v1");
+        fs::write(repo_path.join(&decomposed), "v2").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&[precomposed.as_str()], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "NFC で指定しても NFD で保存された変更済みファイルはブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join(&decomposed).exists(),
+            "ブロックされたファイルは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_blocks_decomposed_directory_with_modified_file() {
+        // NFD 名のディレクトリを NFD のまま指定しても、配下の変更済みファイルごと消さない
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+        let file = format!("{DECOMPOSED_STEM}/a.txt");
+
+        commit_file(&repo_path, &file, "v1");
+        fs::write(repo_path.join(&file), "v2").unwrap();
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&["-r", DECOMPOSED_STEM], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 2,
+            "NFD 名のディレクトリ配下の変更済みファイルはブロックすべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            repo_path.join(&file).exists(),
+            "ブロックされたディレクトリは残っているべき"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_deletes_clean_file_with_decomposed_name() {
+        // clean な NFD 名のファイルは、正規化の照合を足しても従来どおり削除できる
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let config = create_strict_config();
+        let name = format!("{DECOMPOSED_STEM}.txt");
+
+        commit_file(&repo_path, &name, "v1");
+
+        let (exit_code, _, stderr) =
+            run_safe_rm_with_config(&[name.as_str()], &repo_path, Some(config.path()));
+
+        assert_eq!(
+            exit_code, 0,
+            "clean な NFD 名のファイルは削除できるべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            !repo_path.join(&name).exists(),
+            "clean なファイルは削除されるべき"
+        );
+    }
+}

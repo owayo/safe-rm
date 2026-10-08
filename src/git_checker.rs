@@ -7,12 +7,23 @@ use crate::path_resolution::{canonicalize_parent_keep_filename, try_canonicalize
 use git2::{Repository, Status, StatusOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
+
+/// 正準等価な名前（NFC と NFD）を同じエントリとして扱う FS（macOS の APFS / HFS+）か。
+///
+/// macOS の git / libgit2 は `core.precomposeunicode` で status のパスを NFC にそろえるが、
+/// ディスク上の名前は NFD のこともあり（Finder 等で作った濁点付きの名前）、どちらの形で
+/// 指定しても同じファイルが消える。そのため status キャッシュの照合を正準等価にする。
+/// Linux や Windows の FS は正規化を区別する（NFC と NFD は別ファイル）ので対象外。
+const NORMALIZATION_INSENSITIVE_FS: bool = cfg!(target_os = "macos");
 
 /// Git ステータスチェッカー
 pub struct GitChecker {
     repo: Repository,
     /// canonicalize 済みワークディレクトリ（macOS /var→/private/var 等のエイリアス対策）
     workdir_canonical: Option<PathBuf>,
+    /// `core.ignorecase`。配下の status を走査するときの大文字小文字の扱いに使う
+    ignore_case: bool,
 }
 
 impl GitChecker {
@@ -34,9 +45,11 @@ impl GitChecker {
         match Repository::discover(path) {
             Ok(repo) => {
                 let workdir_canonical = Self::canonicalize_workdir(repo.workdir())?;
+                let ignore_case = Self::read_ignore_case(&repo);
                 Ok(Some(Self {
                     repo,
                     workdir_canonical,
+                    ignore_case,
                 }))
             }
             // `NotFound` は通常「Git リポジトリが見つからない」を意味する一方、
@@ -99,6 +112,21 @@ impl GitChecker {
             error.kind(),
             std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
         )
+    }
+
+    /// `core.ignorecase` を読む。
+    ///
+    /// 未設定は git の既定（false）とする。設定を読めない場合は、配下判定の照合を広げる側
+    /// （大文字小文字を区別しない）へ倒して fail-closed にする。
+    fn read_ignore_case(repo: &Repository) -> bool {
+        match repo
+            .config()
+            .and_then(|config| config.get_bool("core.ignorecase"))
+        {
+            Ok(ignore_case) => ignore_case,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => false,
+            Err(_) => true,
+        }
     }
 
     /// Git が返した workdir を比較に使える絶対実体パスへ解決する。
@@ -361,6 +389,9 @@ impl GitChecker {
     /// 変換すると衝突や情報欠落が発生し、非 UTF-8 ファイルが `NotInRepo` に
     /// 落ちて削除を許可される経路が生じるため、`entry.path_bytes()` を直接使う。
     ///
+    /// 正規化を区別しない FS（macOS）では、非 ASCII のキーの NFD 形も別名キーとして
+    /// 登録する（[`Self::insert_canonical_equivalent_keys`]）。
+    ///
     /// # 戻り値
     /// * `Ok(HashMap<Vec<u8>, FileStatus>)` - 相対パス（バイト列）→ ステータスのマップ
     /// * `Err(SafeRmError)` - Git API エラー（ステータス取得不可時は削除をブロック）
@@ -379,7 +410,67 @@ impl GitChecker {
             status_map.insert(entry.path_bytes().to_vec(), status);
         }
 
+        if NORMALIZATION_INSENSITIVE_FS {
+            Self::insert_canonical_equivalent_keys(&mut status_map);
+        }
+
         Ok(status_map)
+    }
+
+    /// status キャッシュに、各キーの NFD 形を別名キーとして登録する。
+    ///
+    /// git（libgit2）は `core.precomposeunicode` が有効だと NFC のパスで status を返す一方、
+    /// macOS のディスク上の名前は NFD のこともある。照合する側も NFD にそろえて引くことで
+    /// （[`Self::lookup_cached_status`]）、正準等価な名前同士を必ず一致させる。
+    /// NFC へ寄せないのは、標準の正規化が CJK 互換漢字（U+FA19 等）を統合漢字へ写すのに
+    /// git の precompose はそれを変えず、片側だけ NFC にすると一致しない名前が残るため。
+    /// 別名が既存のキーと衝突したら、削除不可な方の status を残す（fail-closed）。
+    fn insert_canonical_equivalent_keys(status_map: &mut HashMap<Vec<u8>, FileStatus>) {
+        let aliases: Vec<(Vec<u8>, FileStatus)> = status_map
+            .iter()
+            .filter_map(|(key, &status)| Self::decomposed_key(key).map(|alias| (alias, status)))
+            .collect();
+
+        for (alias, status) in aliases {
+            status_map
+                .entry(alias)
+                .and_modify(|existing| {
+                    if existing.is_deletable() && !status.is_deletable() {
+                        *existing = status;
+                    }
+                })
+                .or_insert(status);
+        }
+    }
+
+    /// キーの NFD 形を返す。ASCII だけのキー・UTF-8 でないキー・既に NFD のキーは `None`。
+    fn decomposed_key(key: &[u8]) -> Option<Vec<u8>> {
+        if key.is_ascii() {
+            return None;
+        }
+        let text = std::str::from_utf8(key).ok()?;
+        let decomposed: String = text.nfd().collect();
+        (decomposed.as_bytes() != key).then(|| decomposed.into_bytes())
+    }
+
+    /// status キャッシュを引く。
+    ///
+    /// 完全一致を優先し、正規化を区別しない FS では入力を NFD にして引き直す。
+    /// 完全一致を先に試すので、正規化を区別する FS 上の別ファイルの status を取り違えない
+    /// （ダーティな対象は status 一覧に必ず完全一致のキーで載る）。
+    fn lookup_cached_status(
+        cache: &HashMap<Vec<u8>, FileStatus>,
+        key: &[u8],
+        normalization_insensitive: bool,
+    ) -> Option<FileStatus> {
+        if let Some(&status) = cache.get(key) {
+            return Some(status);
+        }
+        if !normalization_insensitive {
+            return None;
+        }
+        let decomposed = Self::decomposed_key(key)?;
+        cache.get(&decomposed).copied()
     }
 
     /// キャッシュからファイルステータスを取得
@@ -399,7 +490,9 @@ impl GitChecker {
         let path_key = Self::to_git_relative_key(&relative_path);
 
         // キャッシュから取得
-        if let Some(&status) = cache.get(&path_key) {
+        if let Some(status) =
+            Self::lookup_cached_status(cache, &path_key, NORMALIZATION_INSENSITIVE_FS)
+        {
             return status;
         }
 
@@ -475,12 +568,38 @@ impl GitChecker {
         opts.include_ignored(true);
 
         let relative_path_key = Self::to_git_relative_key(relative_path);
+        // 正規化を区別しない FS では、NFD にそろえると一致するエントリも同じファイルとみなす
+        // （ASCII だけのキーは正規化で変わらないので完全一致だけで足りる）。
+        let decomposed_target = (NORMALIZATION_INSENSITIVE_FS && !relative_path_key.is_ascii())
+            .then(|| {
+                Self::decomposed_key(&relative_path_key)
+                    .unwrap_or_else(|| relative_path_key.clone())
+            });
         match self.repo.statuses(Some(&mut opts)) {
             Ok(statuses) => {
+                let mut equivalent_status: Option<FileStatus> = None;
                 for entry in statuses.iter() {
-                    if entry.path_bytes() == relative_path_key.as_slice() {
+                    let entry_key = entry.path_bytes();
+                    // 完全一致があればそちらを優先する
+                    if entry_key == relative_path_key.as_slice() {
                         return Some(Self::convert_status(entry.status()));
                     }
+                    let Some(target) = &decomposed_target else {
+                        continue;
+                    };
+                    let entry_form = Self::decomposed_key(entry_key);
+                    if entry_form.as_deref().unwrap_or(entry_key) == target.as_slice() {
+                        let status = Self::convert_status(entry.status());
+                        // 正準等価なエントリが複数あれば、削除不可な方を残す（fail-closed）
+                        if equivalent_status.is_none_or(|existing| {
+                            existing.is_deletable() && !status.is_deletable()
+                        }) {
+                            equivalent_status = Some(status);
+                        }
+                    }
+                }
+                if equivalent_status.is_some() {
+                    return equivalent_status;
                 }
             }
             // fail-closed: Git API エラー時は削除をブロック
@@ -562,6 +681,8 @@ impl GitChecker {
     /// * `Ok(())` - 削除可能
     /// * `Err(SafeRmError::DirtyFiles)` - 変更のあるファイルが存在
     pub fn check_path(&self, path: &Path) -> Result<(), SafeRmError> {
+        let path = Self::resolve_on_disk_spelling(path)?;
+        let path = path.as_path();
         if Self::is_real_directory(path)? {
             // まず read_dir ベースの再帰検査でディスク上のファイルを個別に検査する
             // （ダーティなファイルはその具体パスでブロックメッセージを出す）。
@@ -704,6 +825,8 @@ impl GitChecker {
         path: &Path,
         cache: &HashMap<Vec<u8>, FileStatus>,
     ) -> Result<(), SafeRmError> {
+        let path = Self::resolve_on_disk_spelling(path)?;
+        let path = path.as_path();
         if Self::is_real_directory(path)? {
             // まず read_dir ベースの再帰検査でディスク上のファイルを個別に検査する
             // （ダーティなファイルはその具体パスでブロックメッセージを出す）。
@@ -740,14 +863,18 @@ impl GitChecker {
             return Ok(());
         };
         let dir_key = Self::to_git_relative_key(&relative_dir);
+        // 正規化を区別しない FS では、NFD 形の別名キー（get_all_statuses が登録）とも照合する
+        let decomposed_dir_key = if NORMALIZATION_INSENSITIVE_FS {
+            Self::decomposed_key(&dir_key)
+        } else {
+            None
+        };
 
         for (key, &status) in cache {
-            // dir_key が空（ワークディレクトリのルート）なら全エントリが配下。
-            // それ以外は「完全一致」または「dir_key + '/' で始まる」ものだけを配下とみなし、
-            // `dir` と `dir2` のような prefix 衝突で別ディレクトリを巻き込まないようにする。
-            let under_dir = dir_key.is_empty()
-                || key.as_slice() == dir_key.as_slice()
-                || (key.starts_with(&dir_key) && key.get(dir_key.len()) == Some(&b'/'));
+            let under_dir = Self::key_is_under_dir(key, &dir_key, self.ignore_case)
+                || decomposed_dir_key.as_deref().is_some_and(|decomposed| {
+                    Self::key_is_under_dir(key, decomposed, self.ignore_case)
+                });
             if under_dir && !Self::is_deletable(status) {
                 return Err(SafeRmError::DirtyFiles {
                     path: dir.to_path_buf(),
@@ -757,6 +884,125 @@ impl GitChecker {
         }
 
         Ok(())
+    }
+
+    /// status キーが `dir_key` のディレクトリ自身か、その配下を指すか判定する。
+    ///
+    /// `dir_key` が空（ワークディレクトリのルート）なら全エントリが配下。それ以外は
+    /// 「完全一致」または「`dir_key` の直後が `/`」のものだけを配下とみなし、`dir` と
+    /// `dir2` のような前方一致の衝突で別ディレクトリを巻き込まない。`ignore_case`
+    /// （`core.ignorecase`）のときは git と同じく ASCII の大文字小文字を区別しない。
+    fn key_is_under_dir(key: &[u8], dir_key: &[u8], ignore_case: bool) -> bool {
+        if dir_key.is_empty() {
+            return true;
+        }
+        let Some(head) = key.get(..dir_key.len()) else {
+            return false;
+        };
+        let head_matches = if ignore_case {
+            head.eq_ignore_ascii_case(dir_key)
+        } else {
+            head == dir_key
+        };
+        head_matches && matches!(key.get(dir_key.len()), None | Some(b'/'))
+    }
+
+    /// 判定対象のパスを、ディスク上の綴りの絶対パスへそろえる。
+    ///
+    /// 大文字小文字や Unicode 正規化を区別しない FS では、入力の綴り（`SRC`、NFD の名前）と
+    /// ディスク上の綴り（`src`）が違っても同じエントリが消える。Git の status キーは
+    /// ディスク上の綴り（macOS ではその precompose 結果）で作られるため、入力の綴りのまま
+    /// 照合すると一致せず、NotInRepo（削除可）に落ちたり配下の未コミットの削除を
+    /// 見落としたりする。実体（symlink 以外）は末尾成分まで canonicalize してそろえる。
+    /// macOS の realpath と Windows の GetFinalPathNameByHandle はディスク上の綴りを返す。
+    /// symlink はリンク自身を判定するため、リンク先へは解決しない
+    /// （[`Self::resolve_symlink_entry_spelling`]）。
+    /// 解決に失敗した場合は判定できないので fail-closed でエラーにする。
+    fn resolve_on_disk_spelling(path: &Path) -> Result<PathBuf, SafeRmError> {
+        let metadata = std::fs::symlink_metadata(path).map_err(SafeRmError::IoError)?;
+        if metadata.file_type().is_symlink() {
+            return Self::resolve_symlink_entry_spelling(path, &metadata);
+        }
+        path.canonicalize().map_err(SafeRmError::IoError)
+    }
+
+    /// symlink のリンクエントリ自身を、ディスク上の綴りの名前で指す絶対パスにする。
+    ///
+    /// canonicalize はリンク先へ進むので使えない。親ディレクトリだけを解決し、末尾の名前は
+    /// 入力と同じエントリの名前（[`Self::find_same_entry_name`]）に置き換える。
+    fn resolve_symlink_entry_spelling(
+        path: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> Result<PathBuf, SafeRmError> {
+        let Some(name) = path.file_name() else {
+            return Ok(path.to_path_buf());
+        };
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let canonical_parent = parent.canonicalize().map_err(SafeRmError::IoError)?;
+        let on_disk_name = Self::find_same_entry_name(&canonical_parent, name, metadata)?;
+        Ok(canonical_parent.join(on_disk_name.as_deref().unwrap_or(name)))
+    }
+
+    /// 親ディレクトリを列挙し、`metadata` と同じエントリ（device と inode が一致）の名前を返す。
+    ///
+    /// 名前の比較（大文字小文字や正規化を無視した一致）で探すと、それらを区別する FS 上の
+    /// 別エントリ（`my_link` と `MY_LINK`）を取り違えるため、FS 自身が入力の名前を
+    /// 解決した結果である inode で照合する。入力どおりの名前のエントリがあれば `None`
+    /// （入力の名前のまま）を返し、余分な stat をしない。
+    ///
+    /// 次の場合は判定できないので fail-closed で `DirectoryReadError` を返す:
+    /// - 親を列挙できない
+    /// - 同じ inode のエントリが無い（検査中にエントリが差し替えられた等。入力の名前のまま
+    ///   照合すると、綴り違いで status を引けず `NotInRepo` に落ちる元の経路に戻る）
+    /// - 同じ inode のエントリが複数ある（symlink 自体のハードリンク。どの名前が入力に
+    ///   当たるか決められず、走査順で別名の status を見てしまう）
+    #[cfg(unix)]
+    fn find_same_entry_name(
+        canonical_parent: &Path,
+        name: &std::ffi::OsStr,
+        metadata: &std::fs::Metadata,
+    ) -> Result<Option<std::ffi::OsString>, SafeRmError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let read_error = || SafeRmError::DirectoryReadError {
+            path: canonical_parent.to_path_buf(),
+        };
+        let entry_names = std::fs::read_dir(canonical_parent)
+            .map_err(|_| read_error())?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.file_name())
+                    .map_err(|_| read_error())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if entry_names.iter().any(|entry_name| entry_name == name) {
+            return Ok(None);
+        }
+
+        let mut same_entries = entry_names.into_iter().filter(|entry_name| {
+            std::fs::symlink_metadata(canonical_parent.join(entry_name)).is_ok_and(
+                |entry_metadata| {
+                    entry_metadata.dev() == metadata.dev() && entry_metadata.ino() == metadata.ino()
+                },
+            )
+        });
+        match (same_entries.next(), same_entries.next()) {
+            (Some(on_disk_name), None) => Ok(Some(on_disk_name)),
+            _ => Err(read_error()),
+        }
+    }
+
+    /// Windows には inode に当たる安定した API が無いため照合せず、入力の名前のまま判定する。
+    #[cfg(not(unix))]
+    fn find_same_entry_name(
+        _canonical_parent: &Path,
+        _name: &std::ffi::OsStr,
+        _metadata: &std::fs::Metadata,
+    ) -> Result<Option<std::ffi::OsString>, SafeRmError> {
+        Ok(None)
     }
 
     /// Git status のキー形式（スラッシュ区切り、バイト列）に揃える。
@@ -3527,6 +3773,648 @@ mod tests {
             result.is_ok(),
             "別ディレクトリ(dir2)の削除は clean な dir の削除をブロックしないべき: {:?}",
             result
+        );
+    }
+
+    // --- 入力の綴りとディスク上の綴りが違う場合の照合 ---
+
+    /// 「テストガ」の NFD 形（ガ = カ + U+3099）。macOS の Finder などはこの形で保存する
+    const DECOMPOSED_STEM: &str = "\u{30C6}\u{30B9}\u{30C8}\u{30AB}\u{3099}";
+    /// 「テストガ」の NFC 形。git の precompose 後や、通常のキー入力で得られる形
+    const PRECOMPOSED_STEM: &str = "\u{30C6}\u{30B9}\u{30C8}\u{30AC}";
+
+    /// git コマンドを実行する（テスト用）
+    fn run_git(repo_path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} が失敗: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 大文字小文字を区別しない FS か（macOS の APFS や Windows の NTFS の既定）
+    fn is_case_insensitive_fs(dir: &Path) -> bool {
+        let probe = dir.join("case_probe");
+        fs::write(&probe, "").unwrap();
+        let insensitive = fs::symlink_metadata(dir.join("CASE_PROBE")).is_ok();
+        fs::remove_file(&probe).unwrap();
+        insensitive
+    }
+
+    /// Unicode 正規化を区別しない FS か（macOS の APFS / HFS+）
+    fn is_normalization_insensitive_fs(dir: &Path) -> bool {
+        let probe = dir.join(DECOMPOSED_STEM);
+        fs::write(&probe, "").unwrap();
+        let insensitive = fs::symlink_metadata(dir.join(PRECOMPOSED_STEM)).is_ok();
+        fs::remove_file(&probe).unwrap();
+        insensitive
+    }
+
+    #[test]
+    fn test_check_path_with_cache_blocks_staged_deletion_via_case_variant_directory() {
+        // `src` 配下に staged deletion がある状態で、大文字小文字だけ違う `SRC` を指定しても
+        // ブロックすること。ディスク上の綴り（src）にそろえずに照合すると、status キー
+        // （src/b.txt）と前方一致せず、未コミットの削除を素通りさせていた。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        if !is_case_insensitive_fs(&repo_path) {
+            eprintln!("大文字小文字を区別する FS のためテストをスキップ");
+            return;
+        }
+
+        fs::create_dir(repo_path.join("src")).unwrap();
+        fs::write(repo_path.join("src/a.txt"), "a").unwrap();
+        fs::write(repo_path.join("src/b.txt"), "b").unwrap();
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "init"]);
+        run_git(&repo_path, &["rm", "-q", "src/b.txt"]);
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+        let result = checker.check_path_with_cache(&repo_path.join("SRC"), &cache);
+        assert!(
+            matches!(
+                result,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Staged,
+                    ..
+                })
+            ),
+            "大文字小文字違いのディレクトリ指定でも staged deletion をブロックすべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_check_path_with_cache_blocks_staged_deletion_after_case_only_rename() {
+        // ディスク上だけ大文字小文字を変えたディレクトリ（`src` → `Src`）でも、
+        // core.ignorecase の repo では index 側の綴り（src/b.txt）の staged deletion を
+        // 配下とみなしてブロックすること。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        if !is_case_insensitive_fs(&repo_path) {
+            eprintln!("大文字小文字を区別する FS のためテストをスキップ");
+            return;
+        }
+
+        fs::create_dir(repo_path.join("src")).unwrap();
+        fs::write(repo_path.join("src/a.txt"), "a").unwrap();
+        fs::write(repo_path.join("src/b.txt"), "b").unwrap();
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "init"]);
+        run_git(&repo_path, &["rm", "-q", "src/b.txt"]);
+        run_git(&repo_path, &["config", "core.ignorecase", "true"]);
+        fs::rename(repo_path.join("src"), repo_path.join("Src")).unwrap();
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+        let result = checker.check_path_with_cache(&repo_path.join("Src"), &cache);
+        assert!(
+            matches!(
+                result,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Staged,
+                    ..
+                })
+            ),
+            "大文字小文字だけ変えたディレクトリでも staged deletion をブロックすべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_check_path_with_cache_blocks_case_variant_file_when_ignorecase_disabled() {
+        // core.ignorecase = false の repo（大文字小文字を区別する環境から持ち込んだ等）でも、
+        // 大文字小文字だけ違う名前で指定した変更済み・未追跡ファイルをブロックすること。
+        // libgit2 の status_file も大文字小文字を区別するため、ディスク上の綴りに
+        // そろえないと NotInRepo（削除可）に落ちていた。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        if !is_case_insensitive_fs(&repo_path) {
+            eprintln!("大文字小文字を区別する FS のためテストをスキップ");
+            return;
+        }
+
+        commit_file(&repo_path, "mod.txt", "v1");
+        fs::write(repo_path.join("mod.txt"), "v2").unwrap();
+        fs::write(repo_path.join("new.txt"), "new").unwrap();
+        run_git(&repo_path, &["config", "core.ignorecase", "false"]);
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+
+        let modified = checker.check_path_with_cache(&repo_path.join("MOD.TXT"), &cache);
+        assert!(
+            matches!(
+                modified,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Modified,
+                    ..
+                })
+            ),
+            "大文字小文字違いの指定でも変更済みファイルはブロックすべき: {:?}",
+            modified
+        );
+
+        let untracked = checker.check_path_with_cache(&repo_path.join("NEW.TXT"), &cache);
+        assert!(
+            matches!(
+                untracked,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Untracked,
+                    ..
+                })
+            ),
+            "大文字小文字違いの指定でも未追跡ファイルはブロックすべき: {:?}",
+            untracked
+        );
+    }
+
+    #[test]
+    fn test_check_path_with_cache_blocks_modified_file_with_decomposed_name() {
+        // ディスク上の名前が NFD の変更済みファイルを、NFD のまま（ls や glob が返す
+        // バイト列のまま）指定してもブロックすること。macOS の git / libgit2 は
+        // core.precomposeunicode で NFC のパスを返すため、バイト列の一致だけで照合すると
+        // NotInRepo（削除可）に落ちていた。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let name = format!("{DECOMPOSED_STEM}.txt");
+
+        commit_file(&repo_path, &name, "v1");
+        fs::write(repo_path.join(&name), "v2").unwrap();
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+        let result = checker.check_path_with_cache(&repo_path.join(&name), &cache);
+        assert!(
+            matches!(
+                result,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Modified,
+                    ..
+                })
+            ),
+            "NFD 名の変更済みファイルはブロックすべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_check_path_with_cache_blocks_precomposed_input_for_decomposed_name() {
+        // ディスク上は NFD の名前を NFC で指定した場合も同じファイルとしてブロックすること。
+        // ディスク上の綴り（NFD）にそろえたうえで、NFC の status キーと照合できる必要がある。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        if !is_normalization_insensitive_fs(&repo_path) {
+            eprintln!("Unicode 正規化を区別する FS のためテストをスキップ");
+            return;
+        }
+        let decomposed = format!("{DECOMPOSED_STEM}.txt");
+        let precomposed = format!("{PRECOMPOSED_STEM}.txt");
+
+        commit_file(&repo_path, &decomposed, "v1");
+        fs::write(repo_path.join(&decomposed), "v2").unwrap();
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+        let result = checker.check_path_with_cache(&repo_path.join(&precomposed), &cache);
+        assert!(
+            matches!(
+                result,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Modified,
+                    ..
+                })
+            ),
+            "NFD で保存された変更済みファイルを NFC で指定してもブロックすべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_check_path_with_cache_blocks_directory_with_decomposed_name() {
+        // NFD 名のディレクトリ配下の変更済みファイルと staged deletion を、
+        // ディレクトリを NFD のまま指定してもブロックすること。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let dir = repo_path.join(DECOMPOSED_STEM);
+
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        fs::write(dir.join("b.txt"), "b").unwrap();
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "init"]);
+
+        // 変更済みファイル（read_dir で見える側）
+        fs::write(dir.join("a.txt"), "a2").unwrap();
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+        let modified = checker.check_path_with_cache(&dir, &cache);
+        assert!(
+            matches!(
+                modified,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Modified,
+                    ..
+                })
+            ),
+            "NFD 名のディレクトリ配下の変更済みファイルはブロックすべき: {:?}",
+            modified
+        );
+
+        // staged deletion（read_dir では見えず、status キャッシュの走査でだけ拾える側）
+        run_git(&repo_path, &["checkout", "--", "."]);
+        let staged_target = format!("{DECOMPOSED_STEM}/b.txt");
+        run_git(&repo_path, &["rm", "-q", &staged_target]);
+        let cache = checker.get_all_statuses().unwrap();
+        let staged = checker.check_path_with_cache(&dir, &cache);
+        assert!(
+            matches!(
+                staged,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Staged,
+                    ..
+                })
+            ),
+            "NFD 名のディレクトリ配下の staged deletion はブロックすべき: {:?}",
+            staged
+        );
+    }
+
+    #[test]
+    fn test_check_path_with_cache_allows_clean_file_with_decomposed_name() {
+        // 正規化の照合を足しても、clean な NFD 名のファイルは従来どおり削除できること
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let name = format!("{DECOMPOSED_STEM}.txt");
+        commit_file(&repo_path, &name, "v1");
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+        let result = checker.check_path_with_cache(&repo_path.join(&name), &cache);
+        assert!(
+            result.is_ok(),
+            "clean な NFD 名のファイルは削除できるべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_check_path_blocks_modified_file_with_decomposed_name() {
+        // キャッシュを使わない check_path でも、NFD 名の変更済みファイルをブロックすること
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let name = format!("{DECOMPOSED_STEM}.txt");
+
+        commit_file(&repo_path, &name, "v1");
+        fs::write(repo_path.join(&name), "v2").unwrap();
+
+        let checker = open_checker(&repo_path);
+        let result = checker.check_path(&repo_path.join(&name));
+        assert!(
+            matches!(
+                result,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Modified,
+                    ..
+                })
+            ),
+            "キャッシュなしでも NFD 名の変更済みファイルはブロックすべき: {:?}",
+            result
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_path_with_cache_blocks_case_variant_symlink_when_ignorecase_disabled() {
+        // symlink はリンク先へ canonicalize できないため、親を列挙して同じ inode の
+        // エントリ名（ディスク上の綴り）にそろえる。core.ignorecase = false の repo でも、
+        // 大文字小文字違いで指定した変更済み・未追跡の symlink をブロックすること。
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        if !is_case_insensitive_fs(&repo_path) {
+            eprintln!("大文字小文字を区別する FS のためテストをスキップ");
+            return;
+        }
+
+        fs::write(repo_path.join("a.txt"), "a").unwrap();
+        fs::write(repo_path.join("b.txt"), "b").unwrap();
+        std::os::unix::fs::symlink("a.txt", repo_path.join("my_link")).unwrap();
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "init"]);
+        // リンク先を変えて Modified にし、未追跡の symlink も作る
+        fs::remove_file(repo_path.join("my_link")).unwrap();
+        std::os::unix::fs::symlink("b.txt", repo_path.join("my_link")).unwrap();
+        std::os::unix::fs::symlink("a.txt", repo_path.join("new_link")).unwrap();
+        run_git(&repo_path, &["config", "core.ignorecase", "false"]);
+
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+
+        let modified = checker.check_path_with_cache(&repo_path.join("MY_LINK"), &cache);
+        assert!(
+            matches!(
+                modified,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Modified,
+                    ..
+                })
+            ),
+            "大文字小文字違いの指定でも変更済みの symlink はブロックすべき: {:?}",
+            modified
+        );
+
+        let untracked = checker.check_path_with_cache(&repo_path.join("NEW_LINK"), &cache);
+        assert!(
+            matches!(
+                untracked,
+                Err(SafeRmError::DirtyFiles {
+                    status: FileStatus::Untracked,
+                    ..
+                })
+            ),
+            "大文字小文字違いの指定でも未追跡の symlink はブロックすべき: {:?}",
+            untracked
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_entry_spelling_returns_on_disk_name() {
+        // 大文字小文字を区別しない FS では、入力の綴りをディスク上のエントリ名へ置き換える
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().canonicalize().unwrap();
+        if !is_case_insensitive_fs(&dir) {
+            eprintln!("大文字小文字を区別する FS のためテストをスキップ");
+            return;
+        }
+        std::os::unix::fs::symlink("target", dir.join("my_link")).unwrap();
+
+        let typed = dir.join("MY_LINK");
+        let metadata = fs::symlink_metadata(&typed).unwrap();
+        let resolved = GitChecker::resolve_symlink_entry_spelling(&typed, &metadata).unwrap();
+        assert_eq!(resolved, dir.join("my_link"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_entry_spelling_keeps_exact_name() {
+        // 入力どおりの名前のエントリがあれば、そのまま（親だけ解決して）返す
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink("target", dir.join("my_link")).unwrap();
+
+        let typed = dir.join("my_link");
+        let metadata = fs::symlink_metadata(&typed).unwrap();
+        let resolved = GitChecker::resolve_symlink_entry_spelling(&typed, &metadata).unwrap();
+        assert_eq!(resolved, typed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_entry_spelling_does_not_confuse_distinct_case_entries() {
+        // 大文字小文字を区別する FS では `my_link` と `MY_LINK` は別のエントリ。
+        // 名前の大文字小文字を無視した一致で探すと別エントリを取り違えるため、
+        // それぞれが自分自身に解決されること（inode で照合している）を確かめる。
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().canonicalize().unwrap();
+        if is_case_insensitive_fs(&dir) {
+            eprintln!("大文字小文字を区別しない FS のためテストをスキップ");
+            return;
+        }
+        std::os::unix::fs::symlink("a", dir.join("my_link")).unwrap();
+        std::os::unix::fs::symlink("b", dir.join("MY_LINK")).unwrap();
+
+        for name in ["my_link", "MY_LINK"] {
+            let typed = dir.join(name);
+            let metadata = fs::symlink_metadata(&typed).unwrap();
+            let resolved = GitChecker::resolve_symlink_entry_spelling(&typed, &metadata).unwrap();
+            assert_eq!(resolved, typed, "{name} は自分自身に解決されるべき");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_same_entry_name_returns_none_for_exact_name() {
+        // 入力どおりの名前のエントリがあれば、照合せずに入力の名前のままとする
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink("target", dir.join("my_link")).unwrap();
+        let metadata = fs::symlink_metadata(dir.join("my_link")).unwrap();
+
+        let found =
+            GitChecker::find_same_entry_name(&dir, std::ffi::OsStr::new("my_link"), &metadata);
+        assert!(matches!(found, Ok(None)), "{:?}", found);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_same_entry_name_returns_entry_with_same_inode() {
+        // 入力の名前が列挙に無ければ、同じ device / inode のエントリ名を返す
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink("target", dir.join("my_link")).unwrap();
+        std::os::unix::fs::symlink("target", dir.join("other_link")).unwrap();
+        let metadata = fs::symlink_metadata(dir.join("my_link")).unwrap();
+
+        let found =
+            GitChecker::find_same_entry_name(&dir, std::ffi::OsStr::new("typed_name"), &metadata);
+        assert_eq!(found.unwrap(), Some(std::ffi::OsString::from("my_link")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_same_entry_name_blocks_when_no_entry_matches() {
+        // 同じ inode のエントリが無い（検査中に差し替えられた等）なら、入力の名前のまま
+        // 照合して NotInRepo に落ちないよう fail-closed でブロックする
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().canonicalize().unwrap();
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink("target", dir.join("my_link")).unwrap();
+        std::os::unix::fs::symlink("target", elsewhere.join("detached")).unwrap();
+        let metadata = fs::symlink_metadata(elsewhere.join("detached")).unwrap();
+
+        let found =
+            GitChecker::find_same_entry_name(&dir, std::ffi::OsStr::new("typed_name"), &metadata);
+        assert!(
+            matches!(found, Err(SafeRmError::DirectoryReadError { .. })),
+            "{:?}",
+            found
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_same_entry_name_blocks_ambiguous_hard_links() {
+        // symlink 自体のハードリンクで同じ inode のエントリが複数あると、どれが入力に
+        // 当たるか決められないので fail-closed でブロックする
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link1")).unwrap();
+        if fs::hard_link(dir.join("link1"), dir.join("link2")).is_err() {
+            eprintln!("symlink のハードリンクを作れない FS のためテストをスキップ");
+            return;
+        }
+        let metadata = fs::symlink_metadata(dir.join("link1")).unwrap();
+        if !fs::symlink_metadata(dir.join("link2"))
+            .is_ok_and(|link2| link2.file_type().is_symlink())
+        {
+            eprintln!("ハードリンクが symlink 自体を指さない環境のためテストをスキップ");
+            return;
+        }
+
+        let found =
+            GitChecker::find_same_entry_name(&dir, std::ffi::OsStr::new("typed_name"), &metadata);
+        assert!(
+            matches!(found, Err(SafeRmError::DirectoryReadError { .. })),
+            "{:?}",
+            found
+        );
+    }
+
+    #[test]
+    fn test_key_is_under_dir_boundaries() {
+        // 完全一致と `/` 区切りの配下だけを配下とみなし、前方一致の衝突は除外する
+        assert!(GitChecker::key_is_under_dir(b"src/b.txt", b"src", false));
+        assert!(GitChecker::key_is_under_dir(b"src", b"src", false));
+        assert!(GitChecker::key_is_under_dir(
+            b"src/deep/c.txt",
+            b"src",
+            false
+        ));
+        assert!(!GitChecker::key_is_under_dir(b"src2/x.txt", b"src", false));
+        assert!(!GitChecker::key_is_under_dir(b"sr", b"src", false));
+        // ignored ディレクトリは末尾 `/` 付きのキーで載る
+        assert!(GitChecker::key_is_under_dir(b"build/", b"build", false));
+        // ワークディレクトリのルート（空キー）は全エントリが配下
+        assert!(GitChecker::key_is_under_dir(b"anything", b"", false));
+    }
+
+    #[test]
+    fn test_key_is_under_dir_ignore_case_is_ascii_only() {
+        // core.ignorecase のときだけ ASCII の大文字小文字を区別しない
+        assert!(!GitChecker::key_is_under_dir(b"src/b.txt", b"SRC", false));
+        assert!(GitChecker::key_is_under_dir(b"src/b.txt", b"SRC", true));
+        assert!(GitChecker::key_is_under_dir(b"Src", b"sRC", true));
+        assert!(!GitChecker::key_is_under_dir(b"srcx/b.txt", b"SRC", true));
+        // ASCII 以外は git と同じく大文字小文字を同一視しない
+        let upper = "\u{00C4}/a.txt"; // Ä
+        let lower = "\u{00E4}"; // ä
+        assert!(!GitChecker::key_is_under_dir(
+            upper.as_bytes(),
+            lower.as_bytes(),
+            true
+        ));
+    }
+
+    #[test]
+    fn test_insert_canonical_equivalent_keys_adds_decomposed_alias() {
+        // 非 ASCII の NFC キーには NFD 形の別名が同じ status で入り、ASCII キーは増えない
+        let precomposed = format!("dir/{PRECOMPOSED_STEM}.txt");
+        let decomposed = format!("dir/{DECOMPOSED_STEM}.txt");
+        let mut cache: HashMap<Vec<u8>, FileStatus> = HashMap::new();
+        cache.insert(precomposed.clone().into_bytes(), FileStatus::Modified);
+        cache.insert(b"plain.txt".to_vec(), FileStatus::Clean);
+
+        GitChecker::insert_canonical_equivalent_keys(&mut cache);
+
+        assert_eq!(cache.len(), 3);
+        assert_eq!(
+            cache.get(decomposed.as_bytes()),
+            Some(&FileStatus::Modified)
+        );
+        assert_eq!(
+            cache.get(precomposed.as_bytes()),
+            Some(&FileStatus::Modified)
+        );
+        assert_eq!(cache.get(b"plain.txt".as_slice()), Some(&FileStatus::Clean));
+    }
+
+    #[test]
+    fn test_insert_canonical_equivalent_keys_keeps_non_deletable_on_collision() {
+        // 別名が既存のキーと衝突したら、削除不可な status を残す（fail-closed）
+        let precomposed = format!("{PRECOMPOSED_STEM}.txt").into_bytes();
+        let decomposed = format!("{DECOMPOSED_STEM}.txt").into_bytes();
+
+        let mut dirty_alias: HashMap<Vec<u8>, FileStatus> = HashMap::new();
+        dirty_alias.insert(precomposed.clone(), FileStatus::Modified);
+        dirty_alias.insert(decomposed.clone(), FileStatus::Clean);
+        GitChecker::insert_canonical_equivalent_keys(&mut dirty_alias);
+        assert_eq!(dirty_alias.get(&decomposed), Some(&FileStatus::Modified));
+
+        let mut dirty_existing: HashMap<Vec<u8>, FileStatus> = HashMap::new();
+        dirty_existing.insert(precomposed, FileStatus::Clean);
+        dirty_existing.insert(decomposed.clone(), FileStatus::Untracked);
+        GitChecker::insert_canonical_equivalent_keys(&mut dirty_existing);
+        assert_eq!(
+            dirty_existing.get(&decomposed),
+            Some(&FileStatus::Untracked)
+        );
+    }
+
+    #[test]
+    fn test_insert_canonical_equivalent_keys_ignores_non_utf8_keys() {
+        // UTF-8 でないキーは正規化できないので、そのまま残して別名を足さない
+        let mut cache: HashMap<Vec<u8>, FileStatus> = HashMap::new();
+        cache.insert(vec![b'b', 0xff, b'.', b't'], FileStatus::Untracked);
+        GitChecker::insert_canonical_equivalent_keys(&mut cache);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_lookup_cached_status_prefers_exact_key() {
+        // 完全一致のキーがあれば、正規化した形の status より優先する
+        let precomposed = format!("{PRECOMPOSED_STEM}.txt").into_bytes();
+        let decomposed = format!("{DECOMPOSED_STEM}.txt").into_bytes();
+        let mut cache: HashMap<Vec<u8>, FileStatus> = HashMap::new();
+        cache.insert(precomposed.clone(), FileStatus::Clean);
+        cache.insert(decomposed.clone(), FileStatus::Modified);
+
+        assert_eq!(
+            GitChecker::lookup_cached_status(&cache, &precomposed, true),
+            Some(FileStatus::Clean)
+        );
+    }
+
+    #[test]
+    fn test_lookup_cached_status_falls_back_to_decomposed_form_only_when_enabled() {
+        // 完全一致が無ければ入力を NFD にして引き直す。正規化を区別する FS では引き直さない
+        let decomposed_key = format!("{DECOMPOSED_STEM}.txt").into_bytes();
+        let precomposed_input = format!("{PRECOMPOSED_STEM}.txt").into_bytes();
+        let mut cache: HashMap<Vec<u8>, FileStatus> = HashMap::new();
+        cache.insert(decomposed_key, FileStatus::Modified);
+
+        assert_eq!(
+            GitChecker::lookup_cached_status(&cache, &precomposed_input, true),
+            Some(FileStatus::Modified)
+        );
+        assert_eq!(
+            GitChecker::lookup_cached_status(&cache, &precomposed_input, false),
+            None
+        );
+    }
+
+    #[test]
+    fn test_lookup_cached_status_matches_cjk_compatibility_ideograph_names() {
+        // git の precompose は CJK 互換漢字（U+FA19 神）を変えないが、標準の正規化は
+        // 統合漢字（U+795E）へ写す。両辺を NFD にそろえるので、互換漢字と濁点付きの
+        // かなを両方含む名前でも、ディスク上の NFD 名から git の NFC キーを引ける。
+        let git_key = "\u{FA19}\u{30AC}.txt".as_bytes().to_vec();
+        let on_disk = "\u{FA19}\u{30AB}\u{3099}.txt".as_bytes().to_vec();
+        let mut cache: HashMap<Vec<u8>, FileStatus> = HashMap::new();
+        cache.insert(git_key, FileStatus::Modified);
+        GitChecker::insert_canonical_equivalent_keys(&mut cache);
+
+        assert_eq!(
+            GitChecker::lookup_cached_status(&cache, &on_disk, true),
+            Some(FileStatus::Modified)
         );
     }
 }
