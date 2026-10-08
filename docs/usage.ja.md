@@ -17,6 +17,9 @@ safe-rm temp_file.txt      # Exit 0
 
 # ドライラン
 safe-rm -n file.txt # Exit 0, "would remove: file.txt" を表示
+
+# ignore 済みの成果物内に Git 管理ディレクトリがある場合は全件を明示する
+safe-rm -r --allow-nested-git target/vendor/.git target
 ```
 
 ## ブロックされる操作
@@ -54,4 +57,8 @@ safe-rm file.txt/
 safe-rm broken-link/
 # Exit 1: "cannot remove 'broken-link/': No such file or directory"
 # エントリ自体を消すなら末尾スラッシュを外す: safe-rm file.txt
+
+# ignore 済みの対象内でも Git 管理ディレクトリは既定で保護する
+safe-rm -r target
+# Exit 2: 検出した Git 管理エントリの件数とパスを表示
 ```

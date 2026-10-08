@@ -236,7 +236,39 @@ impl GitChecker {
             return Ok(false);
         }
 
-        Self::contains_git_metadata_recursive(path)
+        Ok(!Self::git_metadata_entries_under(path)?.is_empty())
+    }
+
+    /// 再帰削除に含まれる Git 管理エントリを列挙する。
+    /// `.git` ファイル・ディレクトリと bare リポジトリのルートを返す。
+    pub fn git_metadata_entries_under(path: &Path) -> Result<Vec<PathBuf>, SafeRmError> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(SafeRmError::IoError(error)),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = Vec::new();
+        Self::collect_git_metadata_recursive(path, &mut entries)?;
+        Ok(entries)
+    }
+
+    /// 対象ディレクトリ自身がこの repo で ignore されているかを判定する。
+    /// ワークツリー外と repo ルートは許可しない。
+    pub fn is_ignored_directory(&self, path: &Path) -> Result<bool, SafeRmError> {
+        let canonical = path.canonicalize().map_err(SafeRmError::IoError)?;
+        let Some(relative) = self.to_workdir_relative(&canonical) else {
+            return Ok(false);
+        };
+        if relative.as_os_str().is_empty() {
+            return Ok(false);
+        }
+        self.repo
+            .status_should_ignore(&relative)
+            .map_err(SafeRmError::GitError)
     }
 
     /// パスのいずれかのコンポーネントが `.git`（ASCII case-insensitive）か判定する。
@@ -310,7 +342,10 @@ impl GitChecker {
     /// `fs::remove_dir_all` と同様にシンボリックリンクは辿らない。
     /// 大文字小文字を区別しない比較で `.GIT` 等のバリアントも検出し、
     /// `.git` コンポーネントを持たない bare リポジトリも検出する。
-    fn contains_git_metadata_recursive(dir: &Path) -> Result<bool, SafeRmError> {
+    fn collect_git_metadata_recursive(
+        dir: &Path,
+        found: &mut Vec<PathBuf>,
+    ) -> Result<(), SafeRmError> {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => {
@@ -325,7 +360,8 @@ impl GitChecker {
                 path: dir.to_path_buf(),
             })?;
             if Self::is_dot_git_component(&entry.file_name()) {
-                return Ok(true);
+                found.push(entry.path());
+                continue;
             }
             let file_type = match entry.file_type() {
                 Ok(t) => t,
@@ -335,14 +371,14 @@ impl GitChecker {
             };
             if file_type.is_dir() && !file_type.is_symlink() {
                 let entry_path = entry.path();
-                if Self::is_bare_repository_root(&entry_path)
-                    || Self::contains_git_metadata_recursive(&entry_path)?
-                {
-                    return Ok(true);
+                if Self::is_bare_repository_root(&entry_path) {
+                    found.push(entry_path);
+                } else {
+                    Self::collect_git_metadata_recursive(&entry_path, found)?;
                 }
             }
         }
-        Ok(false)
+        Ok(())
     }
 
     /// 絶対パスからワークディレクトリ相対パスを取得

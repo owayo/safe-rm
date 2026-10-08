@@ -78,7 +78,12 @@ pub enum SafeRmError {
     /// ルートディレクトリを指す operand（POSIX rm が拒否する形式）
     RootOperand { path: PathBuf },
     /// Git 管理メタデータへのアクセス
-    ProtectedGitPath { path: PathBuf },
+    ProtectedGitPath {
+        path: PathBuf,
+        metadata_paths: Vec<PathBuf>,
+    },
+    /// 指定された Git 管理エントリが削除対象に一致しない
+    InvalidGitOptIn { path: PathBuf },
     /// プロジェクト外へのアクセス
     OutsideProject {
         path: PathBuf,
@@ -107,6 +112,7 @@ impl SafeRmError {
             | Self::DotOrDotDotOperand { .. }
             | Self::RootOperand { .. }
             | Self::ProtectedGitPath { .. }
+            | Self::InvalidGitOptIn { .. }
             | Self::OutsideProject { .. }
             | Self::DirtyFiles { .. } => 2,
             // ファイル操作エラー
@@ -192,9 +198,32 @@ impl SafeRmError {
                     path.display()
                 )
             }
-            Self::ProtectedGitPath { path } => {
+            Self::ProtectedGitPath {
+                path,
+                metadata_paths,
+            } => {
+                if metadata_paths.is_empty() {
+                    format!(
+                        "Git 管理メタデータは削除できません。\nPath: {}\n作業ツリーのファイルだけを指定してください。",
+                        path.display()
+                    )
+                } else {
+                    let entries = metadata_paths
+                        .iter()
+                        .map(|entry| format!("  {}", entry.display()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(
+                        "Git 管理メタデータは削除できません。\nPath: {}\n含まれる Git 管理エントリ ({} 件):\n{}\nignore 済みの単一ディレクトリなら、削除する各エントリを --allow-nested-git PATH で明示してください。",
+                        path.display(),
+                        metadata_paths.len(),
+                        entries
+                    )
+                }
+            }
+            Self::InvalidGitOptIn { path } => {
                 format!(
-                    "Git 管理メタデータは削除できません。\nPath: {}\n作業ツリーのファイルだけを指定してください。",
+                    "--allow-nested-git のパスが削除対象内の Git 管理ディレクトリと一致しないか、gitdir ファイル・symlink のため許可できません。\nPath: {}",
                     path.display()
                 )
             }
@@ -271,7 +300,8 @@ mod tests {
         );
         assert_eq!(
             SafeRmError::ProtectedGitPath {
-                path: PathBuf::from(".git")
+                path: PathBuf::from(".git"),
+                metadata_paths: Vec::new(),
             }
             .exit_code(),
             2
@@ -542,6 +572,7 @@ mod tests {
     fn test_user_message_protected_git_path() {
         let err = SafeRmError::ProtectedGitPath {
             path: PathBuf::from(".git"),
+            metadata_paths: Vec::new(),
         };
         let msg = err.user_message();
         assert!(msg.contains(".git"));

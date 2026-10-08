@@ -41,6 +41,10 @@ pub struct CliArgs {
     /// ドライランモード（実際には削除せず、削除対象を表示）
     #[arg(short = 'n', long)]
     pub dry_run: bool,
+
+    /// ignore 済みディレクトリ内で、削除を認める Git 管理エントリを正確に指定
+    #[arg(long, value_name = "GIT_PATH", requires = "recursive")]
+    pub allow_nested_git: Vec<PathBuf>,
 }
 
 /// サブコマンド
@@ -68,6 +72,7 @@ mod tests {
             recursive,
             force,
             dry_run,
+            allow_nested_git: Vec::new(),
         }
     }
 
@@ -152,6 +157,7 @@ mod tests {
             recursive: false,
             force: false,
             dry_run: false,
+            allow_nested_git: Vec::new(),
         };
         assert!(matches!(args.command, Some(Commands::Init)));
     }
