@@ -4778,7 +4778,7 @@ mod symlink_to_directory_no_recursive_tests {
 
     #[test]
     fn test_force_ignores_trailing_slash_on_regular_file() {
-        // ENOTDIR は GNU / BSD いずれの rm でも `-f` の無視対象。黙って成功しつつ、
+        // ENOTDIR は GNU rm の `-f` の無視対象（safe-rm は GNU に合わせる）。黙って成功しつつ、
         // ファイルは削除しない。
         let temp_dir = create_test_repo();
         let repo_path = temp_dir.path().canonicalize().unwrap();

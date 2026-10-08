@@ -239,10 +239,11 @@ fn process_path(
     // path resolution がディレクトリ要求として扱うため、ディレクトリに解決できなければ
     // rm も削除しない。safe-rm は直後の `clean()` で末尾セパレータを落とすので、ここで
     // 検査しないと `file.txt` 自体やリンク切れ symlink のエントリ削除に化けて rm より
-    // 危険側へ倒れる。ENOTDIR / ENOENT は GNU / BSD いずれの rm でも `-f` の無視対象
-    // （nonexistent operand 扱い）なので、`-f` のときだけ黙って無視する。ELOOP や権限
-    // 不足は判断不能なので `-f` でも伝播させる。ディレクトリへの symlink（`link/`）は
-    // `is_dir` として解決できるため、従来どおりリンクエントリ自体の削除として扱われる。
+    // 危険側へ倒れる。GNU rm は ENOTDIR / ENOENT を `-f` で存在しない operand として
+    // 無視する（BSD / macOS の rm が無視するのは ENOENT だけ）ので、GNU に合わせて
+    // `-f` のときだけ黙って無視する。ELOOP や権限不足は判断不能なので `-f` でも
+    // 伝播させる。ディレクトリへの symlink（`link/`）は `is_dir` として解決できるため、
+    // 従来どおりリンクエントリ自体の削除として扱われる。
     if let Err(e) = PathChecker::check_trailing_separator_operand(cwd, path) {
         let ignorable_with_force =
             matches!(e, SafeRmError::NotADirectory(_) | SafeRmError::NotFound(_));
