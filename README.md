@@ -199,7 +199,7 @@ min_age_secs = 300
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `allow_project_deletion` | bool | `true` | If `true`, allow deletion of any file within the current project without Git status checks. Containment check is still enforced. |
-| `path` | string | (required) | Directory path where deletion is permitted |
+| `path` | string | (required) | Directory path where deletion is permitted. Glob characters (`*`, `?`, `[`) are not expanded, so such an entry matches only the literal path. A relative path is resolved against the directory `safe-rm` was started in. Both print a warning when the config is loaded. |
 | `recursive` | bool | `false` | If `true`, all nested files/subdirectories are allowed. If `false`, only direct children. |
 | `git_locks.enabled` | bool | `true` | If `false`, `safe-rm git-lock` is refused. |
 | `git_locks.min_age_secs` | integer | `300` | Seconds that must have passed since `index.lock` was last modified before `git-lock` removes it. Must be 1 or more; `0` is a parse error. |
