@@ -12,8 +12,18 @@ use std::path::{Path, PathBuf};
 /// 末尾が未作成で失敗した場合は、既存の親ディレクトリまで canonicalize してから
 /// 未作成部分を再結合する（`/var` と `/private/var` のような別名の差を、未作成の
 /// パスでも吸収するため）。どの祖先も解決できなければ入力をそのまま返す。
+/// 相対パスは、プロセスのカレントディレクトリを基準にする。
 pub(crate) fn try_canonicalize(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
+    try_canonicalize_in(Path::new(""), path)
+}
+
+/// `try_canonicalize` と同じ規則で、相対パスを `base` を基準に解決する。
+///
+/// `base` が空ならプロセスのカレントディレクトリを基準にする（`try_canonicalize` と同じ）。
+/// 相対パスでどの祖先も解決できなければ、`base` に寄せずに入力をそのまま（相対のまま）返す。
+/// allowed_paths の照合はこの結果を使うので、相対のまま残ったエントリは何にも一致しない。
+pub(crate) fn try_canonicalize_in(base: &Path, path: &Path) -> PathBuf {
+    if let Ok(canonical) = base.join(path).canonicalize() {
         return canonical;
     }
 
@@ -25,7 +35,11 @@ pub(crate) fn try_canonicalize(path: &Path) -> PathBuf {
             missing_segments.push(name.to_os_string());
         }
 
-        if let Ok(canonical_parent) = parent.canonicalize() {
+        // 相対パスの先頭より上（空の親）は解決しない。`base` を基準にしても、そこで `base`
+        // 自身に解決したことにしない。
+        if !parent.as_os_str().is_empty()
+            && let Ok(canonical_parent) = base.join(parent).canonicalize()
+        {
             let mut rebuilt = canonical_parent;
             for segment in missing_segments.iter().rev() {
                 rebuilt.push(segment);
@@ -150,6 +164,46 @@ mod tests {
         assert_eq!(
             canonicalize_parent_keep_filename(root),
             try_canonicalize(root)
+        );
+    }
+
+    #[test]
+    fn test_try_canonicalize_in_resolves_relative_path_against_base() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("data")).unwrap();
+
+        // 先頭の成分が base にあれば、base を基準に解決して未作成の部分を付け直す
+        assert_eq!(
+            try_canonicalize_in(&base, Path::new("data/a/memory")),
+            base.join("data").join("a").join("memory")
+        );
+        // `..` も base を基準にする
+        assert_eq!(
+            try_canonicalize_in(&base.join("data"), Path::new("../data")),
+            base.join("data")
+        );
+    }
+
+    #[test]
+    fn test_try_canonicalize_in_keeps_unresolvable_relative_path() {
+        // どの祖先も base に無ければ、base 自身に解決したことにせず、相対のまま返す
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        let path = Path::new("missing/a/memory");
+
+        assert_eq!(try_canonicalize_in(&base, path), path.to_path_buf());
+    }
+
+    #[test]
+    fn test_try_canonicalize_in_ignores_base_for_absolute_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let canonical_tmp = temp_dir.path().canonicalize().unwrap();
+        let other = TempDir::new().unwrap();
+
+        assert_eq!(
+            try_canonicalize_in(other.path(), &canonical_tmp.join("new.txt")),
+            canonical_tmp.join("new.txt")
         );
     }
 }

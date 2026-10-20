@@ -7000,3 +7000,136 @@ mod strict_mode_spelling_tests {
         );
     }
 }
+
+// =============================================================================
+// allowed_paths のワイルドカードと相対パスの警告
+// =============================================================================
+
+mod allowed_paths_warning_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// `<base>/data/a/memory/note.md` と、Git リポジトリ `<base>/proj` を作る。
+    fn setup() -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        let memory = base.join("data").join("a").join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(memory.join("note.md"), "").unwrap();
+        Command::new("git")
+            .args(["init", "-q", "proj"])
+            .current_dir(&base)
+            .output()
+            .unwrap();
+        (temp_dir, base)
+    }
+
+    fn write_config(base: &Path, name: &str, path: &str) -> PathBuf {
+        let config = base.join(name);
+        fs::write(
+            &config,
+            format!("[[allowed_paths]]\npath = \"{}\"\nrecursive = true\n", path),
+        )
+        .unwrap();
+        config
+    }
+
+    #[test]
+    fn test_glob_entry_warns_and_still_matches_only_the_literal_path() {
+        let (_temp_dir, base) = setup();
+        let config = write_config(
+            &base,
+            "glob.toml",
+            &format!("{}/data/*/memory", base.display()),
+        );
+
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["-n", "../data/a/memory/note.md"],
+            &base.join("proj"),
+            Some(&config),
+        );
+
+        assert_eq!(exit_code, 2, "stderr: {}", stderr);
+        assert!(
+            stderr.contains("safe-rm: warning: allowed_paths[0].path = ")
+                && stderr.contains(
+                    "contains '*'; glob patterns are not expanded, so the entry matches only the literal path"
+                ),
+            "ワイルドカードを展開しないことを警告すべき. stderr: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("プロジェクト外へのアクセスは禁止されています"),
+            "一致の結果は変えないべき. stderr: {}",
+            stderr
+        );
+    }
+
+    #[test]
+    fn test_relative_entry_warns_with_resolved_path_and_keeps_its_meaning() {
+        let (_temp_dir, base) = setup();
+        let config = write_config(&base, "rel.toml", "data/a/memory");
+
+        // proj から起動すると、proj には data が無いので解決できず、何にも一致しない
+        let (exit_code, _, stderr) = run_safe_rm_with_config(
+            &["-n", "../data/a/memory/note.md"],
+            &base.join("proj"),
+            Some(&config),
+        );
+        assert_eq!(exit_code, 2, "stderr: {}", stderr);
+        let expected = format!(
+            "safe-rm: warning: allowed_paths[0].path = \"data/a/memory\" is relative, and nothing on its path exists in the directory safe-rm was started in ({}), so the entry matches nothing",
+            base.join("proj").display()
+        );
+        assert!(
+            stderr.contains(&expected),
+            "解決できない相対パスを警告すべき. stderr: {}",
+            stderr
+        );
+
+        // proj の親から起動すると、その親を基準に解決されて一致する（意味は変えない）。
+        // この場合も、相対パスであることと解決先を警告する
+        let (exit_code, stdout, stderr) =
+            run_safe_rm_with_config(&["-n", "data/a/memory/note.md"], &base, Some(&config));
+        assert_eq!(exit_code, 0, "stderr: {}", stderr);
+        assert!(stdout.contains("would remove: data/a/memory/note.md (allowed by config)"));
+        let expected = format!(
+            "safe-rm: warning: allowed_paths[0].path = \"data/a/memory\" is relative; it was resolved against the directory safe-rm was started in: {}",
+            base.join("data").join("a").join("memory").display()
+        );
+        assert!(
+            stderr.contains(&expected),
+            "相対パスの解決先を警告すべき. stderr: {}",
+            stderr
+        );
+        assert!(base.join("data/a/memory/note.md").exists());
+    }
+
+    #[test]
+    fn test_absolute_entry_has_no_warning() {
+        let (_temp_dir, base) = setup();
+        let config = write_config(
+            &base,
+            "abs.toml",
+            &format!("{}/data/a/memory", base.display()),
+        );
+
+        let (exit_code, stdout, stderr) = run_safe_rm_with_config(
+            &["-n", "../data/a/memory/note.md"],
+            &base.join("proj"),
+            Some(&config),
+        );
+
+        assert_eq!(exit_code, 0, "stderr: {}", stderr);
+        assert!(
+            stdout.contains("would remove: ../data/a/memory/note.md (allowed by config)"),
+            "stdout: {}",
+            stdout
+        );
+        assert!(
+            !stderr.contains("warning"),
+            "絶対パスのエントリには警告しないべき. stderr: {}",
+            stderr
+        );
+    }
+}

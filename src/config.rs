@@ -3,7 +3,9 @@
 //! `~/.config/safe-rm/config.toml` からユーザー設定を読み込む。
 //! 指定ディレクトリの安全チェックをバイパスする allowed_paths をサポート。
 
-use crate::path_resolution::{canonicalize_parent_keep_filename, try_canonicalize};
+use crate::path_resolution::{
+    canonicalize_parent_keep_filename, try_canonicalize, try_canonicalize_in,
+};
 use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 
@@ -212,6 +214,10 @@ impl Config {
             Ok(content) => match toml::from_str::<Config>(&content) {
                 Ok(mut config) => {
                     config.resolve_allowed_paths();
+                    let cwd = std::env::current_dir().ok();
+                    for warning in config.allowed_path_warnings(cwd.as_deref()) {
+                        eprintln!("safe-rm: warning: {}", warning);
+                    }
                     config
                 }
                 Err(e) => {
@@ -366,6 +372,58 @@ impl Config {
                 std::path::Component::Prefix(_) | std::path::Component::RootDir
             )
         })
+    }
+
+    /// 書いた側の意図どおりに一致しないおそれがある allowed_paths のエントリへの警告を返す。
+    ///
+    /// `path` の意味は変えない。ワイルドカード（`*`・`?`・`[`）は展開せず、文字どおりのパスに
+    /// しか一致しない。相対パスは、起動したディレクトリ（`cwd`）を基準に解決する。どちらも、
+    /// 書いた側が許可したつもりのまま削除を「プロジェクト外」として拒否される原因になるため、
+    /// 読み込み時に知らせる。未作成の絶対パスは通常の使い方なので警告しない。
+    fn allowed_path_warnings(&self, cwd: Option<&Path>) -> Vec<String> {
+        const GLOB_CHARACTERS: [char; 3] = ['*', '?', '['];
+        let mut warnings = Vec::new();
+        for (index, entry) in self.allowed_paths.iter().enumerate() {
+            let found: Vec<String> = GLOB_CHARACTERS
+                .iter()
+                .filter(|character| entry.path.contains(**character))
+                .map(|character| format!("'{}'", character))
+                .collect();
+            if !found.is_empty() {
+                warnings.push(format!(
+                    "allowed_paths[{}].path = {:?} contains {}; glob patterns are not expanded, so the entry matches only the literal path",
+                    index,
+                    entry.path,
+                    found.join(", ")
+                ));
+            }
+
+            let expanded = Self::expand_tilde(&entry.path);
+            if expanded.is_relative() {
+                // 照合（`resolve_allowed_paths`）と同じ規則で、起動したディレクトリを基準に解決する。
+                // どの祖先も無ければ相対のまま残り、そのエントリは何にも一致しない。
+                let resolved = cwd.map(|cwd| try_canonicalize_in(cwd, &expanded));
+                warnings.push(match (cwd, resolved) {
+                    (Some(_), Some(resolved)) if resolved.is_absolute() => format!(
+                        "allowed_paths[{}].path = {:?} is relative; it was resolved against the directory safe-rm was started in: {}",
+                        index,
+                        entry.path,
+                        resolved.display()
+                    ),
+                    (Some(cwd), _) => format!(
+                        "allowed_paths[{}].path = {:?} is relative, and nothing on its path exists in the directory safe-rm was started in ({}), so the entry matches nothing",
+                        index,
+                        entry.path,
+                        cwd.display()
+                    ),
+                    (None, _) => format!(
+                        "allowed_paths[{}].path = {:?} is relative, and the directory safe-rm was started in could not be determined, so the entry matches nothing",
+                        index, entry.path
+                    ),
+                });
+            }
+        }
+        warnings
     }
 
     /// パスが許可ディレクトリ内にあるかチェック
@@ -1876,5 +1934,131 @@ recursive = true
             !config.is_path_allowed(Path::new("/etc/passwd")),
             "許可範囲外のパスは拒否されるべき"
         );
+    }
+
+    fn config_with_paths(paths: &[&str]) -> Config {
+        Config {
+            allowed_paths: paths
+                .iter()
+                .map(|path| AllowedPathEntry {
+                    path: path.to_string(),
+                    recursive: true,
+                })
+                .collect(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn test_allowed_path_warnings_for_glob_characters() {
+        let config = config_with_paths(&[
+            "/data/*/memory",
+            "/data/file?.txt",
+            "/data/[ab]",
+            "/data/plain",
+        ]);
+
+        let warnings = config.allowed_path_warnings(Some(Path::new("/work")));
+
+        assert_eq!(
+            warnings,
+            vec![
+                "allowed_paths[0].path = \"/data/*/memory\" contains '*'; glob patterns are not expanded, so the entry matches only the literal path".to_string(),
+                "allowed_paths[1].path = \"/data/file?.txt\" contains '?'; glob patterns are not expanded, so the entry matches only the literal path".to_string(),
+                "allowed_paths[2].path = \"/data/[ab]\" contains '['; glob patterns are not expanded, so the entry matches only the literal path".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_allowed_path_warnings_list_each_glob_character_once() {
+        let config = config_with_paths(&["/a/*/b*/c?"]);
+
+        let warnings = config.allowed_path_warnings(Some(Path::new("/work")));
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("contains '*', '?';"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn test_allowed_path_warnings_for_relative_paths() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cwd = tmp_dir.path().canonicalize().unwrap();
+        fs::create_dir(cwd.join("data")).unwrap();
+        // チルダで始まるパスと、未作成の絶対パスは警告しない
+        let config =
+            config_with_paths(&["data/a/memory", ".git/index.lock", "~", "~/x", "/abs/new"]);
+
+        let warnings = config.allowed_path_warnings(Some(&cwd));
+
+        assert_eq!(
+            warnings,
+            vec![
+                // 先頭の成分が起動したディレクトリにあれば、照合と同じく解決できる
+                format!(
+                    "allowed_paths[0].path = \"data/a/memory\" is relative; it was resolved against the directory safe-rm was started in: {}",
+                    cwd.join("data").join("a").join("memory").display()
+                ),
+                // どの祖先も無ければ照合では相対のまま残り、何にも一致しない
+                format!(
+                    "allowed_paths[1].path = \".git/index.lock\" is relative, and nothing on its path exists in the directory safe-rm was started in ({}), so the entry matches nothing",
+                    cwd.display()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_allowed_path_warnings_for_relative_glob_entry() {
+        let config = config_with_paths(&["data/*/memory"]);
+
+        let warnings = config.allowed_path_warnings(Some(Path::new("/work")));
+
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("contains '*'"), "{}", warnings[0]);
+        assert!(warnings[1].contains("is relative"), "{}", warnings[1]);
+    }
+
+    #[test]
+    fn test_allowed_path_warnings_without_startup_directory() {
+        let config = config_with_paths(&["data"]);
+
+        let warnings = config.allowed_path_warnings(None);
+
+        assert_eq!(
+            warnings,
+            vec!["allowed_paths[0].path = \"data\" is relative, and the directory safe-rm was started in could not be determined, so the entry matches nothing".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_warned_entries_keep_their_literal_meaning() {
+        // 警告を出す前と後で照合の結果は変わらず、ワイルドカードは展開しない
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let base = tmp_dir.path().canonicalize().unwrap();
+        let memory = base.join("data").join("a").join("memory");
+        let literal = base.join("data").join("*").join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::create_dir_all(&literal).unwrap();
+        let mut config = config_with_paths(&[&format!("{}/data/*/memory", base.display())]);
+        config.resolve_allowed_paths();
+        let matches = |config: &Config| {
+            (
+                config.is_path_allowed(&memory.join("note.md")),
+                config.is_path_allowed(&literal.join("note.md")),
+            )
+        };
+        let before = matches(&config);
+
+        let warnings = config.allowed_path_warnings(Some(&base));
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(matches(&config), before);
+        // 展開すれば一致する data/a/memory には一致せず、文字どおりの `*` のディレクトリにだけ一致する
+        assert_eq!(before, (false, true));
     }
 }
