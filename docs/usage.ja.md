@@ -20,6 +20,15 @@ safe-rm -n file.txt # Exit 0, "would remove: file.txt" を表示
 
 # ignore 済みの成果物内に Git 管理ディレクトリがある場合は全件を明示する
 safe-rm -r --allow-nested-git target/vendor/.git target
+
+# 異常終了した git が残した空の .git/index.lock
+# （worktree のルートで、git の処理が動いていないことを確かめてから実行する）
+safe-rm git-lock --repo . --assume-quiescent
+# Exit 0, "removed: /path/to/repo/.git/index.lock (git index lock; quiescence asserted)" を表示
+
+# gitdir を直接指定してもよい（ここでは linked worktree の gitdir）。-n は検査だけを行う
+safe-rm git-lock --repo /path/to/repo/.git/worktrees/feature --assume-quiescent -n
+# Exit 0, "would remove: /path/to/repo/.git/worktrees/feature/index.lock (git index lock; quiescence asserted)" を表示
 ```
 
 ## ブロックされる操作
@@ -61,4 +70,38 @@ safe-rm broken-link/
 # ignore 済みの対象内でも Git 管理ディレクトリは既定で保護する
 safe-rm -r target
 # Exit 2: 検出した Git 管理エントリの件数とパスを表示
+
+# 通常の削除では index.lock も消さない（allowed_paths に .git を書いても同じ）
+safe-rm .git/index.lock
+# Exit 2: "Git 管理メタデータは削除できません"
+# メッセージの最後に、使うべきコマンドを示す:
+#   safe-rm git-lock --repo /path/to/repo/.git --assume-quiescent
+
+# --assume-quiescent の無い git-lock
+safe-rm git-lock --repo .
+# Exit 2: "--assume-quiescent が必要です"
+
+# トップレベルのオプションと git-lock の併用（-n は git-lock の後に付ける）
+safe-rm -n git-lock --repo . --assume-quiescent
+# Exit 2: "git-lock は -r / -f / -n / --allow-nested-git / PATH と併用できません"
+
+# サブディレクトリから親は探索しない
+safe-rm git-lock --repo src --assume-quiescent
+# Exit 2: "リポジトリとして開けません"
+
+# 最終更新から min_age_secs（既定 300）秒たっていないロック
+safe-rm git-lock --repo . --assume-quiescent
+# Exit 2: "index.lock の最終更新から 42 秒しかたっていません（必要なのは 300 秒）"
+
+# 中身のあるロック（git が書き終えていない index を含み得る）
+safe-rm git-lock --repo . --assume-quiescent
+# Exit 2: "index.lock が空ではありません（1024 バイト）"
+
+# ロックを開いているプロセスがある
+safe-rm git-lock --repo . --assume-quiescent
+# Exit 2: "index.lock を開いているプロセスがあります（PID: 12345）"
+
+# gitdir に index.lock が無い
+safe-rm git-lock --repo . --assume-quiescent
+# Exit 1: "cannot remove '/path/to/repo/.git/index.lock': No such file or directory"
 ```

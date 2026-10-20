@@ -10,7 +10,7 @@ How the settings in `~/.config/safe-rm/config.toml` behave. The file location, `
 - The `recursive` flag controls whether subdirectories are included:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` is allowed, and `safe-rm -r /path/to/dir/sub` recursively deletes everything under it through the allowed bypass
   - `recursive = false`: Only direct children such as `/path/to/dir/file.txt` are allowed; a direct-child subdirectory may still be removed via `-r`, but only by falling through to the **standard safety branch** (project containment + strict Git status checks). The allowed bypass intentionally rejects `-r` on a direct-child directory under a non-recursive entry so that nested contents are never deleted without the standard checks running.
-- If the config file is **genuinely missing**, `safe-rm` falls back to permissive default (`allow_project_deletion = true`, no allowed paths). If the config location itself cannot be determined, or the config file **exists but cannot be read or parsed** — including a **dangling symlink** at the config path, whether the final or an intermediate path component, which reads back as `NotFound` yet still signals an intended-but-broken config — `safe-rm` falls back to fail-closed strict mode (`allow_project_deletion = false`, no allowed paths) so that an unknown location, syntax error, or broken symlink cannot silently disable intended strict protection. A path whose symlinks still resolve to a not-yet-created file is treated as genuinely missing (permissive), so an unconfigured setup is never over-escalated to strict
+- If the config file is **genuinely missing**, `safe-rm` falls back to permissive default (`allow_project_deletion = true`, no allowed paths). If the config location itself cannot be determined, or the config file **exists but cannot be read or parsed** — including a **dangling symlink** at the config path, whether the final or an intermediate path component, which reads back as `NotFound` yet still signals an intended-but-broken config — `safe-rm` falls back to fail-closed strict mode (`allow_project_deletion = false`, no allowed paths, `git_locks.enabled = false`) so that an unknown location, syntax error, or broken symlink cannot silently disable intended strict protection. A path whose symlinks still resolve to a not-yet-created file is treated as genuinely missing (permissive), so an unconfigured setup is never over-escalated to strict
 - `safe-rm init` protects the config path itself: a dangling symlink at `~/.config/safe-rm/config.toml` is treated as an existing entry and is not followed, so the generated template is never written through the symlink target.
 - Output includes `(allowed by config)` annotation for config-permitted deletions
 
@@ -29,4 +29,20 @@ safe-rm ~/.claude/skills/my-skill/rules.md
 
 safe-rm -r ~/.claude/skills/old-skill/
 # removed: /Users/you/.claude/skills/old-skill/ (allowed by config)
+```
+
+## `[git_locks]`
+
+`[git_locks]` applies only to `safe-rm git-lock`, the subcommand that removes an empty `index.lock` left behind by a crashed git process ([CLI reference](cli-reference.md#git-lock)). Normal deletion does not use these values to grant anything, but the section is parsed with the rest of the file, so an invalid entry here still triggers the config-wide fail-closed fallback.
+
+- **`enabled`** (default `true`): `false` refuses every `git-lock` run with exit code 2.
+- **`min_age_secs`** (default `300`): `git-lock` refuses a lock that was last modified fewer than this many seconds ago, and the message says how many more seconds to wait. The value must be 1 or more; `0` or a negative value is a parse error.
+- `git-lock` never uses `allowed_paths` or `allow_project_deletion` to grant anything. Listing a `.git` directory in `allowed_paths` does not let normal deletion remove `.git/index.lock` either; the error still points to `git-lock`.
+- No setting replaces `--assume-quiescent`. It must be given on every run.
+- If the config file is genuinely missing, the defaults apply (`enabled = true`, `min_age_secs = 300`). If the config cannot be located, read, or parsed — including an unknown key inside `[git_locks]` or `min_age_secs = 0` — the fail-closed fallback also sets `git_locks.enabled = false`, so `git-lock` is refused until the config is fixed. The warning names both settings: `falling back to strict mode (allow_project_deletion = false, git_locks.enabled = false)`.
+
+```toml
+[git_locks]
+enabled = true
+min_age_secs = 600   # require 10 minutes since the last modification
 ```

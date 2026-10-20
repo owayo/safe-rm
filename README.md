@@ -35,6 +35,7 @@ It is meant to stand in for `rm` in AI agents such as Claude Code: a `PreToolUse
 - **Path Containment**: Block deletion of files outside project directory
 - **Strict-Mode Git Status Protection**: When `allow_project_deletion = false`, prevent deletion of modified, staged, or untracked files. The check uses the Git repository that actually owns each target — both the cwd-side checker and a discovery from the target itself are evaluated, and the deepest workdir that contains the target is selected. This blocks bypasses where (a) cwd is non-Git but the target lives inside a nested Git repository, (b) the cwd repository ignores a nested repository (e.g. via `.gitignore`) so its files would otherwise be treated as `Ignored`, and (c) cwd and the target belong to different Git repositories. If the owning repository redirects its working tree elsewhere (e.g. via `core.worktree`) so that its `workdir()` does not contain the target, the target is treated as `Modified` and blocked fail-closed instead of silently falling through to `NotInRepo`
 - **Git Metadata Protection**: Always block direct `.git` targets, gitdir indirection files, bare-repository administrative paths, and recursive deletes that would include current-repository Git metadata. Nested Git metadata in a target subtree is blocked by default, with every discovered path shown in the error. For a single ignored directory, `--allow-nested-git GIT_PATH` explicitly permits a named nested `.git` directory or bare repository root; repeat the option for every entry. Gitdir files and symlinks cannot be opted in, and strict-mode Git status checks still apply. Component matching is ASCII case-insensitive to block `.GIT` bypass attempts on case-insensitive filesystems. Intermediate symlinks that resolve to a `.git` directory or bare repository are blocked, while deleting the symlink itself remains permitted
+- **Recovering an `index.lock` Left by a Crashed Git Process (`git-lock`)**: Normal deletion keeps protecting Git metadata. Only the dedicated `safe-rm git-lock --repo <worktree or gitdir> --assume-quiescent` subcommand can remove an empty `index.lock`, and only under an explicit quiescence assertion and additional checks. With `--assume-quiescent`, you state that no git process is running in that repository and that, until the removal finishes, neither a new git process nor any other change to the gitdir will start. The checks require the lock to sit directly in the gitdir opened from `--repo` (no parent search, no `GIT_DIR`), to be an empty regular file with one link that you own, to be unmodified for at least `min_age_secs` (default 300 seconds), and to be open in no process that safe-rm can inspect. They do not prove that the lock is abandoned; they only add reasons to refuse. Linux and macOS only. `safe-rm .git/index.lock` is still refused, with the `git-lock` command shown in the error
 - **Conflict-Aware Status Mapping**: Files with the `Status::CONFLICTED` flag are treated as `Modified` in strict mode, even when no other index/worktree flags are set, to prevent silent deletion of unresolved merge conflicts
 - **Nested Dirty-File Protection**: Strict-mode checks catch files inside untracked directories, mixed ignored/untracked directories, and tracked modifications inside ignored directories instead of treating them as outside Git
 - **Directory Traversal Prevention**: Block `../` escape attempts whenever the component being collapsed by `..` is not a real directory. Patterns such as `link/../victim` (symlink intermediate), `missing/../victim` (non-existent intermediate), and `file/../victim` (regular-file intermediate) all fail under the OS path resolver but would otherwise be silently normalized to `victim` by lexical path cleaning; safe-rm rejects them fail-closed
@@ -60,7 +61,7 @@ How the checks fit together (check order, safety layers, and what each mode can 
 <!-- standard:install:start -->
 ### Cargo
 
-Requires Rust 1.98 or later.
+Requires Rust 1.99 or later.
 
 ```bash
 cargo install --git https://github.com/owayo/safe-rm --locked
@@ -117,9 +118,16 @@ safe-rm -rf build/
 # Delete an ignored build directory that contains a vendored Git directory
 # (use the exact path reported by a blocked attempt)
 safe-rm -r --allow-nested-git build/vendor/.git build/
+
+# Remove an empty .git/index.lock left behind by a crashed git process
+# (first confirm that no git process is running in that repository)
+safe-rm git-lock --repo /path/to/repo --assume-quiescent
+# removed: /path/to/repo/.git/index.lock (git index lock; quiescence asserted)
 ```
 
 `--allow-nested-git` deletes the named nested repository, including its local Git history and uncommitted changes. Use it only for disposable copies.
+
+`--assume-quiescent` is your guarantee, not something safe-rm can verify. git can hold the lock without keeping it open (for example while `git commit` waits for the editor), and processes of other users, in containers, or on other hosts are invisible to the checks. Add `-n` after `git-lock` to run every check without deleting.
 
 A blocked deletion exits with code 2 and prints the reason on stderr:
 
@@ -131,11 +139,15 @@ safe-rm /etc/passwd
 # `.` / `..` operands (POSIX rm refuses these too)
 safe-rm -r .
 # Exit 2: "末尾が '.' または '..' のパスは削除できません"
+
+# Git metadata, including an index.lock (the message shows the git-lock command to use)
+safe-rm .git/index.lock
+# Exit 2: "Git 管理メタデータは削除できません"
 ```
 
-More allowed and blocked operations, including the strict-mode cases: [docs/usage.md](docs/usage.md)
+More allowed and blocked operations, including the strict-mode and `git-lock` cases: [docs/usage.md](docs/usage.md)
 
-All options, the `init` subcommand, and exit codes: [docs/cli-reference.md](docs/cli-reference.md)
+All options, the `init` and `git-lock` subcommands, and exit codes: [docs/cli-reference.md](docs/cli-reference.md)
 
 ## Configuration
 
@@ -175,6 +187,11 @@ recursive = true
 # [[allowed_paths]]
 # path = "/tmp/logs"
 # recursive = false
+
+# safe-rm git-lock (removing an index.lock left by a crashed git process)
+[git_locks]
+enabled = true
+min_age_secs = 300
 ```
 
 ### Fields
@@ -184,10 +201,12 @@ recursive = true
 | `allow_project_deletion` | bool | `true` | If `true`, allow deletion of any file within the current project without Git status checks. Containment check is still enforced. |
 | `path` | string | (required) | Directory path where deletion is permitted |
 | `recursive` | bool | `false` | If `true`, all nested files/subdirectories are allowed. If `false`, only direct children. |
+| `git_locks.enabled` | bool | `true` | If `false`, `safe-rm git-lock` is refused. |
+| `git_locks.min_age_secs` | integer | `300` | Seconds that must have passed since `index.lock` was last modified before `git-lock` removes it. Must be 1 or more; `0` is a parse error. |
 
-Unknown keys at the top level or inside `allowed_paths` are rejected. This makes misspelled security settings a parse error, which triggers the fail-closed strict-mode fallback instead of silently applying a permissive default. An older `safe-rm` reading a config written for a newer version therefore becomes more restrictive, not less.
+Unknown keys at the top level, inside `allowed_paths`, or inside `[git_locks]` are rejected. This makes misspelled security settings a parse error, which triggers the fail-closed strict-mode fallback instead of silently applying a permissive default; the fallback also turns `git-lock` off. An older `safe-rm` reading a config written for a newer version therefore becomes more restrictive, not less.
 
-How the settings behave (default and strict mode, `allowed_paths` and `recursive`, missing or broken config files) and an example: [docs/configuration.md](docs/configuration.md)
+How the settings behave (default and strict mode, `allowed_paths` and `recursive`, `[git_locks]`, missing or broken config files) and an example: [docs/configuration.md](docs/configuration.md)
 
 ## Claude Code Integration
 
@@ -233,6 +252,7 @@ Add to your `CLAUDE.md`:
 - Use `safe-rm <file>` or `safe-rm -r <directory>` to delete files.
 - `safe-rm` will automatically verify that the file is safe to delete (committed or ignored in Git).
 - If `safe-rm` fails, the file likely has uncommitted changes or is outside the project.
+- If a crashed git process left `.git/index.lock` behind, confirm that no git process is running in the repository, then run `safe-rm git-lock --repo <gitdir> --assume-quiescent`.
 
 ### Examples
 - Delete a build artifact: `safe-rm -r target/`

@@ -35,6 +35,7 @@ Claude Code などの AI エージェントで `rm` の代わりに使う想定�
 - **パス境界チェック**: プロジェクトディレクトリ外のファイル削除をブロック
 - **厳格モードの Git ステータス保護**: `allow_project_deletion = false` のとき、変更済み・ステージング済み・未追跡ファイルの削除を防止。判定には削除対象を実際に所有する Git リポジトリを使用し、cwd 由来の checker と対象起点で discover した checker の両方を評価して、対象を含む最も深い workdir を持つ checker を選択する。これにより (a) cwd が非 Git でも対象が配下のネスト Git リポジトリ内にあるケース、(b) cwd 側 repo が `.gitignore` 等でネスト repo を除外していて本来 `Ignored` として素通りするケース、(c) cwd と対象が別の Git リポジトリに属するケースの三種類のバイパスをいずれも fail-closed で塞ぐ。さらに、対象を所有するリポジトリが `core.worktree` 等でワークツリーを別の場所へリダイレクトしていて `workdir()` が対象を含まない場合も、`NotInRepo` への素通りを防ぐため `Modified` 扱いで fail-closed にブロックする
 - **Git 管理メタデータ保護**: `.git` の直接指定、gitdir 参照ファイル、bare リポジトリの管理パス、現在のリポジトリの管理領域を常時ブロック。再帰削除の対象内にあるネストした Git 管理エントリも既定では拒否し、検出したパスを全件表示する。ignore 済みの単一ディレクトリに限り、`--allow-nested-git GIT_PATH` で各 `.git` ディレクトリまたは bare リポジトリのルートを明示すると削除できる。gitdir ファイルと symlink は許可できず、厳格モードの Git 状態検査も維持する。`.GIT` の検出は ASCII の大文字小文字を区別せず、中間 symlink 経由で管理領域へ入る指定も拒否する（symlink 自身の削除は許可）
+- **異常終了した git が残した `index.lock` の削除（`git-lock`）**: 通常の削除では Git 管理メタデータを保護したまま、専用の `safe-rm git-lock --repo <worktree のルートか gitdir> --assume-quiescent` に限り、静止状態の明示と追加の検査の下で空の `index.lock` を削除できる。`--assume-quiescent` は、そのリポジトリで git の処理が動いておらず、削除が終わるまで新しい処理も gitdir を書き換えるほかの操作も始めないことを、呼び出し側が保証する指定。検査では、ロックが `--repo` から探索なしで開いた gitdir の直下にあること（`GIT_DIR` も使わない）、自分が所有する空の通常ファイルでリンク数が 1 であること、最終更新から `min_age_secs`（既定 300 秒）以上たっていること、safe-rm が調べられる範囲でロックを開いているプロセスが無いことを確かめる。検査はロックが残骸であることの証明ではなく、拒否の理由を増やすだけ。対応は Linux と macOS。`safe-rm .git/index.lock` は引き続き拒否し、エラーメッセージに git-lock のコマンドを示す
 - **コンフリクト対応のステータス判定**: `Status::CONFLICTED` フラグが立ったファイルは、他の index/worktree フラグが立っていない場合でも厳格モードで `Modified` として扱い、未解決のマージコンフリクトが黙って削除されることを防止
 - **ネストしたダーティファイル保護**: 厳格モードでは未追跡ディレクトリ配下、ignored/未追跡が混在するディレクトリ配下、ignored ディレクトリ配下の tracked 変更済みファイルも Git 管理外扱いにせず、正しくブロック
 - **ディレクトリトラバーサル防止**: `../` の直前成分が「実体として存在する通常ディレクトリ」でないパスは fail-closed で拒否。`link/../victim`（symlink 中間成分）、`missing/../victim`（存在しない中間成分）、`file/../victim`（通常ファイル中間成分）はいずれも OS の path resolution では失敗するが、字句正規化で `victim` に化けてしまう経路をブロック
@@ -60,7 +61,7 @@ Claude Code などの AI エージェントで `rm` の代わりに使う想定�
 <!-- standard:install:start -->
 ### Cargo
 
-Rust 1.98 以上が必要です。
+Rust 1.99 以上が必要です。
 
 ```bash
 cargo install --git https://github.com/owayo/safe-rm --locked
@@ -117,9 +118,16 @@ safe-rm -rf build/
 # 無視された成果物内にベンダリングされた .git がある場合
 # ブロック時に表示されたパスを明示する
 safe-rm -r --allow-nested-git build/vendor/.git build/
+
+# 異常終了した git が残した空の .git/index.lock を削除
+# （先に、そのリポジトリで git の処理が動いていないことを確かめる）
+safe-rm git-lock --repo /path/to/repo --assume-quiescent
+# removed: /path/to/repo/.git/index.lock (git index lock; quiescence asserted)
 ```
 
 `--allow-nested-git` は、指定したネスト先のローカル履歴や未コミット変更も削除します。使い捨てのコピーにだけ指定してください。
+
+`--assume-quiescent` は呼び出し側の保証で、safe-rm には確かめきれません。git はロックのファイルを開かずに持ち続けることがあり (`git commit` のエディタ待ちなど)、他のユーザー・コンテナ・別のホストのプロセスは検査から見えないためです。`git-lock` の後に `-n` を付けると、削除せずに検査だけを行います。
 
 ブロックした削除は終了コード 2 で終わり、理由を標準エラー出力に表示します。
 
@@ -131,11 +139,15 @@ safe-rm /etc/passwd
 # `.` / `..` operand（POSIX の rm も拒否する形式）
 safe-rm -r .
 # Exit 2: "末尾が '.' または '..' のパスは削除できません"
+
+# index.lock を含む Git 管理メタデータ（メッセージに git-lock のコマンドを示す）
+safe-rm .git/index.lock
+# Exit 2: "Git 管理メタデータは削除できません"
 ```
 
-厳格モードの例を含む、許可される操作とブロックされる操作の例: [docs/usage.ja.md](docs/usage.ja.md)
+厳格モードと `git-lock` の例を含む、許可される操作とブロックされる操作の例: [docs/usage.ja.md](docs/usage.ja.md)
 
-すべてのオプション、`init` サブコマンド、終了コード: [docs/cli-reference.ja.md](docs/cli-reference.ja.md)
+すべてのオプション、`init` と `git-lock` のサブコマンド、終了コード: [docs/cli-reference.ja.md](docs/cli-reference.ja.md)
 
 ## 設定
 
@@ -175,6 +187,11 @@ recursive = true
 # [[allowed_paths]]
 # path = "/tmp/logs"
 # recursive = false
+
+# safe-rm git-lock（異常終了した git が残した index.lock の削除）
+[git_locks]
+enabled = true
+min_age_secs = 300
 ```
 
 ### フィールド
@@ -184,10 +201,12 @@ recursive = true
 | `allow_project_deletion` | bool | `true` | `true`: プロジェクト内のすべてのファイルをGitステータスチェックなしで削除許可。境界チェックは引き続き有効。 |
 | `path` | string | (必須) | 削除を許可するディレクトリパス |
 | `recursive` | bool | `false` | `true`: ネストされたすべてのファイル/サブディレクトリを許可。`false`: 直下のファイルのみ。 |
+| `git_locks.enabled` | bool | `true` | `false`: `safe-rm git-lock` を拒否する。 |
+| `git_locks.min_age_secs` | 整数 | `300` | `git-lock` が `index.lock` を削除するのに必要な、最終更新からの経過秒数。1 以上を指定し、`0` は解析エラー。 |
 
-トップレベルおよび `allowed_paths` 内の未知の設定キーは拒否されます。これにより、安全性に関わる設定名のタイプミスは解析エラーとなり、permissive な既定値を黙って採用せず、fail-closed の厳格モードへフォールバックします。新しいバージョン向けの設定を古い `safe-rm` が読んだ場合も、保護が弱くなるのではなく安全側へ倒れます。
+トップレベル、`allowed_paths` 内、`[git_locks]` 内の未知の設定キーは拒否されます。これにより、安全性に関わる設定名のタイプミスは解析エラーとなり、permissive な既定値を黙って採用せず、fail-closed の厳格モードへフォールバックします。このフォールバックでは `git-lock` も無効になります。新しいバージョン向けの設定を古い `safe-rm` が読んだ場合も、保護が弱くなるのではなく安全側へ倒れます。
 
-各設定の働き (デフォルトモードと厳格モード、`allowed_paths` と `recursive`、設定ファイルが無いときや壊れているときの扱い) と設定例: [docs/configuration.ja.md](docs/configuration.ja.md)
+各設定の働き (デフォルトモードと厳格モード、`allowed_paths` と `recursive`、`[git_locks]`、設定ファイルが無いときや壊れているときの扱い) と設定例: [docs/configuration.ja.md](docs/configuration.ja.md)
 
 ## Claude Code 連携
 
@@ -233,6 +252,7 @@ Claude Code の設定ファイル（例: `~/.claude/settings.json` または `.c
 - ファイル削除には `safe-rm <file>` または `safe-rm -r <directory>` を使用
 - `safe-rm` はファイルが安全に削除可能か自動検証します（Git でコミット済みまたは無視されたファイル）
 - `safe-rm` が失敗した場合、そのファイルは未コミットの変更があるか、プロジェクト外にあります
+- 異常終了した git の `.git/index.lock` が残ったときは、そのリポジトリで git が動いていないことを確かめてから `safe-rm git-lock --repo <gitdir> --assume-quiescent` を使用
 
 ### 使用例
 - ビルド成果物を削除: `safe-rm -r target/`

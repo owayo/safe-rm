@@ -59,8 +59,8 @@ test: ## 全テストを実行
 test-unit: ## ライブラリのユニットテストだけを実行 (cargo test --lib)
 	$(RUN) cargo test $(CARGO_FLAGS) --lib
 
-test-integration: ## 統合テストだけを実行 (tests/integration_test.rs)
-	$(RUN) cargo test $(CARGO_FLAGS) --test integration_test
+test-integration: ## 統合テストだけを実行 (tests/integration_test.rs と tests/git_lock_test.rs)
+	$(RUN) cargo test $(CARGO_FLAGS) --test integration_test --test git_lock_test
 
 lint: ## 警告をエラーとして clippy を実行
 	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets -- -D warnings

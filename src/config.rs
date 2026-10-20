@@ -23,10 +23,22 @@ use std::path::{Path, PathBuf};
 /// [[allowed_paths]]
 /// path = "/tmp/logs"
 /// recursive = false  # 直下の子のみ許可
+///
+/// # git-lock サブコマンド（異常終了で残った index.lock の削除）
+/// [git_locks]
+/// enabled = true
+/// min_age_secs = 300
 /// ```
 /// デフォルト値 true を返すヘルパー関数
 fn default_true() -> bool {
     true
+}
+
+/// git-lock が要求する、index.lock の最終更新からの経過秒数の既定値
+pub const DEFAULT_GIT_LOCK_MIN_AGE_SECS: u64 = 300;
+
+fn default_git_lock_min_age_secs() -> u64 {
+    DEFAULT_GIT_LOCK_MIN_AGE_SECS
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,9 +53,54 @@ pub struct Config {
     #[serde(default)]
     pub allowed_paths: Vec<AllowedPathEntry>,
 
+    /// git-lock サブコマンドの設定（`[git_locks]`）
+    #[serde(default)]
+    pub git_locks: GitLocksConfig,
+
     /// 事前解決済み許可パス（パフォーマンスのためロード時に canonicalize 済み）
     #[serde(skip)]
     allowed_paths_resolved: Vec<AllowedPathResolved>,
+}
+
+/// git-lock サブコマンドの設定
+///
+/// git-lock は `allowed_paths` と `allow_project_deletion` を使わず、ここだけで許可を絞る。
+/// 設定で `--assume-quiescent` を省略できるようにはしない。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitLocksConfig {
+    /// false の場合、git-lock サブコマンドを拒否する。デフォルト: true
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// index.lock の最終更新から必要な経過秒数。0 は設定エラー。デフォルト: 300
+    #[serde(
+        default = "default_git_lock_min_age_secs",
+        deserialize_with = "deserialize_min_age_secs"
+    )]
+    pub min_age_secs: u64,
+}
+
+impl Default for GitLocksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_age_secs: DEFAULT_GIT_LOCK_MIN_AGE_SECS,
+        }
+    }
+}
+
+/// 経過時間の検査を無くす 0 は、設定エラーにして fail-closed の strict 設定に倒す。
+fn deserialize_min_age_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let secs = u64::deserialize(deserializer)?;
+    if secs == 0 {
+        return Err(serde::de::Error::custom(
+            "git_locks.min_age_secs must be at least 1",
+        ));
+    }
+    Ok(secs)
 }
 
 /// 事前解決済み許可パスエントリ（高速検索のため canonicalize 済み）
@@ -60,6 +117,7 @@ impl Default for Config {
         Self {
             allow_project_deletion: true,
             allowed_paths: Vec::new(),
+            git_locks: GitLocksConfig::default(),
             allowed_paths_resolved: Vec::new(),
         }
     }
@@ -70,11 +128,16 @@ impl Config {
     ///
     /// 既に設定ファイルが置かれている環境で `allow_project_deletion = false`
     /// を意図していた可能性があるため、安全側の strict 設定に倒す。
+    /// `[git_locks] enabled = false` を意図していた可能性もあるため、git-lock も無効にする。
     /// 設定ファイル自体が存在しない場合は通常の `default()` が使われる。
     fn fail_closed_default() -> Self {
         Self {
             allow_project_deletion: false,
             allowed_paths: Vec::new(),
+            git_locks: GitLocksConfig {
+                enabled: false,
+                ..GitLocksConfig::default()
+            },
             allowed_paths_resolved: Vec::new(),
         }
     }
@@ -140,7 +203,7 @@ impl Config {
     pub fn load_from_path(path: Option<PathBuf>) -> Self {
         let Some(path) = path else {
             eprintln!(
-                "safe-rm: warning: cannot determine config path; falling back to strict mode (allow_project_deletion = false)"
+                "safe-rm: warning: cannot determine config path; falling back to strict mode (allow_project_deletion = false, git_locks.enabled = false)"
             );
             return Self::fail_closed_default();
         };
@@ -156,7 +219,7 @@ impl Config {
                     // permissive default に戻すと、利用者が意図した strict 設定が
                     // 一部の構文エラーで無効化されてしまうため。
                     eprintln!(
-                        "safe-rm: warning: config parse error ({}): {}; falling back to strict mode (allow_project_deletion = false)",
+                        "safe-rm: warning: config parse error ({}): {}; falling back to strict mode (allow_project_deletion = false, git_locks.enabled = false)",
                         path.display(),
                         e
                     );
@@ -179,7 +242,7 @@ impl Config {
                 // 区別できないため、コンポーネントを個別に辿って判定する。
                 if Self::has_dangling_symlink_component(&path) {
                     eprintln!(
-                        "safe-rm: warning: config path exists but could not be read ({}); falling back to strict mode (allow_project_deletion = false)",
+                        "safe-rm: warning: config path exists but could not be read ({}); falling back to strict mode (allow_project_deletion = false, git_locks.enabled = false)",
                         path.display()
                     );
                     Self::fail_closed_default()
@@ -190,7 +253,7 @@ impl Config {
             // 権限エラー等のその他の I/O エラーは fail-closed
             Err(e) => {
                 eprintln!(
-                    "safe-rm: warning: cannot read config ({}): {}; falling back to strict mode (allow_project_deletion = false)",
+                    "safe-rm: warning: cannot read config ({}): {}; falling back to strict mode (allow_project_deletion = false, git_locks.enabled = false)",
                     path.display(),
                     e
                 );
@@ -1434,6 +1497,63 @@ recursive = true
         let config: Config = toml::from_str(toml_content).unwrap();
         assert!(!config.allow_project_deletion);
         assert!(config.allowed_paths.is_empty());
+    }
+
+    #[test]
+    fn test_git_locks_defaults_when_section_is_missing() {
+        let config: Config = toml::from_str("allow_project_deletion = false\n").unwrap();
+        assert!(config.git_locks.enabled);
+        assert_eq!(config.git_locks.min_age_secs, DEFAULT_GIT_LOCK_MIN_AGE_SECS);
+        assert!(Config::default().git_locks.enabled);
+    }
+
+    #[test]
+    fn test_parse_git_locks_section() {
+        let toml_content = "[git_locks]\nenabled = false\nmin_age_secs = 60\n";
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(!config.git_locks.enabled);
+        assert_eq!(config.git_locks.min_age_secs, 60);
+
+        let config: Config = toml::from_str("[git_locks]\nmin_age_secs = 1\n").unwrap();
+        assert!(config.git_locks.enabled);
+        assert_eq!(config.git_locks.min_age_secs, 1);
+    }
+
+    #[test]
+    fn test_parse_git_locks_rejects_zero_negative_and_unknown_keys() {
+        // 経過時間の検査を無くす値やタイプミスを、既定値へ黙って倒してはならない
+        for toml_content in [
+            "[git_locks]\nmin_age_secs = 0\n",
+            "[git_locks]\nmin_age_secs = -5\n",
+            "[git_locks]\nmin_age_sec = 60\n",
+            "[git_locks]\nenable = false\n",
+        ] {
+            assert!(
+                toml::from_str::<Config>(toml_content).is_err(),
+                "{toml_content}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_git_locks_config_error_falls_back_to_disabled() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("config.toml");
+        fs::write(&path, "[git_locks]\nmin_age_secs = 0\n").unwrap();
+
+        let config = Config::load_from_path(Some(path));
+
+        assert!(!config.allow_project_deletion);
+        assert!(
+            !config.git_locks.enabled,
+            "設定を読めないときは git-lock も無効にすべき"
+        );
+    }
+
+    #[test]
+    fn test_fail_closed_default_disables_git_locks() {
+        assert!(!Config::fail_closed_default().git_locks.enabled);
+        assert!(!Config::load_from_path(None).git_locks.enabled);
     }
 
     #[test]
