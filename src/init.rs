@@ -29,6 +29,11 @@ recursive = true
 # [[allowed_paths]]
 # path = "/tmp/logs"
 # recursive = false
+
+# safe-rm git-lock（異常終了で残った index.lock の削除）の設定。既定値は次のとおり。
+# [git_locks]
+# enabled = true       # false にすると git-lock を拒否する
+# min_age_secs = 300   # index.lock の最終更新から必要な経過秒数（1 以上）
 "#;
 
 /// init サブコマンドを実行
@@ -119,6 +124,24 @@ mod tests {
         assert!(config.allowed_paths[0].recursive);
         assert_eq!(config.allowed_paths[1].path, "/tmp");
         assert!(config.allowed_paths[1].recursive);
+        assert!(config.git_locks.enabled);
+    }
+
+    #[test]
+    fn test_config_template_git_locks_example_is_valid_when_uncommented() {
+        // コメントアウトした [git_locks] の例は、外せばそのまま既定値と同じ設定になる
+        let uncommented = CONFIG_TEMPLATE
+            .lines()
+            .skip_while(|line| !line.starts_with("# [git_locks]"))
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config: Config = toml::from_str(&uncommented).unwrap();
+        assert!(config.git_locks.enabled);
+        assert_eq!(
+            config.git_locks.min_age_secs,
+            crate::config::DEFAULT_GIT_LOCK_MIN_AGE_SECS
+        );
     }
 
     #[test]

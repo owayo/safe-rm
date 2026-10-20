@@ -9,10 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use path_clean::PathClean;
-use safe_rm::cli::{CliArgs, Commands};
+use safe_rm::cli::{CliArgs, Commands, GitLockArgs};
 use safe_rm::config::Config;
-use safe_rm::error::{FileStatus, SafeRmError};
+use safe_rm::error::{FileStatus, GitLockRefusal, SafeRmError};
 use safe_rm::git_checker::GitChecker;
+use safe_rm::git_lock::{self, GitLockOutcome, GitLockRequest, INDEX_LOCK_FILE_NAME};
 use safe_rm::init;
 use safe_rm::path_checker::PathChecker;
 
@@ -83,14 +84,39 @@ fn main() -> ExitCode {
     let args = CliArgs::parse_args();
 
     // サブコマンドの処理
-    if let Some(Commands::Init) = args.command {
-        match init::run_init() {
+    match &args.command {
+        Some(Commands::Init) => match init::run_init() {
             Ok(()) => return ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("safe-rm: {}", e);
                 return ExitCode::FAILURE;
             }
+        },
+        Some(Commands::GitLock(lock_args)) => {
+            return match run_git_lock(&args, lock_args) {
+                Ok(outcome) => {
+                    let verb = if outcome.removed {
+                        "removed"
+                    } else {
+                        "would remove"
+                    };
+                    println!(
+                        "{}: {} (git index lock; quiescence asserted)",
+                        verb,
+                        outcome.lock_path.display()
+                    );
+                    if let Some(note) = outcome.coverage.note() {
+                        eprintln!("safe-rm: note: {}", note);
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("safe-rm: {}", e);
+                    e.exit_code().into()
+                }
+            };
         }
+        None => {}
     }
 
     // 単一パス失敗は実エラーを 1 回だけ表示する。
@@ -107,6 +133,35 @@ fn main() -> ExitCode {
             e.exit_code().into()
         }
     }
+}
+
+/// git-lock サブコマンドの実行ロジック
+fn run_git_lock(args: &CliArgs, lock_args: &GitLockArgs) -> Result<GitLockOutcome, SafeRmError> {
+    // 通常の削除のオプションや PATH と混ぜると、どちらの意味で動くかが曖昧になるため受け付けない。
+    // ドライランはサブコマンド側の -n だけを使う。
+    if args.recursive
+        || args.force
+        || args.dry_run
+        || !args.allow_nested_git.is_empty()
+        || !args.paths.is_empty()
+    {
+        return Err(SafeRmError::GitLockRefused {
+            target: lock_args.repo.clone(),
+            reason: GitLockRefusal::ConflictingOptions,
+        });
+    }
+
+    // allowed_paths と allow_project_deletion は使わない。設定を読めず strict に倒れたときは
+    // git_locks も無効になる。
+    let config = Config::load();
+    git_lock::remove_index_lock(
+        &GitLockRequest {
+            repo: &lock_args.repo,
+            assume_quiescent: lock_args.assume_quiescent,
+            dry_run: lock_args.dry_run,
+        },
+        &config.git_locks,
+    )
 }
 
 /// メイン実行ロジック
@@ -546,20 +601,14 @@ fn ensure_git_metadata_not_targeted(
 ) -> Result<(), SafeRmError> {
     // 対象自身や中間コンポーネントにある Git メタデータは例外なく保護する。
     if GitChecker::try_path_targets_or_contains_git_metadata(normalized_path, false)? {
-        return Err(SafeRmError::ProtectedGitPath {
-            path: original_path.to_path_buf(),
-            metadata_paths: Vec::new(),
-        });
+        return Err(protected_git_target_error(normalized_path, original_path));
     }
 
     // 現在のリポジトリの管理領域を含む親ディレクトリも常に保護する。
     if let Some(checker) = git_checker
         && checker.touches_git_metadata_path(normalized_path)
     {
-        return Err(SafeRmError::ProtectedGitPath {
-            path: original_path.to_path_buf(),
-            metadata_paths: Vec::new(),
-        });
+        return Err(protected_git_target_error(normalized_path, original_path));
     }
 
     let metadata_paths = if recursive {
@@ -642,6 +691,27 @@ fn ensure_git_metadata_not_targeted(
     }
 
     Ok(())
+}
+
+/// 削除対象自身が Git 管理メタデータのときの拒否を返す。
+///
+/// gitdir（`HEAD` を持つディレクトリ）直下の `index.lock` なら、異常終了で残ったロックを消す
+/// 手段として git-lock サブコマンドを案内する。通常の削除では例外にしない（ロックを開いている
+/// git が居ないかを確かめないため）。
+fn protected_git_target_error(normalized_path: &Path, original_path: &Path) -> SafeRmError {
+    if let (Some(name), Some(gitdir)) = (normalized_path.file_name(), normalized_path.parent())
+        && name == INDEX_LOCK_FILE_NAME
+        && fs::symlink_metadata(gitdir.join("HEAD")).is_ok()
+    {
+        return SafeRmError::ProtectedGitIndexLock {
+            path: original_path.to_path_buf(),
+            gitdir: gitdir.to_path_buf(),
+        };
+    }
+    SafeRmError::ProtectedGitPath {
+        path: original_path.to_path_buf(),
+        metadata_paths: Vec::new(),
+    }
 }
 
 /// 取得済みの `symlink_metadata()` 結果から、削除前の共通検証を行う。
@@ -907,6 +977,45 @@ mod tests {
         assert!(
             matches!(result, Err(super::SafeRmError::ProtectedGitPath { .. })),
             "末尾が .git のパスは ProtectedGitPath で拒否されるべき: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_git_metadata_not_targeted_guides_index_lock_in_gitdir() {
+        // gitdir（HEAD を持つディレクトリ）直下の index.lock は、拒否しつつ git-lock を案内する
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let gitdir = tmp_dir.path().join(".git");
+        std::fs::create_dir(&gitdir).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let lock = gitdir.join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+
+        let result = super::ensure_git_metadata_not_targeted(&lock, &lock, false, None, &[]);
+
+        match result {
+            Err(super::SafeRmError::ProtectedGitIndexLock { gitdir: shown, .. }) => {
+                assert_eq!(shown, gitdir)
+            }
+            other => panic!("ProtectedGitIndexLock で拒否されるべき: {:?}", other),
+        }
+        assert!(lock.exists());
+    }
+
+    #[test]
+    fn test_ensure_git_metadata_not_targeted_does_not_guide_index_lock_outside_gitdir() {
+        // HEAD を持たないディレクトリ（refs/heads など）の index.lock には案内を出さない
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let heads = tmp_dir.path().join(".git").join("refs").join("heads");
+        std::fs::create_dir_all(&heads).unwrap();
+        let lock = heads.join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+
+        let result = super::ensure_git_metadata_not_targeted(&lock, &lock, false, None, &[]);
+
+        assert!(
+            matches!(result, Err(super::SafeRmError::ProtectedGitPath { .. })),
+            "案内なしの ProtectedGitPath で拒否されるべき: {:?}",
             result
         );
     }

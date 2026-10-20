@@ -1,6 +1,6 @@
 # アーキテクチャ
 
-`safe-rm` がパスを削除してよいかをどう判定するかをまとめます。検査の順序、安全レイヤー、モードごとに削除できる範囲を扱います。[README](../README.ja.md) に戻る。
+`safe-rm` がパスを削除してよいかをどう判定するかをまとめます。検査の順序、安全レイヤー、モードごとに削除できる範囲を扱います。空の `index.lock` を削除できる別のサブコマンド `git-lock` は、[`git-lock` サブコマンド](#git-lock-サブコマンド) の節で説明します。[README](../README.ja.md) に戻る。
 
 ```mermaid
 flowchart TB
@@ -44,6 +44,7 @@ flowchart TB
 11. **ルート operand の拒否**: ルートディレクトリに解決される operand（`/`・`//`・cwd が `/` のときの `.`）は exit 2 で拒否する。POSIX の rm も、既定で有効な GNU rm の `--preserve-root` も同じ operand を処理しない。この拒否がないと、cwd が `/` の非 Git 環境（root 実行のコンテナ等）ではプロジェクトルートが `/` になって包含検証を通過し、Git 管理メタデータ保護も `/` 自体はカバーしないため、`safe-rm -r /` がファイルシステム全体の再帰削除に入り得る。`.` / `..` の判定と同じく allowed_paths 判定や `-f` より前に評価する
 12. **末尾セパレータ付き operand の検証**: POSIX では末尾セパレータは「その対象がディレクトリであること」の要求なので、rm はディレクトリとして解決できない operand を削除しない。字句正規化で末尾セパレータが落ちるため、検査しないと `file.txt/` が `file.txt` 自体の削除に、`danglink/`（リンク切れ symlink）がリンクエントリの削除に化ける。正規化前に生 operand を解決し、非ディレクトリなら `Not a directory`、解決できなければ `No such file or directory`（いずれも exit 1、GNU rm と同じく `-f` では黙って無視。BSD / macOS の `rm -f` が無視するのは `ENOENT` だけ）を返す。`ELOOP`（循環 symlink）や権限不足は判断不能なので `-f` でも I/O エラーとして伝播させる。ディレクトリへの symlink は引き続きディレクトリとして解決されるため、`link/` は従来どおりリンクエントリのみを削除してリンク先を残す。この検査は dangling 中間 symlink ガードより後に走るため、解決不能な中間 symlink 配下のパス（`dangling/child/`）は従来どおり exit 2 でブロックされ、`-f` でも無視されない
 13. **綴りの違いを吸収する厳格モード判定**: 大文字小文字や Unicode 正規化を区別しない FS（macOS の APFS、Windows の NTFS）では、`SRC` と指定しても `src` が、NFD の名前で指定しても NFC で保存されたファイルが（その逆も）消える一方、Git の status キーはディスク上の綴り（macOS では `core.precomposeunicode` で NFC にした形）で作られる。厳格モードでは Git 判定の前に対象をディスク上の綴りにそろえる。非 symlink は末尾成分まで canonicalize し、symlink はリンクのまま、同じ device / inode のディレクトリエントリの名前に置き換える（名前で照合すると、大文字小文字を区別する FS で `my_link` と `MY_LINK` を取り違える。その inode のエントリがちょうど 1 つに決まらない場合（検査中の差し替えや、symlink 自体のハードリンク）は fail-closed でブロックする）。macOS では status キャッシュに非 ASCII キーの NFD 形も登録し、照合でも対象の NFD 形で引き直すので、正準等価な名前同士は必ず一致する（両辺を NFD にするのは、標準の NFC が CJK 互換漢字を統合漢字へ写すのに git の precompose はそれを変えないため）。別名が衝突したら削除不可な status を残す。ディレクトリ配下の未コミットの削除を探すときは、`core.ignorecase` の repo では git と同じく ASCII の大文字小文字を区別しない。いずれも完全一致を先に試すので、大文字小文字や正規化を区別する FS 上の別ファイルを対象と取り違えない
+14. **index.lock の復旧は別の経路**: 通常の削除では、Git 管理メタデータを例外にしない。削除対象が gitdir（`HEAD` を持つディレクトリ）直下の `index.lock` なら、エラーメッセージで `safe-rm git-lock` のコマンドを案内する（`allowed_paths` の分岐でも同じ）。案内するだけで、削除はしない。`git-lock` の検査は [`git-lock` サブコマンド](#git-lock-サブコマンド) で説明する
 
 ## ファイルシステムと削除可能スコープ
 
@@ -83,6 +84,7 @@ flowchart TB
 | `temp.txt` (未追跡) | ✅ はい | プロジェクト内 (allow_project_deletion=true) |
 | `~/.claude/skills/foo` | ✅ はい | 設定により許可（recursive） |
 | `.git/` | ❌ いいえ | Git 管理メタデータは常時保護 |
+| `.git/index.lock` | ❌ いいえ | Git 管理メタデータ。空のロックは `safe-rm git-lock` でだけ削除できる |
 | `./` または repo root に `-r` | ❌ いいえ | 再帰削除が Git 管理メタデータを含む |
 | `/etc/passwd` | ❌ いいえ | プロジェクトディレクトリ外 |
 | `../other-project/` | ❌ いいえ | パストラバーサルをブロック |
@@ -129,6 +131,7 @@ flowchart TB
 | `node_modules/` (無視) | ✅ はい | `.gitignore` に記載、依存関係 |
 | `~/.claude/skills/foo` | ✅ はい | 設定により許可（recursive） |
 | `.git/` | ❌ いいえ | Git 管理メタデータは常時保護 |
+| `.git/index.lock` | ❌ いいえ | Git 管理メタデータ。空のロックは `safe-rm git-lock` でだけ削除できる |
 | `./` または repo root に `-r` | ❌ いいえ | 再帰削除が Git 管理メタデータを含む |
 | `main.rs` (変更済み) | ❌ いいえ | 未コミットの変更が失われる |
 | `new_feature.rs` (ステージング済み) | ❌ いいえ | コミット待ちの内容が失われる |
@@ -138,7 +141,7 @@ flowchart TB
 
 **重要ポイント**:
 - プロジェクト外のファイルは**常にブロック**（設定に関係なく）
-- `.git` などの Git 管理メタデータは**常にブロック**（設定に関係なく）。現在のリポジトリルートの再帰削除も対象
+- `.git` などの Git 管理メタデータは**常にブロック**（設定に関係なく）。現在のリポジトリルートの再帰削除も対象。`index.lock` を削除できるのは別のサブコマンド `safe-rm git-lock` だけで、それも独自の条件を満たす空のロックに限る
 - **デフォルトモード (`allow_project_deletion = true`)**: プロジェクト内の作業ツリーファイルは削除可能（AIエージェントに最適）
 - **厳格モード (`allow_project_deletion = false`)**: クリーン（コミット済み）または無視された作業ツリーファイルのみ削除可能。ディレクトリ削除では、ディスク上に存在しない未コミットの削除（配下の `git rm` 済み=staged ファイルや worktree から削除済みの tracked ファイル）も拒否する。これらは `read_dir` ではなく Git ステータスキャッシュで検出する
 - **設定で許可されたパス**は境界チェックと Git ステータスチェックをバイパスするが、Git 管理メタデータ保護はバイパスしない（`~` 展開対応）
@@ -164,3 +167,84 @@ flowchart TB
 | プロジェクト外 | いいえ | Git状態に関わらず常にブロック |
 
 **注意**: カレントディレクトリが Git リポジトリでなくても strict チェックは無効になりません。`safe-rm` は削除対象からもリポジトリを検出し、対象を含む最も深い worktree で判定します。対象自体が Git リポジトリに属さない場合のみ Git ステータスチェックをスキップし、リポジトリ検出や worktree 解決のエラーは fail-closed でブロックします。
+
+## `git-lock` サブコマンド
+
+通常の削除では、Git 管理メタデータを例外なく保護します。`safe-rm git-lock` はこれとは別の復旧用のコマンドです。静止状態の明示と追加の検査の下で、gitdir 直下の空の `index.lock` を削除します。検査は、ロックが残骸であることの証明ではありません。git はロックを開かずに持ち続けることがあり、safe-rm から見えないプロセスもあるため、検査は拒否の理由を増やすだけです。git の処理が動いていないことは、呼び出し側が `--assume-quiescent` で毎回保証します。
+
+```mermaid
+flowchart TB
+    Start["safe-rm git-lock"] --> Mixed{"トップレベルのオプションか PATH がある?"}
+    Mixed -->|Yes| Refuse["Exit 2: 拒否"]
+    Mixed -->|No| Enabled{"git_locks.enabled?"}
+    Enabled -->|No| Refuse
+    Enabled -->|Yes| Assert{"--assume-quiescent がある?"}
+    Assert -->|No| Refuse
+    Assert -->|Yes| Env{"Linux か macOS で、GIT_INDEX_FILE が未設定?"}
+    Env -->|No| Refuse
+    Env -->|Yes| Open{"--repo を探索なしで開けて、bare でない?"}
+    Open -->|No| Refuse
+    Open -->|Yes| Pin{"gitdir の fd を開いた後も、gitdir として開けてパスが同じ?"}
+    Pin -->|No| Refuse
+    Pin -->|Yes| Lookup{"gitdir 直下の index.lock は?"}
+    Lookup -->|無い| NotFound["Exit 1: No such file or directory"]
+    Lookup -->|通常ファイルでない| Refuse
+    Lookup -->|通常ファイル| OpenLock{"開いたファイルが名前の側と同じ?"}
+    OpenLock -->|No| Refuse
+    OpenLock -->|Yes| Attrs{"空・リンク数 1・自分の所有・十分に古い・最終更新が未来でない?"}
+    Attrs -->|No| Refuse
+    Attrs -->|Yes| Scan{"開いているプロセスがある、または調べきれない?"}
+    Scan -->|Yes| Refuse
+    Scan -->|No| Dry{"ドライラン?"}
+    Dry -->|Yes| WouldRemove["Exit 0: would remove"]
+    Dry -->|No| Recheck{"fd の側と名前の側が検査時と同じ?"}
+    Recheck -->|No| Refuse
+    Recheck -->|Yes| Unlink["unlinkat"]
+    Unlink --> Gone{"保持している inode のリンク数が 0?"}
+    Gone -->|No| Replaced["Exit 1: 削除した名前は検査したファイルではなかった"]
+    Gone -->|Yes| Removed["Exit 0: removed"]
+```
+
+### 判定の順序
+
+1. **オプションの併用**: トップレベルの `-r`・`-f`・`-n`・`--allow-nested-git` や PATH があれば拒否する。ドライランには `git-lock` の後の `-n` を使う
+2. **設定**: `[git_locks] enabled = false` なら拒否する。設定ファイルの場所を決定できない・読めない・解析できないときの fail-closed のフォールバックも、これに当たる。`allowed_paths` と `allow_project_deletion` は見ない
+3. **静止状態の明示**: `--assume-quiescent` が無ければ拒否する
+4. **OS**: Linux と macOS 以外（Windows を含む）では拒否する
+5. **代わりの index**: `GIT_INDEX_FILE` が設定されていれば（空文字でも）拒否する。代わりの index を使っていると、gitdir 直下の `index.lock` がその index のロックとは限らないため
+6. **リポジトリ**: `--repo` を `Repository::open_ext(path, NO_SEARCH, 空)` で開く。親ディレクトリは探索せず、`GIT_DIR` などの環境変数も使わない。リポジトリとして開けないパスと bare リポジトリは拒否する。続いて gitdir（`repo.path()`）を canonicalize して固定する。linked worktree と submodule では、それぞれに固有の gitdir になる
+7. **名前の側の検査**: gitdir を `O_DIRECTORY | O_NOFOLLOW` で開き、その fd を保持する。続いて `--repo` をもう一度解決し、同じ gitdir になること、そのパスがまだ fd と同じディレクトリを指していることを確かめる。最初の解決から fd を開くまでの間に、gitdir が別のディレクトリへ差し替わっていれば拒否する。再確認の間だけ元に戻す差し替えは検出できず、静止状態の明示に頼る（最後の節を参照）。この fd を基準に、`fstatat(..., AT_SYMLINK_NOFOLLOW)` で `index.lock` を調べる。無ければ `cannot remove '<path>': No such file or directory`（exit 1）で終わる。通常ファイルでなければ（symlink・ディレクトリ・FIFO・ソケット・デバイス）、開かずに拒否する
+8. **開く**: `openat(O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)` で開き、その fd の `fstat` が名前の側の結果と同じことを確かめる
+9. **属性**: 通常ファイルで、サイズ 0、リンク数 1、所有者が実効ユーザーであること。最終更新が未来でなく、最終更新から `min_age_secs` 以上たっていること。空のロックに限るのは、中身のあるロックには、git がまだ確定させていない新しい index が入っていることがあるため。新しすぎるときは、あと何秒待てばよいかをメッセージに出す
+10. **開いているプロセスの検査**: ロックを開いているプロセスが見つかったとき、または調べきれなかったときは拒否する（後述）
+11. **ドライラン**: `-n` なら、ここで成功（exit 0）として終わり、何も削除しない
+12. **再確認**: 削除の直前に、保持している fd の側と名前の側の両方を調べ直す。デバイス番号・inode・mode・サイズ・リンク数・所有者・mtime・ctime が一つでも検査時と違えば拒否する（再試行しない）
+13. **削除**: `unlinkat(dirfd, "index.lock", 0)` で削除する。失敗は I/O エラー（exit 1）
+14. **確認**: 保持している inode のリンク数が 0 になったことを確かめる。0 でなければ、削除した名前は検査したファイルではなかったので、exit 1 で終わる
+
+ロックの fd は、手順 8 から最後まで開いたままにします。開いている間は inode が解放されないため、同じデバイス番号と inode を持つ別のファイルが現れて再確認を通ることはありません。
+
+### 開いているプロセスの検査の範囲
+
+検査は、パスではなくデバイス番号と inode で照合します。結果は「見つかった」「見つからなかった」「調べきれない」の 3 つで、削除に進むのは「見つからなかった」ときだけです。
+
+- **Linux**: `/proc/<pid>/fd` の各 fd を stat する。調べるのは、`/proc/<pid>` の所有者が実効ユーザーと同じプロセスだけ（root で実行したときは全部）。non-dumpable なプロセス（`ssh-agent` など）は root の所有に見えるため、対象外になる。同じ所有者のプロセスで fd を読めなければ、調べきれないとする。`/proc/<pid>/fd/<n>` を辿るにはカーネルの ptrace の読み取りの検査を通る必要があり、所有者が同じでも、別のグループで動くプロセスや LSM で閉じ込められたプロセスでは拒まれる。そのときは、メッセージにプロセスの名前と資格情報を添える。こうしたプロセスも利用者のリポジトリを操作し得るので対象外にはせず、そうしたプロセスがある環境では `git-lock` は拒否する（GitHub Actions の Linux ランナーで実際に起きた）
+- **macOS**: libproc（`proc_listallpids` → `proc_pidinfo` → `proc_pidfdinfo(PROC_PIDFDVNODEINFO)`）で、各 vnode の fd のデバイス番号と inode を得る。調べるのは、実効ユーザーと同じユーザーで動くプロセスだけ（root で実行したときは全部）。PID の一覧と fd の一覧は、バッファが埋まったら広げて取り直し、それでも取り切れなければ調べきれないとする。中身を取得できない vnode の fd（`ENOENT`）は、対象外にして数える。fd の中身の取得を OS が拒む（`EPERM`）プロセスは、Apple のプラットフォームバイナリ（`csops` の `CS_PLATFORM_BINARY`）で、実行ファイル名が `git` でも `git-*` でもないときだけ対象外にする。この分類の前後で起動時刻を照合し、PID が再利用されていれば調べきれないとする。実測では、同じユーザーで動く OS のデーモン（`/usr/libexec/routined`・`lsd`・`nsurlsessiond`・`UserEventAgent` など）がこれに当たる。それ以外の `EPERM` は、調べきれないとする。対象外にしたプロセスと fd は、`safe-rm: note:` の行で伝える
+- 調べきれないプロセスがあっても走査は続け、ロックを開いているプロセスが見つかれば、調べきれないことより先にそれを報告する
+- 自分のプロセスでは、検査のために開いたロックの fd だけを除外する
+- 走査に 10 秒を超えてかかったら、最後まで終えていても、調べきれないとする
+
+### 検査から見えないもの
+
+- 他のユーザーのプロセス（root で実行しない限り）
+- 別の PID 名前空間（コンテナなど）のプロセス
+- ネットワークファイルシステムでリポジトリを共有する、別のホストのプロセス
+- fd を開かずにロックを持ち続ける git（`git commit` のエディタ待ちなど）
+
+`--assume-quiescent` を毎回求め、設定でも省略できないようにしているのは、これらが見えないためです。
+
+### 検査で防げない競合
+
+safe-rm は、再確認と削除の間の差し替えを防げません。手順 12 の再確認と手順 13 の `unlinkat` は、別々のシステムコールです。その間に別のプロセスが `index.lock` を差し替えると、`unlinkat` は差し替え後のファイルを削除します。検査したファイルが別の名前で残っていれば（名前を変えて退避されていれば）、手順 14 で検出して exit 1 で終えます。すでに削除されていた場合は検出できません。どちらの場合も、削除は取り消せません。
+
+手順 7 の gitdir の確認にも、同じ種類の限界があります。最初の解決、解決し直し、保持した fd との照合は、それぞれ別にパスを解決します。その間に gitdir を差し替えて元に戻す処理があっても、検出できません。どちらの競合も、git 以外による変更を静止状態の明示に含めることで扱います。削除が終わるまで、gitdir、そこまでのパスにあるディレクトリ、`index.lock` を、何も変更・差し替えしないことが前提です。通常の削除と同じく、safe-rm の動作中にパスを意図的に入れ替える並行の処理には、これらの検査では備えていません。

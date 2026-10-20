@@ -10,7 +10,7 @@
 - `recursive` フラグでサブディレクトリの扱いを制御:
   - `recursive = true`: `/path/to/dir/sub/deep/file.txt` も許可。`safe-rm -r /path/to/dir/sub` は allowed バイパス経由で配下を再帰削除する
   - `recursive = false`: `/path/to/dir/file.txt`（直下のファイル）のみ許可。直下のサブディレクトリも `-r` で削除できる場合があるが、その場合は allowed バイパスではなく**標準分岐（プロジェクト境界検証 + 厳格モードでは Git ステータス検査）に落ちる**。非再帰エントリ配下のディレクトリへの `-r` は意図しない子孫まで削除しうるため、allowed バイパスとしては明示的に拒否し、必ず標準チェックを経由させる
-- 設定ファイルが**本当に存在しない**場合は permissive デフォルト（`allow_project_deletion = true`、許可パスなし）にフォールバック。設定ファイルの場所自体を決定できない場合、または設定ファイルが**存在するが読み込み/パースに失敗**した場合 — 設定パス（最終・中間いずれのコンポーネント）が **dangling symlink**（`read_to_string`・`symlink_metadata` ともに `NotFound` を返すが、設定が置かれた意図が壊れている状態）のケースを含む — は、利用者が意図した strict 設定が不明な設定位置・構文エラー・symlink 切れで無効化されないよう、fail-closed で strict モード（`allow_project_deletion = false`、許可パスなし）にフォールバック。symlink が解決でき、その先のファイルが未作成なだけの場合は本当に存在しないものとして扱い（permissive）、未設定環境を過剰に strict 化しない
+- 設定ファイルが**本当に存在しない**場合は permissive デフォルト（`allow_project_deletion = true`、許可パスなし）にフォールバック。設定ファイルの場所自体を決定できない場合、または設定ファイルが**存在するが読み込み/パースに失敗**した場合 — 設定パス（最終・中間いずれのコンポーネント）が **dangling symlink**（`read_to_string`・`symlink_metadata` ともに `NotFound` を返すが、設定が置かれた意図が壊れている状態）のケースを含む — は、利用者が意図した strict 設定が不明な設定位置・構文エラー・symlink 切れで無効化されないよう、fail-closed で strict モード（`allow_project_deletion = false`、許可パスなし、`git_locks.enabled = false`）にフォールバック。symlink が解決でき、その先のファイルが未作成なだけの場合は本当に存在しないものとして扱い（permissive）、未設定環境を過剰に strict 化しない
 - `safe-rm init` は設定ファイルパス自体も保護する。`~/.config/safe-rm/config.toml` が dangling symlink の場合も既存エントリとして扱ってリンク先を辿らないため、生成テンプレートが symlink のリンク先へ書き込まれない。
 - 設定で許可された削除には `(allowed by config)` の注釈が出力に表示
 
@@ -29,4 +29,20 @@ safe-rm ~/.claude/skills/my-skill/rules.md
 
 safe-rm -r ~/.claude/skills/old-skill/
 # removed: /Users/you/.claude/skills/old-skill/ (allowed by config)
+```
+
+## `[git_locks]`
+
+`[git_locks]` は `safe-rm git-lock` だけに効く設定です。`git-lock` は、異常終了した git が残した空の `index.lock` を削除するサブコマンドです（[CLI リファレンス](cli-reference.ja.md#git-lock)）。通常の削除は、この値を許可の判定に使いません。ただし、この節も設定ファイル全体と一緒に解析するため、ここの設定エラーは設定全体の fail-closed のフォールバックを起こします。
+
+- **`enabled`**（既定 `true`）: `false` にすると、`git-lock` を常に終了コード 2 で拒否する。
+- **`min_age_secs`**（既定 `300`）: 最終更新からこの秒数がたっていないロックを、`git-lock` は拒否する。拒否のメッセージには、あと何秒待てばよいかも出る。1 以上を指定し、`0` や負の値は解析エラーになる。
+- `git-lock` は、`allowed_paths` と `allow_project_deletion` を許可の材料に使わない。`allowed_paths` に `.git` ディレクトリを書いても、通常の削除で `.git/index.lock` を消せるようにはならない（エラーは引き続き `git-lock` を案内する）。
+- `--assume-quiescent` の代わりになる設定は無い。毎回指定する。
+- 設定ファイルが本当に存在しないときは既定値（`enabled = true`、`min_age_secs = 300`）を使う。設定の場所を決定できない、読めない、解析できない（`[git_locks]` 内の未知のキーや `min_age_secs = 0` を含む）ときは、fail-closed のフォールバックで `git_locks.enabled = false` にもなる。設定を直すまで `git-lock` は拒否される。警告文には両方の設定が出る: `falling back to strict mode (allow_project_deletion = false, git_locks.enabled = false)`。
+
+```toml
+[git_locks]
+enabled = true
+min_age_secs = 600   # 最終更新から 10 分たったロックだけを削除する
 ```

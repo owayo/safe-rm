@@ -3,7 +3,7 @@
 //! clap derive による型安全な引数パースを提供する。
 
 use clap::builder::{OsStringValueParser, TypedValueParser};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 /// safe-rm の CLI 引数
@@ -52,6 +52,28 @@ pub struct CliArgs {
 pub enum Commands {
     /// 設定ファイルを初期化（~/.config/safe-rm/config.toml）
     Init,
+    /// 異常終了で残った gitdir 直下の空の index.lock を、静止状態の明示と追加の検査の下で削除
+    GitLock(GitLockArgs),
+}
+
+/// git-lock サブコマンドの引数
+#[derive(Args, Debug)]
+pub struct GitLockArgs {
+    /// worktree のルートか gitdir（親ディレクトリは探索しない）
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_parser = OsStringValueParser::new().map(PathBuf::from)
+    )]
+    pub repo: PathBuf,
+
+    /// そのリポジトリで git の処理が動いておらず、削除が終わるまで新しい処理も gitdir を書き換えるほかの操作も始めないことを保証する（必須）
+    #[arg(long)]
+    pub assume_quiescent: bool,
+
+    /// ドライランモード（削除せず、検査を通るかを表示）
+    #[arg(short = 'n', long)]
+    pub dry_run: bool,
 }
 
 impl CliArgs {
@@ -160,5 +182,64 @@ mod tests {
             allow_nested_git: Vec::new(),
         };
         assert!(matches!(args.command, Some(Commands::Init)));
+    }
+
+    #[test]
+    fn test_cli_args_git_lock_subcommand() {
+        let args = CliArgs::try_parse_from([
+            "safe-rm",
+            "git-lock",
+            "--repo",
+            "repo/.git",
+            "--assume-quiescent",
+            "-n",
+        ])
+        .unwrap();
+        let Some(Commands::GitLock(lock_args)) = args.command else {
+            panic!("git-lock として解析されない: {:?}", args.command);
+        };
+        assert_eq!(lock_args.repo, PathBuf::from("repo/.git"));
+        assert!(lock_args.assume_quiescent);
+        assert!(lock_args.dry_run);
+        // ドライランはサブコマンド側の -n で、トップレベルの -n とは別
+        assert!(!args.dry_run);
+        assert!(args.paths.is_empty());
+    }
+
+    #[test]
+    fn test_cli_args_git_lock_without_assume_quiescent_is_parsed() {
+        // 無いときは clap のエラーではなく、意味を説明する safe-rm の拒否にする
+        let args = CliArgs::try_parse_from(["safe-rm", "git-lock", "--repo", "."]).unwrap();
+        let Some(Commands::GitLock(lock_args)) = args.command else {
+            panic!("git-lock として解析されない");
+        };
+        assert!(!lock_args.assume_quiescent);
+    }
+
+    #[test]
+    fn test_cli_args_git_lock_requires_repo() {
+        assert!(CliArgs::try_parse_from(["safe-rm", "git-lock", "--assume-quiescent"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_args_git_lock_keeps_top_level_flags_for_rejection() {
+        let args = CliArgs::try_parse_from([
+            "safe-rm",
+            "-r",
+            "git-lock",
+            "--repo",
+            ".",
+            "--assume-quiescent",
+        ])
+        .unwrap();
+        assert!(args.recursive);
+        assert!(matches!(args.command, Some(Commands::GitLock(_))));
+    }
+
+    #[test]
+    fn test_cli_args_dot_slash_git_lock_is_a_path() {
+        let args = CliArgs::try_parse_from(["safe-rm", "./git-lock"]).unwrap();
+        assert!(args.command.is_none());
+        assert_eq!(args.paths, vec![PathBuf::from("./git-lock")]);
     }
 }

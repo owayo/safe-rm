@@ -21,6 +21,15 @@ safe-rm -n file.txt        # Exit 0, shows "would remove: file.txt"
 # If an ignored build directory contains vendored Git directories,
 # name every reported metadata directory explicitly.
 safe-rm -r --allow-nested-git target/vendor/.git target
+
+# An empty .git/index.lock left behind by a crashed git process
+# (run from the worktree root after confirming that no git process is running there)
+safe-rm git-lock --repo . --assume-quiescent
+# Exit 0, shows "removed: /path/to/repo/.git/index.lock (git index lock; quiescence asserted)"
+
+# The gitdir itself also works (here a linked worktree's); -n only runs the checks
+safe-rm git-lock --repo /path/to/repo/.git/worktrees/feature --assume-quiescent -n
+# Exit 0, shows "would remove: /path/to/repo/.git/worktrees/feature/index.lock (git index lock; quiescence asserted)"
 ```
 
 ## Blocked Operations
@@ -62,4 +71,38 @@ safe-rm broken-link/
 # A nested Git directory is protected by default, even under an ignored target.
 safe-rm -r target
 # Exit 2: lists the nested Git metadata paths and their count
+
+# Normal deletion does not remove an index.lock either, even if .git is in allowed_paths
+safe-rm .git/index.lock
+# Exit 2: "Git 管理メタデータは削除できません"
+# The message ends with the command to use:
+#   safe-rm git-lock --repo /path/to/repo/.git --assume-quiescent
+
+# git-lock without --assume-quiescent
+safe-rm git-lock --repo .
+# Exit 2: "--assume-quiescent が必要です"
+
+# git-lock with top-level options (give -n after git-lock instead)
+safe-rm -n git-lock --repo . --assume-quiescent
+# Exit 2: "git-lock は -r / -f / -n / --allow-nested-git / PATH と併用できません"
+
+# A subdirectory is not searched upward
+safe-rm git-lock --repo src --assume-quiescent
+# Exit 2: "リポジトリとして開けません"
+
+# The lock was modified less than min_age_secs (default 300) seconds ago
+safe-rm git-lock --repo . --assume-quiescent
+# Exit 2: "index.lock の最終更新から 42 秒しかたっていません（必要なのは 300 秒）"
+
+# The lock has content (it may hold an index that git has not finished writing)
+safe-rm git-lock --repo . --assume-quiescent
+# Exit 2: "index.lock が空ではありません（1024 バイト）"
+
+# A process has the lock open
+safe-rm git-lock --repo . --assume-quiescent
+# Exit 2: "index.lock を開いているプロセスがあります（PID: 12345）"
+
+# No index.lock in the gitdir
+safe-rm git-lock --repo . --assume-quiescent
+# Exit 1: "cannot remove '/path/to/repo/.git/index.lock': No such file or directory"
 ```

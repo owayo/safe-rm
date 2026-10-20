@@ -3,7 +3,7 @@
 //! SafeRmError および関連型を定義し、全エラー状態を処理する。
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Git 追跡ファイルのステータス（エラーメッセージ用の前方宣言）
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,6 +45,141 @@ impl fmt::Display for FileStatus {
     }
 }
 
+/// git-lock サブコマンドが index.lock の削除を拒否した理由
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitLockRefusal {
+    /// 設定で無効になっている（`[git_locks] enabled = false`、または設定を読めず strict に倒れた）
+    Disabled,
+    /// `--assume-quiescent` が無い
+    QuiescenceNotAsserted,
+    /// 通常の削除のオプションや PATH と併用された
+    ConflictingOptions,
+    /// 検査を実装していない OS
+    UnsupportedPlatform { os: &'static str },
+    /// `GIT_INDEX_FILE` が設定されている
+    IndexFileOverridden,
+    /// `--repo` をリポジトリとして開けない
+    RepositoryOpenFailed { message: String },
+    /// bare リポジトリ
+    BareRepository,
+    /// 通常ファイルでない
+    NotRegularFile { kind: &'static str },
+    /// 空でない
+    NotEmpty { size: u64 },
+    /// リンク数が 1 でない
+    UnexpectedLinkCount { nlink: u64 },
+    /// 所有者が実効ユーザーでない
+    NotOwned { owner: u32, euid: u32 },
+    /// 最終更新から最小経過時間がたっていない
+    TooRecent { age_secs: u64, min_age_secs: u64 },
+    /// 最終更新時刻が未来
+    ModifiedInFuture { ahead_secs: u64 },
+    /// ロックを開いているプロセスがある
+    OpenByProcess { pids: Vec<u32> },
+    /// 開いているプロセスを調べきれない
+    InspectionIncomplete { reason: String },
+    /// 検査の途中でロックが変わった
+    ChangedDuringInspection,
+}
+
+impl fmt::Display for GitLockRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled => write!(
+                f,
+                "git-lock は設定で無効です（[git_locks] enabled = false、または設定ファイルを読めず strict モードに倒れた状態）。"
+            ),
+            Self::QuiescenceNotAsserted => write!(
+                f,
+                "--assume-quiescent が必要です。これは、そのリポジトリで git の処理が動いておらず、削除が終わるまで新しい処理も gitdir を書き換えるほかの操作も始めないことを、呼び出し側が保証する指定です。git の処理が残っていないことを確かめてから付けてください。"
+            ),
+            Self::ConflictingOptions => write!(
+                f,
+                "git-lock は -r / -f / -n / --allow-nested-git / PATH と併用できません。ドライランは safe-rm git-lock --repo PATH --assume-quiescent -n のように git-lock の後に -n を付けてください。"
+            ),
+            Self::UnsupportedPlatform { os } => write!(
+                f,
+                "この OS（{}）では git-lock を使えません（対応は Linux と macOS）。",
+                os
+            ),
+            Self::IndexFileOverridden => write!(
+                f,
+                "GIT_INDEX_FILE が設定されています。代わりの index を使う指定は対象外です（gitdir 直下の index.lock が、その index のロックとは限りません）。"
+            ),
+            Self::RepositoryOpenFailed { message } => write!(
+                f,
+                "リポジトリとして開けません: {}\n--repo には worktree のルートか gitdir を指定してください（親ディレクトリは探索しません）。",
+                message
+            ),
+            Self::BareRepository => write!(f, "bare リポジトリは対象外です。"),
+            Self::NotRegularFile { kind } => {
+                write!(f, "index.lock が通常ファイルではありません（{}）。", kind)
+            }
+            Self::NotEmpty { size } => write!(
+                f,
+                "index.lock が空ではありません（{} バイト）。書きかけの index を含み得るため削除しません。",
+                size
+            ),
+            Self::UnexpectedLinkCount { nlink } => write!(
+                f,
+                "index.lock のリンク数が {} です（1 のときだけ削除します）。",
+                nlink
+            ),
+            Self::NotOwned { owner, euid } => write!(
+                f,
+                "index.lock の所有者（uid {}）が実行ユーザー（uid {}）と違います。",
+                owner, euid
+            ),
+            Self::TooRecent {
+                age_secs,
+                min_age_secs,
+            } => write!(
+                f,
+                "index.lock の最終更新から {} 秒しかたっていません（必要なのは {} 秒）。git の処理が終わっていることを確かめ、{} 秒以上待ってから再実行してください。",
+                age_secs,
+                min_age_secs,
+                min_age_secs.saturating_sub(*age_secs)
+            ),
+            Self::ModifiedInFuture { ahead_secs } => write!(
+                f,
+                "index.lock の最終更新時刻が現在より {} 秒先です。システムの時刻を確かめてください。",
+                ahead_secs
+            ),
+            Self::OpenByProcess { pids } => write!(
+                f,
+                "index.lock を開いているプロセスがあります（PID: {}）。そのプロセスが終わるのを待ってください。",
+                pids.iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::InspectionIncomplete { reason } => write!(
+                f,
+                "index.lock を開いているプロセスを調べきれませんでした（{}）。安全のため削除しません。",
+                reason
+            ),
+            Self::ChangedDuringInspection => write!(
+                f,
+                "検査の途中で index.lock が変わりました。git の処理が動いている可能性があるため削除しません。"
+            ),
+        }
+    }
+}
+
+/// シェルにそのまま貼れるようにパスを引用する（安全な文字だけならそのまま）。
+fn shell_quote(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let is_plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%=".contains(c));
+    if is_plain {
+        text.into_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
 /// safe-rm のエラー型
 #[derive(Debug)]
 pub enum SafeRmError {
@@ -82,6 +217,13 @@ pub enum SafeRmError {
         path: PathBuf,
         metadata_paths: Vec<PathBuf>,
     },
+    /// 通常の削除で gitdir 直下の index.lock を指定した（git-lock サブコマンドを案内する）
+    ProtectedGitIndexLock { path: PathBuf, gitdir: PathBuf },
+    /// git-lock サブコマンドが安全条件を満たさず index.lock の削除を拒否した
+    GitLockRefused {
+        target: PathBuf,
+        reason: GitLockRefusal,
+    },
     /// 指定された Git 管理エントリが削除対象に一致しない
     InvalidGitOptIn { path: PathBuf },
     /// プロジェクト外へのアクセス
@@ -93,6 +235,8 @@ pub enum SafeRmError {
     DirtyFiles { path: PathBuf, status: FileStatus },
 
     // システムエラー（Exit 1）
+    /// git-lock が削除した名前は、検査したファイルではなかった（検査と削除の間に差し替えられた）
+    GitLockReplaced { path: PathBuf },
     /// I/O エラー
     IoError(std::io::Error),
     /// Git 操作エラー
@@ -112,6 +256,8 @@ impl SafeRmError {
             | Self::DotOrDotDotOperand { .. }
             | Self::RootOperand { .. }
             | Self::ProtectedGitPath { .. }
+            | Self::ProtectedGitIndexLock { .. }
+            | Self::GitLockRefused { .. }
             | Self::InvalidGitOptIn { .. }
             | Self::OutsideProject { .. }
             | Self::DirtyFiles { .. } => 2,
@@ -220,6 +366,26 @@ impl SafeRmError {
                         entries
                     )
                 }
+            }
+            Self::ProtectedGitIndexLock { path, gitdir } => {
+                format!(
+                    "Git 管理メタデータは削除できません。\nPath: {}\n異常終了で残った index.lock なら、git の処理が動いていないことを確かめてから、次のコマンドで削除できます:\n  safe-rm git-lock --repo {} --assume-quiescent",
+                    path.display(),
+                    shell_quote(gitdir)
+                )
+            }
+            Self::GitLockRefused { target, reason } => {
+                format!(
+                    "index.lock を削除できません。\nPath: {}\n{}",
+                    target.display(),
+                    reason
+                )
+            }
+            Self::GitLockReplaced { path } => {
+                format!(
+                    "index.lock の名前を削除しましたが、検査したファイルではありませんでした（検査と削除の間に差し替えられた可能性があります）。\nPath: {}\nリポジトリの状態を確かめてください。",
+                    path.display()
+                )
             }
             Self::InvalidGitOptIn { path } => {
                 format!(
@@ -577,6 +743,128 @@ mod tests {
         let msg = err.user_message();
         assert!(msg.contains(".git"));
         assert!(msg.contains("Git 管理メタデータ"));
+    }
+
+    #[test]
+    fn test_protected_git_index_lock_guides_to_git_lock() {
+        let err = SafeRmError::ProtectedGitIndexLock {
+            path: PathBuf::from(".git/index.lock"),
+            gitdir: PathBuf::from("/work/repo/.git"),
+        };
+        assert_eq!(err.exit_code(), 2);
+        let msg = err.user_message();
+        assert!(msg.contains("Git 管理メタデータは削除できません。"));
+        assert!(msg.contains("Path: .git/index.lock"));
+        assert!(msg.contains("safe-rm git-lock --repo /work/repo/.git --assume-quiescent"));
+    }
+
+    #[test]
+    fn test_protected_git_index_lock_quotes_gitdir_for_the_shell() {
+        let err = SafeRmError::ProtectedGitIndexLock {
+            path: PathBuf::from(".git/index.lock"),
+            gitdir: PathBuf::from("/work/my repo/it's/.git"),
+        };
+        assert!(
+            err.user_message()
+                .contains("--repo '/work/my repo/it'\\''s/.git' --assume-quiescent")
+        );
+    }
+
+    #[test]
+    fn test_shell_quote() {
+        assert_eq!(shell_quote(Path::new("/a/b-c_d.e/.git")), "/a/b-c_d.e/.git");
+        assert_eq!(shell_quote(Path::new("/a b")), "'/a b'");
+        assert_eq!(shell_quote(Path::new("/a$b")), "'/a$b'");
+        assert_eq!(shell_quote(Path::new("/日本語")), "'/日本語'");
+        assert_eq!(shell_quote(Path::new("")), "''");
+    }
+
+    #[test]
+    fn test_git_lock_refused_is_a_block_with_reason() {
+        let err = SafeRmError::GitLockRefused {
+            target: PathBuf::from("/work/repo/.git/index.lock"),
+            reason: GitLockRefusal::TooRecent {
+                age_secs: 18,
+                min_age_secs: 300,
+            },
+        };
+        assert_eq!(err.exit_code(), 2);
+        let msg = err.user_message();
+        assert!(
+            msg.starts_with("index.lock を削除できません。\nPath: /work/repo/.git/index.lock\n")
+        );
+        assert!(msg.contains("最終更新から 18 秒しかたっていません（必要なのは 300 秒）"));
+        assert!(msg.contains("282 秒以上待ってから再実行してください"));
+    }
+
+    #[test]
+    fn test_git_lock_refusal_messages_explain_the_reason() {
+        let cases = [
+            (GitLockRefusal::Disabled, "enabled = false"),
+            (GitLockRefusal::QuiescenceNotAsserted, "--assume-quiescent"),
+            (GitLockRefusal::ConflictingOptions, "併用できません"),
+            (
+                GitLockRefusal::UnsupportedPlatform { os: "windows" },
+                "この OS（windows）",
+            ),
+            (GitLockRefusal::IndexFileOverridden, "GIT_INDEX_FILE"),
+            (
+                GitLockRefusal::RepositoryOpenFailed {
+                    message: "could not find repository".to_string(),
+                },
+                "could not find repository",
+            ),
+            (GitLockRefusal::BareRepository, "bare"),
+            (
+                GitLockRefusal::NotRegularFile { kind: "FIFO" },
+                "通常ファイルではありません（FIFO）",
+            ),
+            (GitLockRefusal::NotEmpty { size: 42 }, "42 バイト"),
+            (
+                GitLockRefusal::UnexpectedLinkCount { nlink: 2 },
+                "リンク数が 2",
+            ),
+            (
+                GitLockRefusal::NotOwned {
+                    owner: 0,
+                    euid: 501,
+                },
+                "uid 0",
+            ),
+            (
+                GitLockRefusal::ModifiedInFuture { ahead_secs: 61 },
+                "61 秒先",
+            ),
+            (
+                GitLockRefusal::OpenByProcess {
+                    pids: vec![123, 456],
+                },
+                "PID: 123, 456",
+            ),
+            (
+                GitLockRefusal::InspectionIncomplete {
+                    reason: "/proc を読めません".to_string(),
+                },
+                "/proc を読めません",
+            ),
+            (GitLockRefusal::ChangedDuringInspection, "検査の途中で"),
+        ];
+        for (reason, expected) in cases {
+            let message = reason.to_string();
+            assert!(message.contains(expected), "{reason:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn test_git_lock_replaced_is_an_operation_error() {
+        let err = SafeRmError::GitLockReplaced {
+            path: PathBuf::from("/work/repo/.git/index.lock"),
+        };
+        assert_eq!(err.exit_code(), 1);
+        assert!(
+            err.user_message()
+                .contains("検査したファイルではありませんでした")
+        );
     }
 
     // --- IoError / GitError 周りのテスト ---

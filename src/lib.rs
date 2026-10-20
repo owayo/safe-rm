@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod git_checker;
+pub mod git_lock;
 pub mod init;
 pub mod path_checker;
 mod path_resolution;
