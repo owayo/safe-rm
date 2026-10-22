@@ -6,10 +6,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
-/// テスト用の safe-rm バイナリのパスを取得
+/// Cargo が現在のプロファイルと出力先にビルドした safe-rm のパスを取得
 fn get_binary_path() -> String {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    format!("{}/target/debug/safe-rm", manifest_dir)
+    env!("CARGO_BIN_EXE_safe-rm").to_string()
 }
 
 /// safe-rm を実行してステータスを取得
@@ -3439,6 +3438,30 @@ mod strict_mode_nested_tests {
 
 mod force_flag_tests {
     use super::*;
+
+    #[test]
+    fn test_nested_git_opt_in_invalid_operand_count_reports_error() {
+        let temp_dir = TempDir::new().unwrap();
+        for name in ["one.txt", "two.txt"] {
+            fs::write(temp_dir.path().join(name), "keep").unwrap();
+        }
+
+        for paths in [&[][..], &["one.txt", "two.txt"][..]] {
+            let mut args = vec!["-rf", "--allow-nested-git", "nested/.git"];
+            args.extend_from_slice(paths);
+            let (exit_code, stdout, stderr) = run_safe_rm(&args, temp_dir.path());
+
+            assert_eq!(exit_code, 2);
+            assert!(stdout.is_empty());
+            assert!(stderr.contains("--allow-nested-git requires exactly one PATH"));
+            for name in ["one.txt", "two.txt"] {
+                assert_eq!(
+                    fs::read_to_string(temp_dir.path().join(name)).unwrap(),
+                    "keep"
+                );
+            }
+        }
+    }
 
     /// allow_project_deletion = false の設定ファイルを作成
     fn create_strict_config() -> tempfile::NamedTempFile {

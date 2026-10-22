@@ -720,12 +720,7 @@ impl GitChecker {
         let path = Self::resolve_on_disk_spelling(path)?;
         let path = path.as_path();
         if Self::is_real_directory(path)? {
-            // まず read_dir ベースの再帰検査でディスク上のファイルを個別に検査する
-            // （ダーティなファイルはその具体パスでブロックメッセージを出す）。
-            self.check_directory(path)?;
-            // 続いて、read_dir では拾えない削除済みエントリ（ディスク上に無い未コミット
-            // 削除）を一括取得結果から検査する。
-            self.check_cached_statuses_under_directory(path, &self.get_all_statuses()?)
+            self.check_directory(path)
         } else {
             self.check_file(path)
         }
@@ -749,10 +744,18 @@ impl GitChecker {
     /// # 戻り値
     /// * `Ok(())` - 全ファイルが Clean または Ignored
     /// * `Err(SafeRmError::DirtyFiles)` - 変更のあるファイルが存在
+    ///
+    /// ディスク上に無い未コミットの削除も、Git ステータス一覧から検査する。
     pub fn check_directory(&self, dir: &Path) -> Result<(), SafeRmError> {
+        let dir =
+            Self::resolve_on_disk_spelling(dir).map_err(|_| SafeRmError::DirectoryReadError {
+                path: dir.to_path_buf(),
+            })?;
         // ディレクトリ自体が ignored でも、配下に tracked な変更済みファイルが
         // 存在し得るため、早期許可せず各エントリを再帰的に検査する。
-        self.check_directory_recursive(dir)
+        self.check_directory_recursive(&dir)?;
+        // read_dir では見つからない staged / worktree deletion も最上位で 1 回検査する。
+        self.check_cached_statuses_under_directory(&dir, &self.get_all_statuses()?)
     }
 
     /// ディレクトリ内のファイルを再帰的にチェック
@@ -775,7 +778,7 @@ impl GitChecker {
 
             if Self::is_real_directory(&path)? {
                 // サブディレクトリは再帰的にチェック
-                self.check_directory(&path)?;
+                self.check_directory_recursive(&path)?;
             } else {
                 // ファイルのステータスをチェック
                 let status = self.get_file_status(&path);
@@ -792,14 +795,21 @@ impl GitChecker {
     ///
     /// `get_all_statuses()` で事前取得したキャッシュを使用することで、
     /// 多数のファイルを持つディレクトリの検証を高速化。
+    /// ディスク上に無い未コミットの削除も、同じキャッシュから検査する。
     pub fn check_directory_with_cache(
         &self,
         dir: &Path,
         cache: &HashMap<Vec<u8>, FileStatus>,
     ) -> Result<(), SafeRmError> {
+        let dir =
+            Self::resolve_on_disk_spelling(dir).map_err(|_| SafeRmError::DirectoryReadError {
+                path: dir.to_path_buf(),
+            })?;
         // キャッシュ利用時も、ignored ディレクトリ配下の tracked 変更を
         // 見落とさないように必ず各エントリを検査する。
-        self.check_directory_recursive_with_cache(dir, cache)
+        self.check_directory_recursive_with_cache(&dir, cache)?;
+        // サブツリー全体を 1 回走査し、再帰の深さに応じた全件走査の繰り返しを避ける。
+        self.check_cached_statuses_under_directory(&dir, cache)
     }
 
     /// キャッシュを使用した再帰的ディレクトリチェック
@@ -825,7 +835,7 @@ impl GitChecker {
 
             if Self::is_real_directory(&path)? {
                 // サブディレクトリも再帰的にチェック
-                self.check_directory_with_cache(&path, cache)?;
+                self.check_directory_recursive_with_cache(&path, cache)?;
             } else {
                 // キャッシュからステータスを取得
                 let status = self.get_file_status_from_cache(&path, cache);
@@ -864,14 +874,7 @@ impl GitChecker {
         let path = Self::resolve_on_disk_spelling(path)?;
         let path = path.as_path();
         if Self::is_real_directory(path)? {
-            // まず read_dir ベースの再帰検査でディスク上のファイルを個別に検査する
-            // （ダーティなファイルはその具体パスでブロックメッセージを出す）。
-            self.check_directory_with_cache(path, cache)?;
-            // 続いて、read_dir では拾えない削除済みエントリ（ディスク上に無い未コミット
-            // 削除）をキャッシュから検査する。この走査は最上位エントリで 1 回だけ行い、
-            // サブツリー全体（任意の深さ）をカバーするため、再帰のたびに再走査して
-            // O(深さ×件数) になるのを避ける。
-            self.check_cached_statuses_under_directory(path, cache)
+            self.check_directory_with_cache(path, cache)
         } else {
             self.check_file_with_cache(path, cache)
         }
@@ -3692,6 +3695,87 @@ mod tests {
     }
 
     #[test]
+    fn test_directory_apis_keep_directory_read_errors() {
+        let temp_dir = create_test_repo();
+        let repo_path = temp_dir.path().canonicalize().unwrap();
+        let checker = open_checker(&repo_path);
+        let cache = checker.get_all_statuses().unwrap();
+        let missing = repo_path.join("missing");
+
+        for result in [
+            checker.check_directory(&missing),
+            checker.check_directory_with_cache(&missing, &cache),
+        ] {
+            assert!(
+                matches!(result, Err(SafeRmError::DirectoryReadError { ref path }) if path == &missing),
+                "存在しないディレクトリは従来どおり読み取り失敗として拒否する: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_directory_apis_block_staged_deletion_in_descendant() {
+        for cached in [false, true] {
+            let temp_dir = create_test_repo();
+            let repo_path = temp_dir.path().canonicalize().unwrap();
+            fs::create_dir_all(repo_path.join("dir/deep")).unwrap();
+            commit_file(&repo_path, "dir/deep/gone.txt", "original");
+            commit_file(&repo_path, "dir/keep.txt", "keep");
+            run_git(&repo_path, &["rm", "dir/deep/gone.txt"]);
+
+            let checker = open_checker(&repo_path);
+            let dir = repo_path.join("dir");
+            let result = if cached {
+                checker.check_directory_with_cache(&dir, &checker.get_all_statuses().unwrap())
+            } else {
+                checker.check_directory(&dir)
+            };
+
+            assert!(
+                matches!(
+                    result,
+                    Err(SafeRmError::DirtyFiles {
+                        status: FileStatus::Staged,
+                        ..
+                    })
+                ),
+                "公開ディレクトリ検査も、ディスク上に無い孫の staged deletion を拒否する: cached={cached}, {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_directory_apis_block_worktree_deletion_in_descendant() {
+        for cached in [false, true] {
+            let temp_dir = create_test_repo();
+            let repo_path = temp_dir.path().canonicalize().unwrap();
+            fs::create_dir_all(repo_path.join("dir/deep")).unwrap();
+            commit_file(&repo_path, "dir/deep/gone.txt", "original");
+            commit_file(&repo_path, "dir/keep.txt", "keep");
+            fs::remove_file(repo_path.join("dir/deep/gone.txt")).unwrap();
+
+            let checker = open_checker(&repo_path);
+            let dir = repo_path.join("dir");
+            let result = if cached {
+                checker.check_directory_with_cache(&dir, &checker.get_all_statuses().unwrap())
+            } else {
+                checker.check_directory(&dir)
+            };
+
+            assert!(
+                matches!(
+                    result,
+                    Err(SafeRmError::DirtyFiles {
+                        status: FileStatus::Modified,
+                        ..
+                    })
+                ),
+                "公開ディレクトリ検査も、ディスク上に無い孫の worktree deletion を拒否する: cached={cached}, {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_check_path_with_cache_blocks_staged_deletion_in_directory() {
         // strict モードのディレクトリ削除で、配下の staged deletion（git rm 済みで
         // ディスク上には存在しないが index に削除がステージされたファイル）を
@@ -3810,6 +3894,12 @@ mod tests {
             "別ディレクトリ(dir2)の削除は clean な dir の削除をブロックしないべき: {:?}",
             result
         );
+        assert!(checker.check_directory(&repo_path.join("dir")).is_ok());
+        assert!(
+            checker
+                .check_directory_with_cache(&repo_path.join("dir"), &cache)
+                .is_ok()
+        );
     }
 
     // --- 入力の綴りとディスク上の綴りが違う場合の照合 ---
@@ -3870,6 +3960,8 @@ mod tests {
         run_git(&repo_path, &["add", "."]);
         run_git(&repo_path, &["commit", "-m", "init"]);
         run_git(&repo_path, &["rm", "-q", "src/b.txt"]);
+        // Git の大文字小文字無視に頼らず、公開 API 自身がディスク上の綴りへ解決する。
+        run_git(&repo_path, &["config", "core.ignorecase", "false"]);
 
         let checker = open_checker(&repo_path);
         let cache = checker.get_all_statuses().unwrap();
@@ -3885,6 +3977,21 @@ mod tests {
             "大文字小文字違いのディレクトリ指定でも staged deletion をブロックすべき: {:?}",
             result
         );
+        for result in [
+            checker.check_directory(&repo_path.join("SRC")),
+            checker.check_directory_with_cache(&repo_path.join("SRC"), &cache),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(SafeRmError::DirtyFiles {
+                        status: FileStatus::Staged,
+                        ..
+                    })
+                ),
+                "公開ディレクトリ検査も入力の綴りを解決する: {result:?}"
+            );
+        }
     }
 
     #[test]
