@@ -127,6 +127,8 @@ safe-rm git-lock --repo /path/to/repo --assume-quiescent
 
 `--allow-nested-git` deletes the named nested repository, including its local Git history and uncommitted changes. Use it only for disposable copies.
 
+When the target contains gitdir files or symlinks, the refusal does not suggest this option. For a verified, unlocked linked worktree, it instead shows a shell-quoted `git -C <common-git-dir> worktree remove -- <worktree>` command. Submodules, separate gitdirs, and broken gitdir files do not receive this command.
+
 `--assume-quiescent` is your guarantee, not something safe-rm can verify. git can hold the lock without keeping it open (for example while `git commit` waits for the editor), and processes of other users, in containers, or on other hosts are invisible to the checks. Add `-n` after `git-lock` to run every check without deleting.
 
 A blocked deletion exits with code 2 and prints the reason on stderr:

@@ -103,6 +103,8 @@ Config、`allowed_paths`、`[git_locks]` の TOML デシリアライズには `#
 
 ### CLI の引数検証
 
+再帰削除の拒否は、検出した管理エントリを `GitMetadataEntry` / `GitMetadataKind` に分類して表示する。`GitChecker::classify_git_metadata_entry()` は案内のための分類で、確認不能なら `Other` に倒す。`ProtectedGitPath` の `metadata_entries` は全件がディレクトリの場合だけ opt-in を案内する。gitdir ファイル・symlink が混在する場合は許可フラグの照合前に拒否し、登録・実体パス・ロック状態を確認できた linked worktree に限り `git -C <commondir> worktree remove -- <worktree>` を案内する。非 UTF-8 パスは別のパスに化ける案内を防ぐためコマンドを出さず、`user_message()` はファイルシステムを再検査しない。
+
 `--allow-nested-git` の対象件数の検証は `main()` で削除開始前に行い、0 件・複数件のいずれも診断を表示して拒否する。`run()` 内のバッチ処理は各パスのエラーを表示するため、終了時には exit 2 の重複表示を抑えている。この抑制に、パスごとの処理へ進む前の引数エラーを混ぜない。
 
 ### テスト構成

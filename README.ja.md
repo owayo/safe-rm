@@ -127,6 +127,8 @@ safe-rm git-lock --repo /path/to/repo --assume-quiescent
 
 `--allow-nested-git` は、指定したネスト先のローカル履歴や未コミット変更も削除します。使い捨てのコピーにだけ指定してください。
 
+gitdir ファイルや symlink を含む場合は、このオプションを案内せずに拒否します。登録を確認できたロックされていない linked worktree には、パスを引用した `git -C <共通の管理ディレクトリ> worktree remove -- <worktree>` を案内します。submodule・外出し gitdir・壊れた gitdir ファイルには、このコマンドを案内しません。
+
 `--assume-quiescent` は呼び出し側の保証で、safe-rm には確かめきれません。git はロックのファイルを開かずに持ち続けることがあり (`git commit` のエディタ待ちなど)、他のユーザー・コンテナ・別のホストのプロセスは検査から見えないためです。`git-lock` の後に `-n` を付けると、削除せずに検査だけを行います。
 
 ブロックした削除は終了コード 2 で終わり、理由を標準エラー出力に表示します。

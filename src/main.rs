@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use path_clean::PathClean;
 use safe_rm::cli::{CliArgs, Commands, GitLockArgs};
 use safe_rm::config::Config;
-use safe_rm::error::{FileStatus, GitLockRefusal, SafeRmError};
+use safe_rm::error::{FileStatus, GitLockRefusal, GitMetadataKind, SafeRmError};
 use safe_rm::git_checker::GitChecker;
 use safe_rm::git_lock::{self, GitLockOutcome, GitLockRequest, INDEX_LOCK_FILE_NAME};
 use safe_rm::init;
@@ -619,13 +619,28 @@ fn ensure_git_metadata_not_targeted(
     } else {
         Vec::new()
     };
+    let metadata_entries: Vec<_> = metadata_paths
+        .iter()
+        .cloned()
+        .map(GitChecker::classify_git_metadata_entry)
+        .collect();
+    // ファイル・symlink は opt-in で許可できない。指定の有無によらず理由を案内する。
+    if metadata_entries
+        .iter()
+        .any(|entry| entry.kind != GitMetadataKind::Directory)
+    {
+        return Err(SafeRmError::ProtectedGitPath {
+            path: original_path.to_path_buf(),
+            metadata_entries,
+        });
+    }
     if allowed_entries.is_empty() {
         return if metadata_paths.is_empty() {
             Ok(())
         } else {
             Err(SafeRmError::ProtectedGitPath {
                 path: original_path.to_path_buf(),
-                metadata_paths,
+                metadata_entries,
             })
         };
     }
@@ -645,7 +660,7 @@ fn ensure_git_metadata_not_targeted(
     if !ignored {
         return Err(SafeRmError::ProtectedGitPath {
             path: original_path.to_path_buf(),
-            metadata_paths,
+            metadata_entries,
         });
     }
 
@@ -689,7 +704,10 @@ fn ensure_git_metadata_not_targeted(
     if !unpermitted.is_empty() {
         return Err(SafeRmError::ProtectedGitPath {
             path: original_path.to_path_buf(),
-            metadata_paths: unpermitted,
+            metadata_entries: unpermitted
+                .into_iter()
+                .map(GitChecker::classify_git_metadata_entry)
+                .collect(),
         });
     }
 
@@ -713,7 +731,7 @@ fn protected_git_target_error(normalized_path: &Path, original_path: &Path) -> S
     }
     SafeRmError::ProtectedGitPath {
         path: original_path.to_path_buf(),
-        metadata_paths: Vec::new(),
+        metadata_entries: Vec::new(),
     }
 }
 

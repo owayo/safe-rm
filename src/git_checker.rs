@@ -2,7 +2,7 @@
 //!
 //! Git リポジトリを検出し、安全な削除のためにファイルステータスを確認する。
 
-use crate::error::{FileStatus, SafeRmError};
+use crate::error::{FileStatus, GitMetadataEntry, GitMetadataKind, SafeRmError};
 use crate::path_resolution::{canonicalize_parent_keep_filename, try_canonicalize};
 use git2::{Repository, Status, StatusOptions};
 use std::collections::HashMap;
@@ -254,6 +254,51 @@ impl GitChecker {
         let mut entries = Vec::new();
         Self::collect_git_metadata_recursive(path, &mut entries)?;
         Ok(entries)
+    }
+
+    /// 拒否の案内に使う分類。確認できないものに削除コマンドを案内しない。
+    pub fn classify_git_metadata_entry(path: PathBuf) -> GitMetadataEntry {
+        let kind = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => GitMetadataKind::Directory,
+            Ok(metadata) if metadata.is_file() => {
+                Self::linked_worktree_of_gitfile(&path).unwrap_or(GitMetadataKind::GitFile)
+            }
+            _ => GitMetadataKind::Other,
+        };
+        GitMetadataEntry { path, kind }
+    }
+
+    fn linked_worktree_of_gitfile(path: &Path) -> Option<GitMetadataKind> {
+        let root = path.parent()?.canonicalize().ok()?;
+        // 親リポジトリの探索や環境変数による指定は使わない。
+        let repo = Repository::open_ext(
+            &root,
+            git2::RepositoryOpenFlags::NO_SEARCH,
+            std::iter::empty::<&std::ffi::OsStr>(),
+        )
+        .ok()?;
+        if !repo.is_worktree() || repo.workdir()?.canonicalize().ok()? != root {
+            return None;
+        }
+        let worktree = git2::Worktree::open_from_repository(&repo).ok()?;
+        worktree.validate().ok()?;
+        if worktree.path().canonicalize().ok()? != root {
+            return None;
+        }
+        // is_locked() は非 UTF-8 の理由で panic するため、中身を読まず存在だけ調べる。
+        // 不在と確定できない場合も、解除コマンドは案内しない。
+        match std::fs::symlink_metadata(repo.path().join("locked")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        let common_dir = repo.commondir().canonicalize().ok()?;
+        // 表示用の lossy 変換で別のパスを案内しない。
+        root.to_str()?;
+        common_dir.to_str()?;
+        Some(GitMetadataKind::LinkedWorktree {
+            worktree: root,
+            common_dir,
+        })
     }
 
     /// 対象ディレクトリ自身がこの repo で ignore されているかを判定する。
