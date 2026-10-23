@@ -6,10 +6,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
-/// テスト用の safe-rm バイナリのパスを取得
+/// Cargo が現在のプロファイルと出力先にビルドした safe-rm のパスを取得
 fn get_binary_path() -> String {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    format!("{}/target/debug/safe-rm", manifest_dir)
+    env!("CARGO_BIN_EXE_safe-rm").to_string()
 }
 
 /// safe-rm を実行してステータスを取得
@@ -3440,6 +3439,30 @@ mod strict_mode_nested_tests {
 mod force_flag_tests {
     use super::*;
 
+    #[test]
+    fn test_nested_git_opt_in_invalid_operand_count_reports_error() {
+        let temp_dir = TempDir::new().unwrap();
+        for name in ["one.txt", "two.txt"] {
+            fs::write(temp_dir.path().join(name), "keep").unwrap();
+        }
+
+        for paths in [&[][..], &["one.txt", "two.txt"][..]] {
+            let mut args = vec!["-rf", "--allow-nested-git", "nested/.git"];
+            args.extend_from_slice(paths);
+            let (exit_code, stdout, stderr) = run_safe_rm(&args, temp_dir.path());
+
+            assert_eq!(exit_code, 2);
+            assert!(stdout.is_empty());
+            assert!(stderr.contains("--allow-nested-git requires exactly one PATH"));
+            for name in ["one.txt", "two.txt"] {
+                assert_eq!(
+                    fs::read_to_string(temp_dir.path().join(name)).unwrap(),
+                    "keep"
+                );
+            }
+        }
+    }
+
     /// allow_project_deletion = false の設定ファイルを作成
     fn create_strict_config() -> tempfile::NamedTempFile {
         let config = tempfile::NamedTempFile::new().unwrap();
@@ -5807,6 +5830,7 @@ mod nested_git_metadata_tests {
         let (blocked, _, stderr) = run_safe_rm(&["-r", "build"], &outer_path);
         assert_eq!(blocked, 2, "通常の削除は保護を維持する: {stderr}");
         assert!(stderr.contains("build/vendor/.git"), "原因を示す: {stderr}");
+        assert!(stderr.contains("--allow-nested-git PATH"), "{stderr}");
         assert!(vendor.join(".git").exists());
 
         let (allowed, _, stderr) = run_safe_rm(
@@ -5880,6 +5904,183 @@ mod nested_git_metadata_tests {
     }
 
     #[test]
+    fn test_nested_gitfile_guidance_for_linked_worktree_and_mixed_entries() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        commit_file(&outer_path, ".gitignore", "build/\n");
+        let worktree = outer_path.join("build/linked worktree's files");
+        fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        let output = Command::new("git")
+            .args(["worktree", "add", "-b", "linked-test"])
+            .arg(&worktree)
+            .current_dir(&outer_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+
+        for mixed in [false, true] {
+            if mixed {
+                let vendor = outer_path.join("build/vendor");
+                fs::create_dir_all(&vendor).unwrap();
+                init_repo(&vendor);
+            }
+            for (target, dry_run) in [
+                ("build", false),
+                ("build", true),
+                ("build/linked worktree's files", false),
+                ("build/linked worktree's files", true),
+            ] {
+                for opt_in in [false, true] {
+                    let mut args = vec!["-r"];
+                    if dry_run {
+                        args.push("-n");
+                    }
+                    if opt_in {
+                        args.extend(["--allow-nested-git", "build/linked worktree's files/.git"]);
+                    }
+                    args.push(target);
+                    let (exit_code, stdout, stderr) = run_safe_rm(&args, &outer_path);
+                    assert_eq!(exit_code, 2, "{stderr}");
+                    assert!(stdout.is_empty(), "{stdout}");
+                    assert!(!stderr.contains("--allow-nested-git"), "{stderr}");
+                    let quoted = worktree.to_string_lossy().replace('\'', "'\\''");
+                    assert!(
+                        stderr.contains(&format!("worktree remove -- '{quoted}'")),
+                        "worktree 自身を引用して案内する: {stderr}"
+                    );
+                    assert!(stderr.contains("build/linked worktree's files/.git"));
+                    assert!(worktree.join(".git").is_file());
+                    if mixed && target == "build" {
+                        assert!(stderr.contains("build/vendor/.git"), "{stderr}");
+                        assert!(outer_path.join("build/vendor/.git").is_dir());
+                    }
+                }
+            }
+        }
+
+        let output = Command::new("git")
+            .args(["worktree", "lock"])
+            .arg(&worktree)
+            .current_dir(&outer_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let worktree_repo = git2::Repository::open(&worktree).unwrap();
+        for reason in [&b"locked for testing"[..], &b"\xff"[..]] {
+            fs::write(worktree_repo.path().join("locked"), reason).unwrap();
+            let (exit_code, _, stderr) = run_safe_rm(&["-n", "-r", "build"], &outer_path);
+            assert_eq!(exit_code, 2, "ロック理由の UTF-8 に依存しない: {stderr}");
+            assert!(!stderr.contains("worktree remove"), "{stderr}");
+            assert!(worktree.join(".git").is_file());
+        }
+        let output = Command::new("git")
+            .args(["worktree", "unlock"])
+            .arg(&worktree)
+            .current_dir(&outer_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+
+        // 表示されたコマンドを別の cwd から実行して、引用と登録解除まで確認する。
+        let (_, _, stderr) = run_safe_rm(&["-n", "-r", "build"], &outer_path);
+        let command = stderr
+            .lines()
+            .find(|line| line.starts_with("  git -C "))
+            .unwrap();
+        let output = Command::new("sh")
+            .args(["-c", command])
+            .current_dir(outer.path().parent().unwrap())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(!worktree.exists());
+        let repo = git2::Repository::open(&outer_path).unwrap();
+        assert!(repo.worktrees().unwrap().is_empty());
+        let (exit_code, _, stderr) = run_safe_rm(&["-n", "-r", "build"], &outer_path);
+        assert_eq!(exit_code, 2, "{stderr}");
+        assert!(stderr.contains("--allow-nested-git PATH"), "{stderr}");
+    }
+
+    #[test]
+    fn test_nested_gitfile_guidance_does_not_call_submodule_a_worktree() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        commit_file(&outer_path, ".gitignore", "build/\n");
+        let source = create_test_repo();
+        commit_file(source.path(), "tracked.txt", "keep");
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--force",
+            ])
+            .arg(source.path())
+            .arg("build/submodule")
+            .current_dir(&outer_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        for args in [
+            vec!["-r", "build"],
+            vec!["-r", "--allow-nested-git", "build/submodule/.git", "build"],
+        ] {
+            let (exit_code, _, stderr) = run_safe_rm(&args, &outer_path);
+            assert_eq!(exit_code, 2, "{stderr}");
+            assert!(!stderr.contains("--allow-nested-git"), "{stderr}");
+            assert!(!stderr.contains("worktree remove"), "{stderr}");
+            assert!(outer_path.join("build/submodule/.git").is_file());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_nested_git_symlink_has_no_opt_in_or_worktree_guidance() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        commit_file(&outer_path, ".gitignore", "build/\n");
+        fs::create_dir_all(outer_path.join("build/nested")).unwrap();
+        let link = outer_path.join("build/nested/.git");
+        std::os::unix::fs::symlink(outer_path.join(".git"), &link).unwrap();
+        let (exit_code, _, stderr) = run_safe_rm(&["-n", "-r", "build"], &outer_path);
+        assert_eq!(exit_code, 2, "{stderr}");
+        assert!(!stderr.contains("--allow-nested-git"), "{stderr}");
+        assert!(!stderr.contains("worktree remove"), "{stderr}");
+        assert!(link.is_symlink());
+        assert!(outer_path.join(".git").is_dir());
+    }
+
+    #[test]
+    fn test_nested_gitfile_guidance_does_not_call_separate_gitdir_a_worktree() {
+        let outer = create_test_repo();
+        let outer_path = outer.path().canonicalize().unwrap();
+        commit_file(&outer_path, ".gitignore", "build/\n");
+        let external = TempDir::new().unwrap();
+        let worktree = outer_path.join("build/separate");
+        fs::create_dir_all(&worktree).unwrap();
+        let output = Command::new("git")
+            .args(["init", "--separate-git-dir"])
+            .arg(external.path().join("metadata"))
+            .arg(&worktree)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+
+        for args in [
+            vec!["-r", "build"],
+            vec!["-r", "--allow-nested-git", "build/separate/.git", "build"],
+        ] {
+            let (exit_code, _, stderr) = run_safe_rm(&args, &outer_path);
+            assert_eq!(exit_code, 2, "{stderr}");
+            assert!(stderr.contains("gitdir ファイル"), "{stderr}");
+            assert!(!stderr.contains("--allow-nested-git"), "{stderr}");
+            assert!(!stderr.contains("worktree remove"), "{stderr}");
+            assert!(worktree.join(".git").is_file());
+        }
+    }
+
+    #[test]
     fn test_nested_git_opt_in_cannot_delete_gitfile() {
         let outer = create_test_repo();
         let outer_path = outer.path().canonicalize().unwrap();
@@ -5892,12 +6093,16 @@ mod nested_git_metadata_tests {
         )
         .unwrap();
 
-        let (exit_code, _, stderr) = run_safe_rm(
-            &["-r", "--allow-nested-git", "build/worktree/.git", "build"],
-            &outer_path,
-        );
-        assert_eq!(exit_code, 2, "gitdir ファイルは保護する: {stderr}");
-        assert!(worktree.join(".git").exists());
+        for args in [
+            vec!["-r", "build"],
+            vec!["-r", "--allow-nested-git", "build/worktree/.git", "build"],
+        ] {
+            let (exit_code, _, stderr) = run_safe_rm(&args, &outer_path);
+            assert_eq!(exit_code, 2, "gitdir ファイルは保護する: {stderr}");
+            assert!(!stderr.contains("--allow-nested-git"), "{stderr}");
+            assert!(!stderr.contains("worktree remove"), "{stderr}");
+            assert!(worktree.join(".git").exists());
+        }
     }
 
     #[test]

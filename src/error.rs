@@ -180,6 +180,25 @@ fn shell_quote(path: &Path) -> String {
     }
 }
 
+/// 拒否時の案内に使う、再帰削除内の Git 管理エントリ。
+#[derive(Debug)]
+pub struct GitMetadataEntry {
+    pub path: PathBuf,
+    pub kind: GitMetadataKind,
+}
+
+/// エントリの分類。削除許可ではなく、拒否理由と次の操作の表示に使う。
+#[derive(Debug, PartialEq, Eq)]
+pub enum GitMetadataKind {
+    Directory,
+    LinkedWorktree {
+        worktree: PathBuf,
+        common_dir: PathBuf,
+    },
+    GitFile,
+    Other,
+}
+
 /// safe-rm のエラー型
 #[derive(Debug)]
 pub enum SafeRmError {
@@ -215,7 +234,7 @@ pub enum SafeRmError {
     /// Git 管理メタデータへのアクセス
     ProtectedGitPath {
         path: PathBuf,
-        metadata_paths: Vec<PathBuf>,
+        metadata_entries: Vec<GitMetadataEntry>,
     },
     /// 通常の削除で gitdir 直下の index.lock を指定した（git-lock サブコマンドを案内する）
     ProtectedGitIndexLock { path: PathBuf, gitdir: PathBuf },
@@ -346,25 +365,46 @@ impl SafeRmError {
             }
             Self::ProtectedGitPath {
                 path,
-                metadata_paths,
+                metadata_entries,
             } => {
-                if metadata_paths.is_empty() {
+                if metadata_entries.is_empty() {
                     format!(
                         "Git 管理メタデータは削除できません。\nPath: {}\n作業ツリーのファイルだけを指定してください。",
                         path.display()
                     )
                 } else {
-                    let entries = metadata_paths
+                    let entries = metadata_entries
                         .iter()
-                        .map(|entry| format!("  {}", entry.display()))
+                        .map(|entry| format!("  {}", entry.path.display()))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    format!(
-                        "Git 管理メタデータは削除できません。\nPath: {}\n含まれる Git 管理エントリ ({} 件):\n{}\nignore 済みの単一ディレクトリなら、削除する各エントリを --allow-nested-git PATH で明示してください。",
+                    let mut message = format!(
+                        "Git 管理メタデータは削除できません。\nPath: {}\n含まれる Git 管理エントリ ({} 件):\n{}",
                         path.display(),
-                        metadata_paths.len(),
+                        metadata_entries.len(),
                         entries
-                    )
+                    );
+                    if metadata_entries
+                        .iter()
+                        .all(|entry| entry.kind == GitMetadataKind::Directory)
+                    {
+                        message.push_str("\nignore 済みの単一ディレクトリなら、削除する各エントリを --allow-nested-git PATH で明示してください。");
+                    } else {
+                        message.push_str("\ngitdir ファイル・symlink・種類を確認できないエントリは、削除の例外にできません。");
+                        for entry in metadata_entries {
+                            if let GitMetadataKind::LinkedWorktree {
+                                worktree,
+                                common_dir,
+                            } = &entry.kind
+                            {
+                                message.push_str(&format!(
+                                    "\nlinked worktree は変更が残っていないことを確かめてから、登録ごと外してください:\n  git -C {} worktree remove -- {}",
+                                    shell_quote(common_dir), shell_quote(worktree)
+                                ));
+                            }
+                        }
+                    }
+                    message
                 }
             }
             Self::ProtectedGitIndexLock { path, gitdir } => {
@@ -467,7 +507,7 @@ mod tests {
         assert_eq!(
             SafeRmError::ProtectedGitPath {
                 path: PathBuf::from(".git"),
-                metadata_paths: Vec::new(),
+                metadata_entries: Vec::new(),
             }
             .exit_code(),
             2
@@ -738,11 +778,34 @@ mod tests {
     fn test_user_message_protected_git_path() {
         let err = SafeRmError::ProtectedGitPath {
             path: PathBuf::from(".git"),
-            metadata_paths: Vec::new(),
+            metadata_entries: Vec::new(),
         };
         let msg = err.user_message();
         assert!(msg.contains(".git"));
         assert!(msg.contains("Git 管理メタデータ"));
+    }
+
+    #[test]
+    fn test_protected_git_entries_only_guide_opt_in_for_directories() {
+        for kind in [
+            GitMetadataKind::Directory,
+            GitMetadataKind::GitFile,
+            GitMetadataKind::Other,
+        ] {
+            let directory = kind == GitMetadataKind::Directory;
+            let error = SafeRmError::ProtectedGitPath {
+                path: PathBuf::from("build"),
+                metadata_entries: vec![GitMetadataEntry {
+                    path: PathBuf::from("build/nested/.git"),
+                    kind,
+                }],
+            };
+            let message = error.user_message();
+            assert_eq!(error.exit_code(), 2);
+            assert!(message.contains("build/nested/.git"));
+            assert_eq!(message.contains("--allow-nested-git"), directory);
+            assert!(!message.contains("worktree remove"));
+        }
     }
 
     #[test]

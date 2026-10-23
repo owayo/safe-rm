@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use path_clean::PathClean;
 use safe_rm::cli::{CliArgs, Commands, GitLockArgs};
 use safe_rm::config::Config;
-use safe_rm::error::{FileStatus, GitLockRefusal, SafeRmError};
+use safe_rm::error::{FileStatus, GitLockRefusal, GitMetadataKind, SafeRmError};
 use safe_rm::git_checker::GitChecker;
 use safe_rm::git_lock::{self, GitLockOutcome, GitLockRequest, INDEX_LOCK_FILE_NAME};
 use safe_rm::init;
@@ -119,7 +119,17 @@ fn main() -> ExitCode {
         None => {}
     }
 
-    // 単一パス失敗は実エラーを 1 回だけ表示する。
+    // 対象件数のエラーは削除開始前に表示する。複数パス時の個別エラー表示に
+    // 任せると、run() に入る前の拒否まで表示を省略してしまう。
+    if !args.allow_nested_git.is_empty() && args.paths.len() != 1 {
+        let error = SafeRmError::DangerousOption {
+            option: "--allow-nested-git requires exactly one PATH".to_string(),
+        };
+        eprintln!("safe-rm: {}", error);
+        return error.exit_code().into();
+    }
+
+    // パスなしのオプションエラーと単一パスの失敗は、実エラーを 1 回だけ表示する。
     // 複数パス失敗は run() 側の各パス出力を優先し、
     // 操作エラーのみ最後に集計メッセージを補足する。
     let path_count = args.paths.len();
@@ -127,7 +137,7 @@ fn main() -> ExitCode {
     match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            if path_count == 1 || (path_count > 1 && e.exit_code() == 1) {
+            if path_count <= 1 || e.exit_code() == 1 {
                 eprintln!("safe-rm: {}", e);
             }
             e.exit_code().into()
@@ -166,13 +176,6 @@ fn run_git_lock(args: &CliArgs, lock_args: &GitLockArgs) -> Result<GitLockOutcom
 
 /// メイン実行ロジック
 fn run(args: CliArgs) -> Result<(), SafeRmError> {
-    // 例外的な Git 管理エントリの許可は、全件を削除前に照合できる単一 operand に限る。
-    if !args.allow_nested_git.is_empty() && args.paths.len() != 1 {
-        return Err(SafeRmError::DangerousOption {
-            option: "--allow-nested-git requires exactly one PATH".to_string(),
-        });
-    }
-
     // 削除対象がないなら設定も cwd も要らない。CLI 上ここに空 paths で来るのは
     // `-f` 指定時だけで（サブコマンドは main() で処理済み）、`rm -f` は operand が
     // 無ければ cwd を参照せず成功する。ここで返さないと、cwd が別プロセスに
@@ -616,13 +619,28 @@ fn ensure_git_metadata_not_targeted(
     } else {
         Vec::new()
     };
+    let metadata_entries: Vec<_> = metadata_paths
+        .iter()
+        .cloned()
+        .map(GitChecker::classify_git_metadata_entry)
+        .collect();
+    // ファイル・symlink は opt-in で許可できない。指定の有無によらず理由を案内する。
+    if metadata_entries
+        .iter()
+        .any(|entry| entry.kind != GitMetadataKind::Directory)
+    {
+        return Err(SafeRmError::ProtectedGitPath {
+            path: original_path.to_path_buf(),
+            metadata_entries,
+        });
+    }
     if allowed_entries.is_empty() {
         return if metadata_paths.is_empty() {
             Ok(())
         } else {
             Err(SafeRmError::ProtectedGitPath {
                 path: original_path.to_path_buf(),
-                metadata_paths,
+                metadata_entries,
             })
         };
     }
@@ -642,7 +660,7 @@ fn ensure_git_metadata_not_targeted(
     if !ignored {
         return Err(SafeRmError::ProtectedGitPath {
             path: original_path.to_path_buf(),
-            metadata_paths,
+            metadata_entries,
         });
     }
 
@@ -686,7 +704,10 @@ fn ensure_git_metadata_not_targeted(
     if !unpermitted.is_empty() {
         return Err(SafeRmError::ProtectedGitPath {
             path: original_path.to_path_buf(),
-            metadata_paths: unpermitted,
+            metadata_entries: unpermitted
+                .into_iter()
+                .map(GitChecker::classify_git_metadata_entry)
+                .collect(),
         });
     }
 
@@ -710,7 +731,7 @@ fn protected_git_target_error(normalized_path: &Path, original_path: &Path) -> S
     }
     SafeRmError::ProtectedGitPath {
         path: original_path.to_path_buf(),
-        metadata_paths: Vec::new(),
+        metadata_entries: Vec::new(),
     }
 }
 

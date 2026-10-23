@@ -52,7 +52,7 @@ It is meant to stand in for `rm` in AI agents such as Claude Code: a `PreToolUse
 - **Configurable Allowed Paths**: Bypass project containment and Git status checks for specified directories (per-directory recursive control), without requiring current-directory Git discovery to succeed
 - **Non-Git Support**: Works safely in non-Git directories
 - **Dry Run Mode**: Preview what would be deleted without actually deleting
-- **Deterministic Error Output**: Single-path failures emit one stderr block, while batch runs emit one error per failed path without duplicating the same message
+- **Deterministic Error Output**: Invalid operand counts for `--allow-nested-git` emit a diagnostic before deletion begins. Single-path failures emit one stderr block, while batch runs emit one error per failed path without duplicating the same message
 
 How the checks fit together (check order, safety layers, and what each mode can delete): [docs/architecture.md](docs/architecture.md)
 
@@ -126,6 +126,8 @@ safe-rm git-lock --repo /path/to/repo --assume-quiescent
 ```
 
 `--allow-nested-git` deletes the named nested repository, including its local Git history and uncommitted changes. Use it only for disposable copies.
+
+When the target contains gitdir files or symlinks, the refusal does not suggest this option. For a verified, unlocked linked worktree, it instead shows a shell-quoted `git -C <common-git-dir> worktree remove -- <worktree>` command. Submodules, separate gitdirs, and broken gitdir files do not receive this command.
 
 `--assume-quiescent` is your guarantee, not something safe-rm can verify. git can hold the lock without keeping it open (for example while `git commit` waits for the editor), and processes of other users, in containers, or on other hosts are invisible to the checks. Add `-n` after `git-lock` to run every check without deleting.
 
@@ -250,8 +252,8 @@ Add to your `CLAUDE.md`:
 
 - Do NOT use `rm` or `rmdir`. These are restricted for safety.
 - Use `safe-rm <file>` or `safe-rm -r <directory>` to delete files.
-- `safe-rm` will automatically verify that the file is safe to delete (committed or ignored in Git).
-- If `safe-rm` fails, the file likely has uncommitted changes or is outside the project.
+- `safe-rm` checks project boundaries and protects Git metadata. With `allow_project_deletion = false`, it also blocks modified, staged, and untracked files; the default mode allows these files inside the project.
+- If `safe-rm` fails, read the diagnostic before retrying. A refusal can protect a project boundary, Git metadata, or uncommitted changes in strict mode.
 - If a crashed git process left `.git/index.lock` behind, confirm that no git process is running in the repository, then run `safe-rm git-lock --repo <gitdir> --assume-quiescent`.
 
 ### Examples
